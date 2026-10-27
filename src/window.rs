@@ -1,10 +1,11 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pixels::wgpu::{BlendState, Color, CompositeAlphaMode};
 use pixels::{Pixels, PixelsBuilder, ScalingMode, SurfaceTexture};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -13,12 +14,17 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::RunOptions;
+use crate::activity::Presentation;
 use crate::animation::{Animation, Player};
-use crate::assets::{CELL_HEIGHT, CELL_WIDTH, HexAtlas};
+use crate::assets::{DEFAULT_CHARACTER_ID, DEFAULT_CHARACTER_NAME, SpriteAtlas};
+use crate::bubble;
+use crate::display::{LiveDisplay, Mailbox};
+use crate::ipc::{FocusControl, Server};
+use crate::typography::Typeface;
 
 const DEMO_INTERVAL: Duration = Duration::from_secs(3);
 
-pub fn run(atlas: HexAtlas, options: RunOptions) -> Result<()> {
+pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Result<()> {
     let mut builder = EventLoop::builder();
     #[cfg(target_os = "macos")]
     {
@@ -31,7 +37,23 @@ pub fn run(atlas: HexAtlas, options: RunOptions) -> Result<()> {
         .build()
         .context("cannot connect to desktop event loop")?;
     let mut app = App::new(atlas, options);
-    event_loop.run_app(&mut app)?;
+    let mailbox = app.mailbox.clone();
+    let proxy = event_loop.create_proxy();
+    let server = socket
+        .map(|path| {
+            let server = Server::start(path, move |view| {
+                if mailbox.post(view) {
+                    let _ = proxy.send_event(());
+                }
+            })?;
+            info!(socket = %path.display(), "Local activity listener ready");
+            Ok::<_, anyhow::Error>(server)
+        })
+        .transpose()?;
+    app.focus_control = server.as_ref().map(Server::focus_control);
+    let result = event_loop.run_app(&mut app);
+    drop(server);
+    result?;
     info!(draws = app.draws, "Numen window closed");
     match app.error {
         Some(error) => Err(error),
@@ -43,7 +65,7 @@ struct App {
     // Drop the GPU surface before the window (the surface also holds its own Arc).
     pixels: Option<Pixels<'static>>,
     window: Option<Arc<Window>>,
-    atlas: HexAtlas,
+    atlas: SpriteAtlas,
     player: Player,
     selection_index: usize,
     options: RunOptions,
@@ -54,11 +76,23 @@ struct App {
     exit_at: Option<Instant>,
     draws: u64,
     error: Option<anyhow::Error>,
+    display: LiveDisplay,
+    mailbox: Arc<Mailbox>,
+    focus_control: Option<FocusControl>,
+    latest_view: Presentation,
+    renderer: Option<bubble::Renderer>,
+    frame_size: (u32, u32),
 }
 
 impl App {
-    fn new(atlas: HexAtlas, options: RunOptions) -> Self {
+    fn new(atlas: SpriteAtlas, options: RunOptions) -> Self {
         let now = Instant::now();
+        let mut display = LiveDisplay::default();
+        if options.manual || options.demo {
+            display.manual(options.animation);
+        } else {
+            display.on_advance(options.animation);
+        }
         Self {
             pixels: None,
             window: None,
@@ -76,15 +110,38 @@ impl App {
             exit_at: None,
             draws: 0,
             error: None,
+            display,
+            mailbox: Arc::new(Mailbox::default()),
+            focus_control: None,
+            latest_view: Presentation::default(),
+            renderer: None,
+            frame_size: (0, 0),
         }
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let typeface = if self.options.no_bubble {
+            None
+        } else {
+            let face = Typeface::load(
+                self.options.font_family.as_deref(),
+                self.options.font_file.as_deref(),
+            )
+            .context("cannot load conversation font; choose --font-family or --font-file")?;
+            info!(
+                face = face.description(),
+                font_size = self.options.font_size,
+                "Conversation font selected"
+            );
+            Some(face)
+        };
+        self.renderer = Some(bubble::Renderer::new(typeface, self.options.font_size));
+        let (canvas_width, canvas_height) = bubble::dimensions(!self.options.no_bubble);
         let attributes = Window::default_attributes()
-            .with_title("Numen — Hex")
+            .with_title(format!("Numen — {DEFAULT_CHARACTER_NAME}"))
             .with_inner_size(LogicalSize::new(
-                f64::from(CELL_WIDTH) * self.options.scale,
-                f64::from(CELL_HEIGHT) * self.options.scale,
+                f64::from(canvas_width) * self.options.scale,
+                f64::from(canvas_height) * self.options.scale,
             ))
             .with_resizable(false)
             .with_decorations(false)
@@ -108,7 +165,9 @@ impl App {
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         let surface = SurfaceTexture::new(size.width.max(1), size.height.max(1), window.clone());
-        let mut pixels = PixelsBuilder::new(CELL_WIDTH, CELL_HEIGHT, surface)
+        // Rasterize into actual display pixels, not a low-resolution canvas
+        // subsequently enlarged by the GPU. Only the sprite uses nearest scaling.
+        let mut pixels = PixelsBuilder::new(size.width.max(1), size.height.max(1), surface)
             .clear_color(if self.options.opaque { Color::BLACK } else { Color::TRANSPARENT })
             // Preserve straight-alpha PNG bytes in the presentation surface.
             // Nearest-neighbor scaling avoids filtering straight-alpha edges.
@@ -125,8 +184,11 @@ impl App {
             .build()
             .context("cannot create graphics surface; try `numen run --opaque` to diagnose alpha support")?;
         pixels.set_scaling_mode(ScalingMode::PixelPerfect);
-        info!(adapter = ?pixels.adapter().get_info(), "Graphics initialized");
+        info!(adapter = ?pixels.adapter().get_info(),
+            framebuffer_width = size.width, framebuffer_height = size.height,
+            display_scale = window.scale_factor(), "Graphics initialized");
         self.pixels = Some(pixels);
+        self.frame_size = (size.width.max(1), size.height.max(1));
         self.last_tick = Instant::now();
         self.next_demo = self.last_tick + DEMO_INTERVAL;
         self.exit_at = self
@@ -139,8 +201,9 @@ impl App {
         window.request_redraw();
         self.window = Some(window);
         info!(
+            character = DEFAULT_CHARACTER_ID,
             animation = self.player.animation().label(),
-            "Hex ready; click to focus, 1–9 expressions, Space pause, right-click cycle, Esc/Q quit"
+            "{DEFAULT_CHARACTER_NAME} ready; Tab/next conversation, 1–9/manual, L/live, Space/pause, right-click/cycle, Esc/Q/quit"
         );
         Ok(())
     }
@@ -165,20 +228,43 @@ impl App {
     }
 
     fn cycle(&mut self) {
-        self.select(Animation::ALL[(self.selection_index + 1) % Animation::ALL.len()]);
+        let animation = Animation::ALL[(self.selection_index + 1) % Animation::ALL.len()];
+        self.display.manual(animation);
+        self.select(animation);
     }
 
     fn keyboard(&mut self, event_loop: &ActiveEventLoop, code: KeyCode) {
         match code {
             KeyCode::Escape | KeyCode::KeyQ => event_loop.exit(),
+            KeyCode::Tab => {
+                if let Some(control) = &self.focus_control {
+                    match control.next() {
+                        Ok(()) => {
+                            let animation = self.display.resume();
+                            self.select(animation);
+                            info!("Requested next focused conversation");
+                        }
+                        Err(error) => warn!(%error, "Could not switch conversation"),
+                    }
+                }
+            }
+            KeyCode::KeyL if !self.options.demo && !self.options.manual => {
+                let animation = self.display.resume();
+                self.select(animation);
+                info!("Live activity control resumed");
+            }
             KeyCode::Space => {
                 self.paused = !self.paused;
                 self.last_tick = Instant::now();
                 self.next_demo = self.last_tick + DEMO_INTERVAL;
                 info!(paused = self.paused, "Animation pause toggled");
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             _ => {
                 if let Some(animation) = animation_for_key(code) {
+                    self.display.manual(animation);
                     self.select(animation);
                 }
             }
@@ -191,9 +277,66 @@ impl App {
             !self.occluded && size.width > 0 && size.height > 0
         })
     }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if let Some(pixels) = &mut self.pixels {
+            pixels.resize_surface(width, height)?;
+            pixels.resize_buffer(width, height)?;
+            self.frame_size = (width, height);
+        }
+        Ok(())
+    }
 }
 
 impl ApplicationHandler for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
+        if let Some(view) = self.mailbox.take() {
+            let represented = view
+                .cue
+                .as_ref()
+                .map(|cue| &cue.selection)
+                .or(view.base.as_ref());
+            if let Some(selection) = represented {
+                info!(source = %selection.source, activity = %selection.activity,
+                    state = selection.state.label(), attention = selection.attention,
+                    "Live activity changed");
+                if let Some(window) = &self.window {
+                    window.set_title(&format!(
+                        "Numen — {DEFAULT_CHARACTER_NAME} [{} / {}: {}]",
+                        selection.source,
+                        selection.activity,
+                        selection.state.label()
+                    ));
+                }
+            } else {
+                info!("No live activity; resting");
+                if let Some(window) = &self.window {
+                    window.set_title(&format!("Numen — {DEFAULT_CHARACTER_NAME}"));
+                }
+            }
+            self.latest_view = view.clone();
+            if let Some(animation) = self.display.update(view) {
+                self.select(animation);
+            }
+            if !self.options.no_bubble {
+                let text = bubble::text(
+                    &self.latest_view,
+                    self.display.is_manual().then_some(self.player.animation()),
+                );
+                // Do not log summary text; it may contain private conversation details.
+                debug!(identity = %text.identity, status = %text.status, "Thought bubble updated");
+            }
+            // Metadata changes must repaint even if the animation is unchanged
+            // or paused. They must never reset the player or steal focus.
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none()
             && let Err(error) = self.initialize(event_loop)
@@ -243,11 +386,15 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
             }
-            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
-                if let Some(pixels) = &mut self.pixels
-                    && let Err(error) = pixels.resize_surface(size.width, size.height)
-                {
-                    self.fail(event_loop, error.into());
+            WindowEvent::Resized(size) => {
+                // Do not catch up hours of animation after a zero-sized window restores.
+                self.last_tick = Instant::now();
+                self.next_demo = self.last_tick + DEMO_INTERVAL;
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
+                if let Err(error) = self.resize(size.width, size.height) {
+                    self.fail(event_loop, error);
                     return;
                 }
                 if let Some(window) = &self.window {
@@ -262,11 +409,32 @@ impl ApplicationHandler for App {
                     window.request_redraw();
                 }
             }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // Reconcile physical dimensions in redraw, after the windowing
+                // system has applied the monitor's new scale factor.
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested if self.drawable() => {
-                if let Some(pixels) = &mut self.pixels {
-                    pixels.frame_mut().copy_from_slice(
+                if let Some(window) = &self.window {
+                    let size = window.inner_size();
+                    if (size.width, size.height) != self.frame_size
+                        && let Err(error) = self.resize(size.width, size.height)
+                    {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                }
+                if let (Some(pixels), Some(renderer)) = (&mut self.pixels, &mut self.renderer) {
+                    renderer.compose(
+                        pixels.frame_mut(),
+                        self.frame_size,
                         self.atlas
                             .frame(self.player.animation(), self.player.frame_index()),
+                        &self.latest_view,
+                        self.display.is_manual().then_some(self.player.animation()),
+                        !self.options.no_bubble,
                     );
                     if let Err(error) = pixels.render() {
                         self.fail(event_loop, error.into());
@@ -290,6 +458,9 @@ impl ApplicationHandler for App {
         let mut wake_at = self.exit_at;
         if self.drawable() && !self.paused {
             let changed = self.player.advance(elapsed, &self.atlas);
+            if let Some(animation) = self.display.on_advance(self.player.animation()) {
+                self.select(animation);
+            }
             if self.options.demo && now >= self.next_demo {
                 // Use a separate cursor: one-shot clips return to idle before
                 // their demo interval ends, so current animation is not a cursor.
@@ -358,7 +529,7 @@ mod tests {
                 unreachable!()
             };
             options.animation = selected;
-            let mut app = App::new(HexAtlas::load().unwrap(), options);
+            let mut app = App::new(SpriteAtlas::load().unwrap(), options);
             let total: Duration = app
                 .atlas
                 .clip(selected)

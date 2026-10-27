@@ -1,4 +1,4 @@
 /target/
 .DS_Store
 # Keep the original generation archive locally; runtime assets are imported separately.
-/hex-artifacts.zip
+/djinn-artifacts.zip

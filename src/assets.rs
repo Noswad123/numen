@@ -8,8 +8,11 @@ use crate::animation::Animation;
 
 pub const CELL_WIDTH: u32 = 192;
 pub const CELL_HEIGHT: u32 = 208;
-const MANIFEST: &str = include_str!("../assets/hex/manifest.json");
-const SPRITESHEET: &[u8] = include_bytes!("../assets/hex/spritesheet.png");
+// Temporary global default, independent of activity producer source IDs.
+pub const DEFAULT_CHARACTER_ID: &str = "djinn";
+pub const DEFAULT_CHARACTER_NAME: &str = "Djinn";
+const MANIFEST: &str = include_str!("../assets/djinn/manifest.json");
+const SPRITESHEET: &[u8] = include_bytes!("../assets/djinn/spritesheet.png");
 
 pub struct Clip {
     pub frame_durations: Vec<Duration>,
@@ -17,7 +20,7 @@ pub struct Clip {
     frames: Vec<Vec<u8>>,
 }
 
-pub struct HexAtlas {
+pub struct SpriteAtlas {
     clips: HashMap<Animation, Clip>,
 }
 
@@ -78,7 +81,7 @@ where
 
 impl Manifest {
     fn parse(json: &str) -> Result<Self> {
-        let manifest: Self = serde_json::from_str(json).context("invalid Hex manifest JSON")?;
+        let manifest: Self = serde_json::from_str(json).context("invalid sprite manifest JSON")?;
         ensure!(
             manifest.width == 1536 && manifest.height == 2288,
             "invalid atlas dimensions"
@@ -132,7 +135,7 @@ impl Manifest {
     }
 }
 
-impl HexAtlas {
+impl SpriteAtlas {
     pub fn load() -> Result<Self> {
         Self::from_bytes(MANIFEST, SPRITESHEET)
     }
@@ -140,7 +143,7 @@ impl HexAtlas {
     fn from_bytes(json: &str, png: &[u8]) -> Result<Self> {
         let manifest = Manifest::parse(json)?;
         let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
-            .context("cannot decode embedded Hex spritesheet")?
+            .context("cannot decode embedded spritesheet")?
             .into_rgba8();
         ensure!(
             image.dimensions() == (manifest.width, manifest.height),
@@ -193,9 +196,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_character_identity() {
+        assert_eq!(DEFAULT_CHARACTER_ID, "djinn");
+        assert_eq!(DEFAULT_CHARACTER_NAME, "Djinn");
+    }
+
+    #[test]
     fn exact_manifest_rows_timings_and_cached_rgba() {
         let manifest = Manifest::parse(MANIFEST).unwrap();
-        let atlas = HexAtlas::load().unwrap();
+        let atlas = SpriteAtlas::load().unwrap();
         let source = image::load_from_memory(SPRITESHEET).unwrap().into_rgba8();
         let expected: [(Animation, u32, &[u64]); 9] = [
             (Animation::Idle, 0, &[280, 110, 110, 140, 140, 320]),
@@ -320,11 +329,11 @@ mod tests {
 
     #[test]
     fn rejects_bad_png_and_dimension_mismatch() {
-        assert!(HexAtlas::from_bytes(MANIFEST, b"not a PNG").is_err());
+        assert!(SpriteAtlas::from_bytes(MANIFEST, b"not a PNG").is_err());
         let mut encoded = std::io::Cursor::new(Vec::new());
         image::RgbaImage::new(1, 1)
             .write_to(&mut encoded, image::ImageFormat::Png)
             .unwrap();
-        assert!(HexAtlas::from_bytes(MANIFEST, encoded.get_ref()).is_err());
+        assert!(SpriteAtlas::from_bytes(MANIFEST, encoded.get_ref()).is_err());
     }
 }

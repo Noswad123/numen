@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::assets::HexAtlas;
+use crate::assets::SpriteAtlas;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, clap::ValueEnum, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,7 +73,7 @@ impl Player {
     }
 
     /// Returns whether the final visible frame differs, not whether time advanced.
-    pub fn advance(&mut self, delta: Duration, atlas: &HexAtlas) -> bool {
+    pub fn advance(&mut self, delta: Duration, atlas: &SpriteAtlas) -> bool {
         let before = (self.animation, self.frame_index);
         let clip = atlas.clip(self.animation);
         // Work is bounded by clip length, even for Duration::MAX or long stalls.
@@ -114,7 +114,7 @@ impl Player {
         before != (self.animation, self.frame_index)
     }
 
-    pub fn until_next_frame(&self, atlas: &HexAtlas) -> Duration {
+    pub fn until_next_frame(&self, atlas: &SpriteAtlas) -> Duration {
         atlas.clip(self.animation).frame_durations[self.frame_index] - self.elapsed
     }
 }
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn exact_boundaries_and_looping() {
-        let atlas = HexAtlas::load().unwrap();
+        let atlas = SpriteAtlas::load().unwrap();
         let mut player = Player::new(Animation::Idle);
         assert_eq!(player.until_next_frame(&atlas), Duration::from_millis(280));
         assert!(!player.advance(Duration::from_millis(279), &atlas));
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn every_clip_observes_its_timings_and_completion_policy() {
-        let atlas = HexAtlas::load().unwrap();
+        let atlas = SpriteAtlas::load().unwrap();
         for animation in Animation::ALL {
             let clip = atlas.clip(animation);
             let mut player = Player::new(animation);
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn one_shot_carries_leftover_time_into_idle() {
-        let atlas = HexAtlas::load().unwrap();
+        let atlas = SpriteAtlas::load().unwrap();
         for animation in [Animation::Waving, Animation::Succeeded, Animation::Failed] {
             let total: Duration = atlas.clip(animation).frame_durations.iter().copied().sum();
             let mut player = Player::new(animation);
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn selection_resets_even_the_same_animation() {
-        let atlas = HexAtlas::load().unwrap();
+        let atlas = SpriteAtlas::load().unwrap();
         let mut player = Player::new(Animation::Working);
         player.advance(Duration::from_millis(150), &atlas);
         player.select(Animation::Working);
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn maximum_delta_matches_reduced_time() {
-        let atlas = HexAtlas::load().unwrap();
+        let atlas = SpriteAtlas::load().unwrap();
         let idle_total: Duration = atlas
             .clip(Animation::Idle)
             .frame_durations

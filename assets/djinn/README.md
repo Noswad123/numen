@@ -1,7 +1,14 @@
-# Hex runtime assets
+# Djinn runtime assets
+
+Djinn (`djinn`) is Numen's current temporary global default character. The
+eventual mapping of app source `djinn` to character `djinn` is separate from
+the future global default; activity source IDs do not define character identity.
 
 `spritesheet.png` is imported without modification from
-`final/spritesheet-extended.png` inside the owner's `hex-artifacts.zip`.
+`final/spritesheet-extended.png` inside the owner's local `djinn-artifacts.zip`.
+The archive was formerly named `hex-artifacts.zip`; Hex is only a historical
+name in the original archive contents and generation metadata, not an active
+runtime identity. Those contents and metadata remain unchanged as provenance.
 
 SHA-256: `149020622d30f9a5e7414148181426215aea4258653d85e21274f83fe592ff04`.
 
