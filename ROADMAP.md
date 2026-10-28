@@ -2,7 +2,7 @@
 
 ## Overview
 
-Delivered: multi-familiar foundation, macOS Go to mouse, familiar-first fzf menu/Wisp adapter, opt-in action installer, menu Open empty bootstrap and graceful graphical quit. Checked items mean implemented behavior, not complete desktop acceptance or automatic application integration. Unchecked work has no assigned dates. See [Wisp](WISP.md) for opt-in user setup; no actual home Wisp configuration was edited during delivery.
+Delivered: multi-familiar foundation, macOS Go to mouse, familiar-first fzf menu/Wisp adapter, opt-in action installer, menu Open empty bootstrap and graceful graphical quit. The sibling Djinn source now has an optional ordinary-interactive adapter. Checked items mean implemented behavior, not complete desktop acceptance or general application discovery. Unchecked work has no assigned dates. See [Wisp](WISP.md) for opt-in user setup; no actual home Wisp configuration was edited during delivery.
 
 ## Delivery checklist
 
@@ -18,7 +18,9 @@ Delivered: multi-familiar foundation, macOS Go to mouse, familiar-first fzf menu
 - [x] Menu Open can start detached current-executable `run --empty`, with no unattached Main, private service log and bounded readiness. Discovery alone never starts/writes; `--no-start` opts out. Concurrent starts reuse the UDS winner; unsupported/unsafe existing services are never replaced or killed.
 - [x] `service-info` reports control metadata; `quit` gracefully stops current graphical services, including zero-window services, without stopping source apps.
 - [ ] Actual Wisp palette → Kitty launcher handoff acceptance. Installer parsing and real fzf PTY tests do not prove this handoff.
-- [ ] Automatic Djinn application/open-session discovery and publishing adapter.
+- [x] Optional built-from-source Djinn local owning-Worker interactive adapter: Chat-tab session selection, existing idle-chat admission, title-only summaries, current-state snapshots and reconnects. See [scope/setup](README.md#optional-djinn-interactive-adapter).
+- [ ] Actual interactive Djinn → graphical Numen handoff acceptance; headless interop/UI tests do not prove it.
+- [ ] Broader Djinn coverage (Rust-native ask/session run, mini, external attach, remote web, current core v2 API and arbitrary background/child sessions). No OS scanning is implemented.
 - [ ] Supported application-instance adapters, followed by an unrelated runner. Arbitrary PIDs/process-name matches are not eligible targets.
 
 ### Multi-familiar foundation
@@ -51,12 +53,13 @@ GUI rows advertise Info/Attach/Close and Go to Mouse only with an installed navi
 
 ## Data Flow
 
-Wisp palette → Numen Summon action → familiar/preset multi-selection → command → one fresh protocol target per selection where needed → atomic backend revalidation → complete registry snapshots → independent native views. Wisp invokes Numen's interface, not a duplicate store/renderer. Current targets are connected protocol-advertised activities only, not OS scans or automatic Djinn sessions.
+Wisp palette → Numen Summon action → familiar/preset multi-selection → command → one fresh protocol target per selection where needed → atomic backend revalidation → complete registry snapshots → independent native views. Wisp invokes Numen's interface, not a duplicate store/renderer. Targets are connected protocol-advertised activities, including opt-in Djinn chats, not OS scans or all historical/background sessions.
 
 One canonical activity store feeds per-familiar exact bindings/cues/retained summaries. Only ordinary bootstrap `main` auto-selects a first eligible activity; empty bootstrap has no `main`, even after source updates. Future adapters should expose supported app instances/open sessions directly, without mandatory process-to-conversation drill-down, and must isolate publishing from source execution, recover via snapshots and tolerate absence/slowness.
 
 ## Edge Cases
 
+- Djinn adapter: backend UUID survives reconnect, not reload/restart; exact pins then require explicit reattachment. Chat presence is renewed every 5 seconds with a 20-second TTL; idle chats disappear on leaving Chat, previously observed busy chats remain until idle. Admission fails closed at 16 current/32 lifetime distinct session IDs; restart backend + reattach resets capacity without ID reassignment. State polling is 250 ms, potentially about 500 ms after an event; no terminal outcomes are inferred.
 - Open is attached, not an unattached-pet/history-restore flow. Close removes a familiar, not its app, and there is no separate Hide familiar action. Automatic thought-bubble hiding remains separate. Multiple bubbles/views may overlap with arbitrary stacking; no collision/fanning policy is required.
 - Each exact `(source, instance, activity)` belongs to at most one familiar, including disconnected waiting pins. Different sessions/instances of one app can have separate familiars. Pending target reservations prevent duplicate choices; backend mutation revalidates atomically. Attach cannot swap another owner's target even within one batch.
 - Up to 16 active views. Generated IDs are monotonic for service lifetime without generated-history growth; explicit history is bounded to 256 plus reserved `main`. Closed IDs are not reused; restart resets state. Closing/omitting Main never redirects legacy scope to another familiar or recreates it.
@@ -67,7 +70,9 @@ One canonical activity store feeds per-familiar exact bindings/cues/retained sum
 
 ## Validation
 
-Verified: **224 automated tests pass (206 unit + 18 CLI)**, plus formatting, strict clippy, debug build and diff checks. Real fzf PTY checks cover bootstrap/Open, multi-selection Info, cancellation and detached-service survival; native zero-window quit cleans up its socket. Generation-scoped commands reject stale selections after restart. Actual Wisp palette → Kitty handoff remains a manual acceptance check, and the home action catalog has not been installed by this implementation session.
+Prior Numen validation: **224 automated tests passed (206 unit + 18 CLI)**, plus formatting, strict clippy, debug build and diff checks; not rerun for this documentation/menu-text update. Real fzf PTY checks cover bootstrap/Open, multi-selection Info, cancellation and detached-service survival; native zero-window quit cleans up its socket. Generation-scoped commands reject stale selections after restart. Actual Wisp palette → Kitty handoff remains a manual acceptance check, and no home action catalog installation is claimed.
+
+Separately reported Djinn validation: real Rust headless interop passed 21 lifecycle assertions, plus UI lifecycle tests and package typechecks. No actual interactive GUI handoff test was performed. This is not installation, commit, or Wisp acceptance evidence.
 
 Real fzf PTY validation auto-started an empty native GUI from Preset Open, registered a diagnostic source, selected its target, opened one familiar with no Main and exited the menu while the detached service stayed alive. A second real fzf menu multi-selected two familiars for Info with source JSON unchanged. An existing-empty-GUI test exercised target/command/familiar Escape with no mutation and selection retained at command Back. Graceful quit ACKed/socket cleanup passed, including a separate native zero-window case. Only temporary test catalogs were installed; actual installed `wisp actions list` parsed the Numen row. No real Kitty/WM-prefix handoff or home catalog installation was performed.
 

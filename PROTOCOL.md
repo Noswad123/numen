@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implemented additive local v1 API: newline-delimited JSON over a user-private Unix-domain socket. The first multi-familiar foundation is delivered and verified by automated checks and a three-view Metal smoke test. This is not a stable public SDK. Sources report semantic activity, not animations; no automatic Djinn adapter exists yet. Graphical `run` supports lifecycle control; headless `listen` supports discovery/legacy selection, not GUI lifecycle.
+Implemented additive local v1 API: newline-delimited JSON over a user-private Unix-domain socket. The first multi-familiar foundation is delivered and verified by automated checks and a three-view Metal smoke test. This is not a stable public SDK. Sources report semantic activity, not animations; an optional built-from-source Djinn interactive adapter publishes through this protocol without OS scanning. Graphical `run` supports lifecycle control; headless `listen` supports discovery/legacy selection, not GUI lifecycle.
 
 ## API / Interfaces
 
@@ -92,7 +92,7 @@ Explicit scoped status additionally includes `familiar_id`. `activities` still l
 
 `familiar.list` data is `{familiars, offset, total, next_offset}`. Each row has `id`, `preset`, `attachment` (exact tuple or null), `available`, optional cached `summary`, and `capabilities`. Multi-familiar GUI rows advertise `["info","attach","close"]`, extended to `["info","attach","close","go-to-mouse"]` only when the server has a navigation callback. Headless/legacy handlers advertise `[]`. Core store capabilities remain static; server-side advertisement matches installed handlers, not source capability claims. Other platforms currently omit navigation.
 
-`companion.targets` data is `{targets, offset, total, next_offset}`. Rows flatten the Selection fields above and add `claimed_by` (ID or null) and `eligible` (boolean). Only currently connected protocol-advertised activities appear, including terminals; unavailable waiting pins are not live targets but still reserve ownership. Eligibility means unclaimed, or already owned by the supplied familiar. The menu fetches fresh pages per selection, filters ineligible rows and excludes earlier pending choices. This is neither OS process discovery nor an actual Djinn adapter. Both discovery endpoints page four rows with the same paging semantics as status.
+`companion.targets` data is `{targets, offset, total, next_offset}`. Rows flatten the Selection fields above and add `claimed_by` (ID or null) and `eligible` (boolean). Only currently connected protocol-advertised activities appear, including terminals; unavailable waiting pins are not live targets but still reserve ownership. Eligibility means unclaimed, or already owned by the supplied familiar. The menu fetches fresh pages per selection, filters ineligible rows and excludes earlier pending choices. Discovery itself is not an adapter or OS scan; the opt-in Djinn adapter supplies ordinary protocol records. Both discovery endpoints page four rows with the same paging semantics as status.
 
 Open items are `{id?, preset?, source, instance?, activity}`; preset defaults to `djinn`, the only supported preset. Attach items are `{id, source, instance?, activity}`. Targets are **flattened inside each item**, not nested or a shared batch target. IDs for presets and active familiars occupy different concepts. Offline CLI `presets` returns `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]}` without contacting a service.
 
@@ -109,6 +109,14 @@ Lifecycle ACKs confirm atomic registry acceptance, not GPU readiness. Complete s
 3. State/remove updates must have strictly greater sequences than existing records, including tombstones. Duplicate and stale updates are rejected.
 4. A snapshot is checked atomically: lower sequences are rejected; equal sequences are allowed only for an identical still-present record. Equal-sequence changed records or resurrection of tombstones are rejected. Omitted activities are removed, retaining their previous sequence tombstones. Newer records can restore removed IDs.
 5. Disconnect removes the source and its cues immediately when the connection is retired; no stale attention or inferred outcome remains. The exact focus pin remains, unavailable, with no automatic fallback. Reconnect registers afresh with the current authoritative snapshot. A restarted producer should use a new instance ID; a new instance does not inherit the old focus. Registration/snapshots do not celebrate historical terminal states.
+
+### Optional Djinn producer
+
+Djinn's local owning-Worker interactive adapter uses source `djinn`, a backend-lifetime UUID instance stable across socket reconnects, and the actual UI `SessionID` as activity. Chat-tab viewer presence renews every 5 seconds (20-second TTL); opening an existing idle chat is sufficient. Leaving Chat removes idle records, while previously observed busy records remain until idle. Dashboard/history do not advertise new targets. Reload/new backend means a new instance and explicit reattachment; exit/disconnect makes exact pins unavailable.
+
+The adapter sends current authoritative snapshots and heartbeats, not inferred terminal outcomes. It reports `idle`/`working`; permission/question requests map to `waiting` with attention, retry to `waiting` without attention. Reconciliation polls every 250 ms and can take about 500 ms after an event, not hard real-time. Adapter admission is 16 current sessions and 32 distinct IDs over the backend/transport lifetime, including removed IDs; it fails closed without ID reassignment. Restart the backend and reattach to reset lifetime capacity. These adapter limits are distinct from the protocol's source/view limits below.
+
+Enable with `DJINN_NUMEN=1 djinn -s REF` or `DJINN_NUMEN=1 djinn session chat REF` in a source build containing the adapter; `DJINN_NUMEN_DISABLED=1` overrides. `DJINN_NUMEN_SOCKET` must be an absolute existing private endpoint matching Numen `--socket`; defaults match the XDG/UID-temporary path below. It neither starts Numen nor changes Wisp configuration; menu Open may start Numen and the adapter retries by default every second. Rust-native ask/session run, mini, external attach, remote web, current core v2 API and arbitrary background/child sessions are outside its scope. See [setup and privacy](README.md#optional-djinn-interactive-adapter).
 
 ### Presentation policy
 
@@ -142,7 +150,7 @@ Tab/L reveal that view on live resume; 1–9/right-click reveal its Preview. Dem
 
 ### Summary display and privacy
 
-Numen makes no LLM calls, reads no transcripts and automatically copies no raw prompts. A future Djinn adapter is expected to reuse existing title/short-intent metadata; it is not implemented. Explicit summaries can still be sensitive on screen. `run --no-bubble` hides only the on-screen bubble, not summaries in wire/state or diagnostic output.
+Numen makes no LLM calls, reads no transcripts and automatically copies no raw prompts. The optional Djinn adapter uses only the existing chat title, sanitized, trimmed and capped at 160 UTF-8 bytes; it makes no LLM calls and copies no raw prompts or error files. Summaries can still be sensitive on screen. `run --no-bubble` hides only the on-screen bubble, not summaries in wire/state or diagnostic output.
 
 Display typography is a local GUI concern, not a wire field or producer instruction. The physical-pixel CPU compositor uses `fontdue` advances, kerning, metrics and antialiased coverage, not bitmap cells or full-canvas nearest upscaling. Identity/status are clipped by measured width; summaries wrap to at most three lines according to available space/line height, with U+2026 `…` truncation. Larger fonts may reduce visible lines without resizing the sprite. These display limits do not truncate stored UTF-8 metadata or change the 160-byte validation limit.
 
@@ -162,7 +170,7 @@ An active listener collision refuses startup. Only a user-owned socket whose bou
 
 ### Publisher scope
 
-The bundled synchronous publisher bounds connection, write and ACK waits to 500 ms as applicable and validates ACKs. It reports errors/nonzero exit rather than silently ignoring them. Its synchronous stderr logging can still block. It is an interactive diagnostic, not a safe automatic agent callback or stable best-effort SDK. Future adapters must isolate publishing from source execution and recover current state via snapshots.
+The bundled synchronous publisher bounds connection, write and ACK waits to 500 ms as applicable and validates ACKs. It reports errors/nonzero exit rather than silently ignoring them. Its synchronous stderr logging can still block. It is an interactive diagnostic, not a safe automatic agent callback or stable best-effort SDK. Adapters must isolate publishing from source execution and recover current state via snapshots; the optional Djinn transport is separate from this diagnostic command.
 
 ## Example usage
 
@@ -231,6 +239,7 @@ Open/Attach examples require distinct, connected, eligible targets at mutation t
 
 ## Related files
 
+- [Djinn adapter guide](../djinn/docs/numen.md): optional sibling source integration, not a Numen dependency; service/transport live under `clients/djinn-ui/packages/opencode/src/numen/` in Djinn.
 - [Wisp](WISP.md), [`src/menu.rs`](src/menu.rs), [`src/bootstrap.rs`](src/bootstrap.rs): client-side selection and menu-only empty bootstrap, not automatic source adapters.
 
 - [`src/protocol.rs`](src/protocol.rs): wire types, validation and constants.

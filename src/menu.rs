@@ -781,7 +781,7 @@ fn target_items(
                 .collect();
             rows.extend([refresh(), back()]);
             let status = if eligible.is_empty() {
-                "No compatible running targets. Only connected protocol sources appear; no application source adapter is implemented."
+                "No compatible running targets. Only connected protocol sources appear; enable the optional Djinn interactive adapter and open a chat, then Refresh. No OS scanning."
             } else {
                 "Choose one connected target. Esc discards all pending choices."
             };

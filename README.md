@@ -3,7 +3,7 @@
 ![numen](img/numen.jpg)
 An independent, event-driven familiar that gives visible expression to what your tools are doing.
 
-**Status:** multi-familiar foundation, macOS Go to mouse, familiar-first fzf menu, opt-in Wisp action installer, menu Open empty-service bootstrap, and graceful graphical quit are delivered. Only the Djinn preset is available; targets come from connected protocol sources, not automatic application/session adapters. No actual home Wisp catalog was edited. Wisp palette → Kitty handoff and further hands-on desktop acceptance remain manual checks. See [Wisp setup and limitations](WISP.md).
+**Status:** multi-familiar foundation, macOS Go to mouse, familiar-first fzf menu, opt-in Wisp action installer, menu Open empty-service bootstrap, and graceful graphical quit are delivered. Only the Djinn preset is available; targets come from connected protocol sources, including an optional built-from-source Djinn interactive adapter, not OS scanning. No actual home Wisp catalog was edited. Wisp palette → Kitty handoff and further hands-on desktop acceptance remain manual checks. See [Wisp setup and limitations](WISP.md).
 
 Numen means divine power or presence: an unseen, animating presence in the machine. The intended CLI spelling is `numen`; command and package availability have not yet been checked.
 
@@ -23,7 +23,7 @@ For example, a source reports `waiting` with the reason `permission_required`, n
 - Local-first, lightweight, and optional.
 - Useful ambient awareness without becoming another notification feed.
 - No model calls or tokens required for basic behavior.
-- Future automatic adapters must not impede source execution when the companion is absent or slow; the diagnostic publisher reports errors instead.
+- Adapters must not impede source execution when the companion is absent or slow; the diagnostic publisher reports errors instead.
 - Personality and artwork are separate from the activity contract.
 - Observe logical activities, not just operating-system PIDs.
 
@@ -65,6 +65,28 @@ cargo run --locked -- run --manual --animation waiting --paused --always-bubble 
 
 Each publisher command has its own connection lifetime. After it disconnects, the familiar retains that unavailable pin: use `focus --next` or select another connected activity to follow a new publisher. The `--source djinn` example is diagnostic data, not an automatic Djinn application integration.
 
+### Optional Djinn interactive adapter
+
+The sibling Djinn source implements a best-effort local adapter for the **ordinary interactive UI with its owning internal Worker**. Enable it in a Djinn build containing the adapter:
+
+```sh
+DJINN_NUMEN=1 djinn -s REF
+# Or:
+DJINN_NUMEN=1 djinn session chat REF
+# Separately, select Djinn preset → Open → the chat target:
+~/Projects/numen/target/debug/numen menu
+```
+
+- The first existing chat opened in the **Chat tab** is eligible even while idle. Global dashboard/history views do not publish new targets. Viewer presence renews every 5 seconds with a 20-second TTL; leaving Chat removes an idle target. A previously observed busy chat remains tracked until idle, even after leaving Chat.
+- Source is `djinn`; instance is a backend-lifetime UUID stable across socket reconnects; activity is the actual UI `SessionID`. Process exit/disconnect leaves exact familiar pins Unavailable. Reload or a new backend creates a new instance: explicitly reattach rather than inheriting an old pin.
+- Publishes only `idle`, `working`, and `waiting`: permission/question requests wait with attention; retry waits without attention. Idle, errors and disconnect never imply success/failure/cancellation. State reconciliation polls every 250 ms and can take about 500 ms after an event; this is not hard real-time.
+- Summary uses only the existing title, sanitized, trimmed and capped at 160 UTF-8 bytes. The adapter makes no LLM calls and copies no raw prompts or error files. **Titles/summaries can still be sensitive**; `--no-bubble` does not redact protocol/state metadata.
+- `DJINN_NUMEN_DISABLED=1` overrides enablement. `DJINN_NUMEN_SOCKET=/absolute/private/events.sock` overrides the endpoint and must match Numen's `--socket`; it requires an existing user-owned private directory/socket. Defaults match Numen: nonempty `XDG_RUNTIME_DIR/numen/events.sock`, otherwise the UID-scoped temporary path below.
+- Enabling the adapter neither starts Numen nor changes Wisp configuration. Menu Open can bootstrap Numen; the adapter retries connection by default every 1 second. Refresh the target picker after it connects.
+- Admission is bounded to 16 current sessions and 32 distinct session IDs per backend/transport lifetime, including removed IDs. It fails closed rather than reusing an ID for another chat. Restart the backend and explicitly reattach to reset lifetime capacity.
+
+Not supported: Rust-native `ask`/`session run`, `--mini`, external attach, remote web clients, the current core v2 API, or arbitrary background/child sessions. No OS process/session scanning is performed. See the optional sibling [Djinn adapter guide](../djinn/docs/numen.md); Djinn is not a dependency of Numen.
+
 ### Local macOS SDK workaround
 
 The selected `MacOSX27.0.sdk` currently causes a linker failure reporting unknown architecture `arm64e.x1`. This command-scoped workaround has been verified locally:
@@ -85,7 +107,7 @@ Use the same `SDKROOT=...` prefix for `cargo test`, `cargo clippy`, or `cargo ru
 
 `menu [--no-start] [--fzf PATH]` requires stdin and stderr TTYs and installed fzf (already installed on the validation machine). Use Wisp **run/summon**, not exec. It lists clearly labeled running/waiting familiars and presets, with distinct `familiar:` / `preset:` identities. Tab multi-selects up to 16; Enter advances to commands. Command Escape/Back retains the familiar selection; target Escape/Back discards the **entire** pending batch. Ctrl-R refreshes the current stage. One accepted action exits the menu so the Wisp Kitty floater can close.
 
-Commands are the capability intersection of **all** selected rows: presets support only Open; active familiars support Info, Go to Mouse, Attach and Close as advertised. A mixed selection may have no common command: Back is offered with an explanation, never silent partial execution. Open/Attach fetch fresh target pages separately for each selection, excluding other owners and earlier pending choices while allowing one's own current attachment. Empty lists offer Refresh/Back and explain that no application adapter exists. Backend mutation revalidates the whole batch; retryable errors appear in the menu header. With only one Djinn preset, opening more copies requires repeated invocations; a batch applies once to each actual selection.
+Commands are the capability intersection of **all** selected rows: presets support only Open; active familiars support Info, Go to Mouse, Attach and Close as advertised. A mixed selection may have no common command: Back is offered with an explanation, never silent partial execution. Open/Attach fetch fresh target pages separately for each selection, excluding other owners and earlier pending choices while allowing one's own current attachment. Empty lists offer Refresh/Back; only connected publishers appear, including opt-in Djinn chats. Backend mutation revalidates the whole batch; retryable errors appear in the menu header. With only one Djinn preset, opening more copies requires repeated invocations; a batch applies once to each actual selection.
 
 Merely entering the menu or discovering sources never spawns a service or writes files. Choosing Open while offline starts the current executable as detached `run --empty`, unless `--no-start` requests a visible error instead. It creates no unattached `main`; source updates alone keep the registry empty. Startup uses a private 0600 `service.log` beside the socket and a five-second control-readiness wait, not GPU readiness. Concurrent starts reuse the winning graphical listener. Existing headless, outdated or unsafe services are never replaced or killed: stop an old foreground service manually once or choose another `--socket`. **Direct CLI `open` still requires an already-running graphical service.**
 
@@ -146,7 +168,7 @@ One service supports **16 familiars**. Bindings are exclusive exact `(source, in
 | --- | --- |
 | `presets` | Offline JSON: `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]}`. |
 | `familiars --offset N` | Four records/page: `id`, `preset`, `attachment`, `available`, optional `summary`, `capabilities`. GUI capabilities: `info`, `attach`, `close`, plus `go-to-mouse` only with an installed navigation callback; headless/legacy handlers: `[]`. |
-| `targets --offset N [--familiar ID]` | Four connected protocol-advertised activities/page with `claimed_by` and `eligible`; an owner may reselect its own target. The menu filters eligible entries; no OS scan or actual Djinn adapter. |
+| `targets --offset N [--familiar ID]` | Four connected protocol-advertised activities/page with `claimed_by` and `eligible`; an owner may reselect its own target. The menu filters eligible entries; opt-in Djinn chats can publish here, without OS scanning. |
 | `open --source NAME --activity A [--instance I] [--id ID] [--preset djinn]` | Opens an attached view in an already-running graphical service; no auto-bootstrap. |
 | `attach --familiar ID --source NAME --activity A [--instance I]` | Retargets an existing familiar, never executes/stops the source. |
 | `close --familiar ID1 ID2` | Atomically removes selected familiars, not their applications. |
@@ -185,7 +207,7 @@ When visible, the thought bubble shows a clipped `source / activity / instance` 
 
 The default `Typeface` prefers installed **SauceCodePro Nerd Font Regular**, discovered by `fontdb` in standard system/user font directories. This preference matches the owner's configured Kitty family; Numen does **not** parse Kitty configuration or read its font size at runtime, and has no hardcoded machine-specific font path. If the default preferred face cannot be loaded, it uses embedded **Source Code Pro Regular**, an OFL-licensed base font without Nerd Font icons. Explicit overrides never silently substitute the bundled face. See [font provenance and limits](assets/fonts/README.md).
 
-Supply metadata with `publish --summary 'Investigating retry backoff'`. Summaries must be nonblank, at most 160 UTF-8 bytes, and contain no control characters or bidi embedding/isolate controls. The CLI trims surrounding whitespace and repeats the summary on every state, including `publish --demo`. Numen makes no LLM calls, reads no transcripts, and automatically copies no raw prompts. A future Djinn adapter is expected to reuse an existing title/short-intent field; it is not implemented.
+Supply metadata with `publish --summary 'Investigating retry backoff'`. Summaries must be nonblank, at most 160 UTF-8 bytes, and contain no control characters or bidi embedding/isolate controls. The CLI trims surrounding whitespace and repeats the summary on every state, including `publish --demo`. Numen makes no LLM calls, reads no transcripts, and automatically copies no raw prompts. The optional Djinn adapter reuses the existing chat title as described above.
 
 **Privacy:** even a short explicit summary may be sensitive and visible to nearby people or screen sharing. `run --no-bubble` hides only the on-screen bubble; summaries remain in protocol/state and diagnostic output. Producers must choose safe metadata.
 
@@ -213,11 +235,13 @@ Graphical startup validates the embedded `assets/djinn/` PNG/manifest through th
 - Completion is not idle or disconnect. Only new success/failure transitions of the focused conversation can cue; repeated terminal states, snapshots and selection of historical terminal records do not replay outcomes. Focused attention clears/drops cues rather than queuing them. Background attention, failure and success never take over.
 - Movement commits the hidden sprite anchor so bubble expiry does not snap back to the pre-command position. Pointer reading is read-only: fresh macOS `CGEvent` snapshots from `CombinedSessionState`, no cursor warp, event posting, event tap, permission request or OS process scan. Other platforms currently advertise no navigation capability.
 - Menu labels/summaries are sanitized and never shell-interpolated. fzf default-options/options-file/default-command environment variables are removed; unoffered or duplicate output identities are rejected, with a 64 KiB output cap.
-- Next: a Djinn adapter, then an unrelated runner. Other [mode choices](MODES.md), app-signaled following, different per-view characters/options, persistent preferences, general installation/autostart, packaging, gaze and roaming remain future work.
+- Next: broader adapter coverage and an unrelated runner. Other [mode choices](MODES.md), app-signaled following, different per-view characters/options, persistent preferences, general installation/autostart, packaging, gaze and roaming remain future work.
 
 ## Validation
 
-Verified: **206 unit tests and 18 CLI integration tests pass (224 automated tests)**, plus formatting, strict clippy, debug build and diff checks. Real fzf PTY runs verified empty native startup from Open, source-target selection, attached familiar creation without Main, detached service survival, multi-familiar Info, cancellation/Back, and graceful quit with socket cleanup. The scoped Open/bootstrap path passed again after service-generation guarding; tests also reject stale commands against reused IDs after restart. Temporary action catalogs were parsed by installed Wisp; no home catalog was edited. Actual Wisp palette → Kitty handoff remains manual. Earlier native lifecycle/navigation and compositor regression evidence is preserved; font tests use the bundled fixture without OS fonts.
+Prior Numen validation: **206 unit tests and 18 CLI integration tests passed (224 automated tests)**, plus formatting, strict clippy, debug build and diff checks. These checks were not rerun for this documentation/menu-text update; Numen behavior is unchanged. Real fzf PTY runs verified empty native startup from Open, source-target selection, attached familiar creation without Main, detached service survival, multi-familiar Info, cancellation/Back, and graceful quit with socket cleanup. The scoped Open/bootstrap path passed again after service-generation guarding; tests also reject stale commands against reused IDs after restart. Temporary action catalogs were parsed by installed Wisp; no home catalog was edited. Actual Wisp palette → Kitty handoff remains manual. Earlier native lifecycle/navigation and compositor regression evidence is preserved; font tests use the bundled fixture without OS fonts.
+
+Separately reported Djinn adapter validation: real Rust headless interop passed 21 lifecycle assertions, plus UI lifecycle tests and package typechecks. No actual interactive Djinn → graphical Numen handoff test was performed; this does not establish Wisp/desktop acceptance or installation.
 
 Real fzf PTY validation selected Preset Open, auto-started an empty native GUI, registered a diagnostic source, selected its target and opened exactly one familiar with **no Main**. The menu exited while the detached service remained alive. A second real fzf menu multi-selected two familiars for Info without changing source JSON. An existing-empty-GUI test exercised target Escape, command Escape and familiar Escape with no mutation and retained selection. Graceful quit ACKed and removed the socket; a separate native zero-window quit passed. The installer touched only temporary test catalogs; actual installed `wisp actions list` parsed the generated Numen row. No home Wisp configuration was edited, no real Kitty launcher/WM-prefix handoff was exercised, and no global OS keyboard/pointer input was injected: only scripted PTY terminal inputs. Actual `wisp palette` → Kitty handoff remains manual.
 
@@ -243,7 +267,8 @@ Tests cover CLI validation, atlas integrity, animation timing, protocol/store li
 
 ## Related files
 
-- [Roadmap](ROADMAP.md): delivered menu/bootstrap foundation and remaining adapters.
+- [Roadmap](ROADMAP.md): delivered menu/bootstrap foundation and remaining adapter coverage.
+- [Djinn adapter guide](../djinn/docs/numen.md): optional sibling integration, not a Numen dependency.
 - [Wisp](WISP.md): opt-in palette setup, menu flow, installer safety and recovery.
 - [Architecture](ARCHITECTURE.md): delivered service/renderer boundaries and next milestones.
 - [Protocol](PROTOCOL.md): initial local v1 messages, limits, sequencing, and lifecycle.
