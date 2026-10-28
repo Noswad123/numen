@@ -1,5 +1,6 @@
 # Numen
 
+![numen](img/numen.jpg)
 An independent, event-driven familiar that gives visible expression to what your tools are doing.
 
 **Status:** local socket service, diagnostic publisher, explicit conversation selection, GUI live input, and a focused-conversation thought bubble delivered, with bundled Djinn animations. No automatic Djinn application adapter yet. macOS is the initial target; Linux and manual desktop acceptance remain unvalidated.
