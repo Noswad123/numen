@@ -1,5 +1,6 @@
 # Numen
 
+![numen](img/numen.jpg)
 An independent, event-driven familiar that gives visible expression to what your tools are doing.
 
 **Status:** multi-familiar foundation, macOS Go to mouse, familiar-first fzf menu, opt-in Wisp action installer, menu Open empty-service bootstrap, and graceful graphical quit are delivered. Only the Djinn preset is available; targets come from connected protocol sources, not automatic application/session adapters. No actual home Wisp catalog was edited. Wisp palette → Kitty handoff and further hands-on desktop acceptance remain manual checks. See [Wisp setup and limitations](WISP.md).
