@@ -5,7 +5,7 @@
 Numen prefers installed **SauceCodePro Nerd Font Regular**, matching the owner's
 configured Kitty family. Discovery uses `fontdb` standard system and user font
 directories, not runtime parsing of Kitty configuration or hardcoded machine
-paths. The default UI size is 16 logical canvas units, not Kitty's runtime size.
+paths. The default UI size is 12 logical canvas units, not Kitty's runtime size.
 Installed Nerd Fonts are not copied into this project.
 
 `SourceCodePro-Regular.ttf` is the embedded portable fallback and positive-test
@@ -29,14 +29,14 @@ not copied from a locally installed Nerd Font. Supplied SHA-256:
 - `run --font-file PATH`: TTF/OTF override at face 0; a TTC uses collection index 0.
   This conflicts with `--font-family`.
 - Explicit missing/invalid family/file selections **error**, never silently fall
-  back. `--font-size` accepts finite 8–32, default 16 logical canvas units, scaled
+  back. `--font-size` accepts finite 8–32, default 12 logical canvas units, scaled
   with `--scale` and physical display density.
 - `numen font-license` prints the **full embedded SIL OFL 1.1 license text** from
   [`OFL.txt`](OFL.txt); it does not load fonts or open a GUI.
 
 ## Data Flow
 
-Bubble-enabled GUI initialization → `Typeface::load` → installed exact Regular
+Bubble-capable GUI initialization (once, even while initially hidden) → `Typeface::load` → installed exact Regular
 face or bundled default fallback → `fontdue` metrics/advances/kerning and glyph
 coverage → physical-pixel CPU bubble composition → 1:1 GPU presentation.
 `fontdb` and `fontdue` replace the removed `font8x8` bitmap dependency.
@@ -45,8 +45,12 @@ Glyphs rasterize at `font_size × physical scene scale` with grayscale coverage
 alpha-blended onto ivory. Wrapping/clipping measures actual widths and uses
 U+2026 `…`, with up to three summary lines depending on line height and available
 space. Larger font sizes can reduce visible lines without resizing the sprite.
-The logical canvas remains 384 × 352, with the 192 × 208 sprite at `(96, 144)`;
-only the sprite is nearest-resampled, not text or the whole canvas.
+The native window starts with a 96 × 104 logical sprite-only canvas, expands to
+384 × 248 on reveal (half-size sprite at `(144, 144)`), and shrinks back on hide;
+there is no full hidden bubble input area. `--sprite-scale 1` restores the native
+192 × 208 character and 384 × 352 revealed canvas without changing text size.
+The whole-scene `--scale` default remains 1.5. Only the sprite is nearest-resampled,
+not text or the whole canvas.
 
 ## Edge Cases
 
@@ -59,8 +63,13 @@ only the sprite is nearest-resampled, not text or the whole canvas.
   clear it.
 - `run --no-bubble` skips font discovery/loading even for an invalid file or
   nonexistent family. CLI syntax/conflict/range validation still applies.
-  `listen`, `publish`, `status`, `focus`, `check-assets`, and `font-license` never
-  initialize fonts. Hiding the bubble does not redact metadata elsewhere.
+  `listen`, `publish`, `status`, `focus`, `bubbles`, `check-assets`, and `font-license` never
+  initialize fonts. `--no-bubble` ignores all reveals; hiding does not redact metadata elsewhere.
+- Normal visibility starts hidden, with five-second selected status/summary
+  notifications and Option+I/`numen bubbles` reveals. Font loading is not deferred
+  until reveal and is not repeated on each open. `--bubble-duration` accepts finite
+  0.25–30 seconds; `--always-bubble` is persistent debug/preview opt-in and conflicts
+  with `--no-bubble`. These options do not change typography or stored metadata.
 - Positive font tests use this bundled fixture without OS-font requirements.
   The separately run ignored preview uses default discovery: supplied validation
   reports the installed preferred face and inspected 1×/2× images, not actual
@@ -70,8 +79,10 @@ only the sprite is nearest-resampled, not text or the whole canvas.
 ## Example usage
 
 ```sh
-cargo run --locked -- run --font-family 'SauceCodePro Nerd Font' --font-size 18
-cargo run --locked -- run --font-file assets/fonts/SourceCodePro-Regular.ttf
+cargo run --locked -- run --always-bubble --font-family 'SauceCodePro Nerd Font' --font-size 12
+cargo run --locked -- run --always-bubble --font-file assets/fonts/SourceCodePro-Regular.ttf
+# Against a separately running graphical service: timed reveal without focus
+cargo run --locked -- bubbles
 cargo run --locked -- font-license
 ```
 
@@ -80,6 +91,7 @@ cargo run --locked -- font-license
 - [`src/typography.rs`](../../src/typography.rs): selection, bounded reads, metrics and cache.
 - [`src/bubble.rs`](../../src/bubble.rs): measured layout, alpha composition and previews.
 - [`src/window.rs`](../../src/window.rs): font initialization and physical-size buffer/surface updates.
+- [`src/visibility.rs`](../../src/visibility.rs): timed visibility, independent of font selection.
 - [`src/main.rs`](../../src/main.rs): CLI validation and license command.
 - [README](../../README.md), [Architecture](../../ARCHITECTURE.md): usage and validation.
 - [`OFL.txt`](OFL.txt): bundled fallback license, embedded verbatim by source.

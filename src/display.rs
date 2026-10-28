@@ -6,18 +6,23 @@ use std::sync::Mutex;
 
 /// One pending GUI update, regardless of publisher rate. `post` returns whether
 /// the caller should wake the event loop; later posts replace the pending view.
-#[derive(Default)]
-pub struct Mailbox(Mutex<Option<Presentation>>);
+pub struct Mailbox<T = Presentation>(Mutex<Option<T>>);
 
-impl Mailbox {
-    pub fn post(&self, view: Presentation) -> bool {
+impl<T> Default for Mailbox<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl<T> Mailbox<T> {
+    pub fn post(&self, view: T) -> bool {
         let mut pending = self.0.lock().unwrap_or_else(|error| error.into_inner());
         let wake = pending.is_none();
         *pending = Some(view);
         wake
     }
 
-    pub fn take(&self) -> Option<Presentation> {
+    pub fn take(&self) -> Option<T> {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -168,6 +173,19 @@ mod tests {
         assert_eq!(mailbox.take(), Some(latest));
         assert_eq!(mailbox.take(), None);
         assert!(mailbox.post(Presentation::default()));
+    }
+
+    #[test]
+    fn registry_mailbox_replaces_whole_snapshots_including_empty_registry() {
+        let mailbox = Mailbox::<Vec<crate::activity::FamiliarPresentation>>::default();
+        assert!(mailbox.post(vec![crate::activity::FamiliarPresentation {
+            id: "main".into(),
+            preset: "djinn".into(),
+            presentation: Presentation::default(),
+        }]));
+        assert!(!mailbox.post(vec![]));
+        assert_eq!(mailbox.take(), Some(vec![]));
+        assert!(mailbox.take().is_none());
     }
 
     #[test]

@@ -5,6 +5,60 @@ pub const VERSION: u32 = 1;
 pub const MAX_LINE: usize = 8 * 1024;
 pub const MAX_SOURCES: usize = 16;
 pub const MAX_ACTIVITIES: usize = 32;
+pub const MAX_FAMILIARS: usize = 16;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TargetRequest {
+    pub source: String,
+    #[serde(default)]
+    pub instance: Option<String>,
+    pub activity: String,
+}
+
+impl TargetRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_id(&self.source)?;
+        validate_id(&self.activity)?;
+        if let Some(instance) = &self.instance {
+            validate_id(instance)?;
+        }
+        Ok(())
+    }
+}
+
+fn default_preset() -> String {
+    "djinn".into()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpenRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default = "default_preset")]
+    pub preset: String,
+    #[serde(flatten)]
+    pub target: TargetRequest,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AttachRequest {
+    pub id: String,
+    #[serde(flatten)]
+    pub target: TargetRequest,
+}
+
+pub fn validate_ids(ids: &[String]) -> Result<()> {
+    ensure!(
+        (1..=MAX_FAMILIARS).contains(&ids.len()),
+        "expected 1..16 familiar IDs"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        validate_id(id)?;
+        ensure!(seen.insert(id), "duplicate familiar ID");
+    }
+    Ok(())
+}
 
 #[derive(clap::ValueEnum, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -94,6 +148,8 @@ impl Activity {
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub version: u32,
+    #[serde(default)]
+    pub service_instance: Option<String>,
     #[serde(flatten)]
     pub event: Event,
 }
@@ -101,6 +157,10 @@ pub struct Request {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
+    #[serde(rename = "companion.quit")]
+    Quit,
+    #[serde(rename = "companion.service")]
+    Service,
     #[serde(rename = "source.register")]
     Register {
         source: String,
@@ -122,6 +182,8 @@ pub enum Event {
     Status {
         #[serde(default)]
         offset: usize,
+        #[serde(default)]
+        familiar: Option<String>,
     },
     #[serde(rename = "companion.focus")]
     Focus {
@@ -129,9 +191,39 @@ pub enum Event {
         #[serde(default)]
         instance: Option<String>,
         activity: String,
+        #[serde(default)]
+        familiar: Option<String>,
     },
     #[serde(rename = "companion.next")]
-    Next,
+    Next {
+        #[serde(default)]
+        familiar: Option<String>,
+    },
+    #[serde(rename = "companion.reveal")]
+    Reveal {
+        #[serde(default)]
+        familiars: Option<Vec<String>>,
+    },
+    #[serde(rename = "familiar.list")]
+    FamiliarList {
+        #[serde(default)]
+        offset: usize,
+    },
+    #[serde(rename = "companion.targets")]
+    Targets {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        familiar: Option<String>,
+    },
+    #[serde(rename = "familiar.open")]
+    Open { items: Vec<OpenRequest> },
+    #[serde(rename = "familiar.attach")]
+    Attach { items: Vec<AttachRequest> },
+    #[serde(rename = "familiar.close")]
+    Close { ids: Vec<String> },
+    #[serde(rename = "familiar.go-to-mouse")]
+    GoToMouse { ids: Vec<String> },
 }
 
 impl Request {
@@ -143,6 +235,9 @@ impl Request {
             "unsupported protocol version {}; expected 1",
             request.version
         );
+        if let Some(instance) = &request.service_instance {
+            validate_id(instance)?;
+        }
         match &request.event {
             Event::Register {
                 source,
@@ -159,13 +254,49 @@ impl Request {
                 validate_id(activity)?;
                 ensure!(*sequence > 0, "sequence must be positive");
             }
-            Event::Heartbeat => {}
-            Event::Status { .. } | Event::Next => {}
+            Event::Heartbeat | Event::Service | Event::Quit => {}
+            Event::Status { familiar, .. }
+            | Event::Next { familiar }
+            | Event::Targets { familiar, .. } => {
+                if let Some(id) = familiar {
+                    validate_id(id)?;
+                }
+            }
+            Event::Reveal { familiars } => {
+                if let Some(ids) = familiars {
+                    validate_ids(ids)?;
+                }
+            }
+            Event::FamiliarList { .. } => {}
+            Event::Close { ids } | Event::GoToMouse { ids } => validate_ids(ids)?,
+            Event::Open { items } => {
+                ensure!(
+                    (1..=MAX_FAMILIARS).contains(&items.len()),
+                    "expected 1..16 items"
+                );
+                for item in items {
+                    if let Some(id) = &item.id {
+                        validate_id(id)?;
+                    }
+                    ensure!(item.preset == "djinn", "unknown preset");
+                    item.target.validate()?;
+                }
+            }
+            Event::Attach { items } => {
+                validate_ids(&items.iter().map(|i| i.id.clone()).collect::<Vec<_>>())?;
+                for item in items {
+                    item.target.validate()?;
+                }
+            }
             Event::Focus {
                 source,
                 instance,
                 activity,
+                familiar,
             } => {
+                if let Some(id) = familiar {
+                    validate_id(id)?;
+                }
                 validate_id(source)?;
                 if let Some(instance) = instance {
                     validate_id(instance)?;
@@ -195,6 +326,144 @@ fn validate_snapshot(activities: &[Activity]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_precondition_is_optional_validated_and_distinct_from_producer_instance() {
+        for instance in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("service-1")),
+        ] {
+            let mut packet = serde_json::json!({"version":1,"type":"source.register",
+                "source":"test","instance":"producer-1","activities":[]});
+            if let Some(value) = instance {
+                packet["service_instance"] = value;
+            }
+            let request = Request::parse(&serde_json::to_vec(&packet).unwrap()).unwrap();
+            assert_eq!(
+                request.service_instance.as_deref(),
+                packet["service_instance"].as_str()
+            );
+            let Event::Register { instance, .. } = request.event else {
+                panic!("expected registration");
+            };
+            assert_eq!(instance, "producer-1");
+        }
+        for value in [
+            serde_json::json!(""),
+            serde_json::json!("bad/id"),
+            serde_json::json!("\u{e9}"),
+            serde_json::json!("x".repeat(97)),
+            serde_json::json!(123),
+        ] {
+            let packet = serde_json::json!({"version":1,"type":"companion.service","service_instance":value});
+            assert!(Request::parse(&serde_json::to_vec(&packet).unwrap()).is_err());
+        }
+        let packet = serde_json::json!({"version":1,"type":"companion.quit","service_instance":"x".repeat(96)});
+        assert!(Request::parse(&serde_json::to_vec(&packet).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn quit_requires_supported_version_and_no_fields() {
+        assert!(matches!(
+            Request::parse(br#"{"version":1,"type":"companion.quit"}"#)
+                .unwrap()
+                .event,
+            Event::Quit
+        ));
+        for packet in [
+            br#"{"version":2,"type":"companion.quit"}"#.as_slice(),
+            br#"{"type":"companion.quit"}"#.as_slice(),
+            br#"{"version":1,"type":"companion.quit",}"#.as_slice(),
+        ] {
+            assert!(Request::parse(packet).is_err());
+        }
+    }
+
+    #[test]
+    fn service_requires_supported_version_and_no_fields() {
+        assert!(matches!(
+            Request::parse(br#"{"version":1,"type":"companion.service"}"#)
+                .unwrap()
+                .event,
+            Event::Service
+        ));
+        for packet in [
+            br#"{"version":2,"type":"companion.service"}"#.as_slice(),
+            br#"{"type":"companion.service"}"#.as_slice(),
+        ] {
+            assert!(Request::parse(packet).is_err());
+        }
+    }
+
+    #[test]
+    fn go_to_mouse_validates_required_unique_bounded_ids() {
+        for ids in [
+            vec!["main".to_owned()],
+            (0..16).map(|n| format!("f{n}")).collect(),
+        ] {
+            let packet = serde_json::json!({"version":1,"type":"familiar.go-to-mouse","ids":ids});
+            let Event::GoToMouse { ids: parsed } =
+                Request::parse(&serde_json::to_vec(&packet).unwrap())
+                    .unwrap()
+                    .event
+            else {
+                panic!("expected go-to-mouse");
+            };
+            assert_eq!(parsed, ids);
+        }
+        for ids in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(["main", "main"]),
+            serde_json::json!(["bad/id"]),
+            serde_json::json!([""]),
+            serde_json::json!(["x".repeat(97)]),
+            serde_json::json!((0..17).map(|n| format!("f{n}")).collect::<Vec<_>>()),
+        ] {
+            let packet = serde_json::json!({"version":1,"type":"familiar.go-to-mouse","ids":ids});
+            assert!(Request::parse(&serde_json::to_vec(&packet).unwrap()).is_err());
+        }
+        for packet in [
+            serde_json::json!({"version":1,"type":"familiar.go-to-mouse"}),
+            serde_json::json!({"version":2,"type":"familiar.go-to-mouse","ids":["main"]}),
+        ] {
+            assert!(Request::parse(&serde_json::to_vec(&packet).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn familiar_controls_validate_all_ids_and_batch_bounds() {
+        for packet in [
+            serde_json::json!({"type":"companion.status","familiar":"bad/id"}),
+            serde_json::json!({"type":"companion.next","familiar":""}),
+            serde_json::json!({"type":"companion.targets","familiar":"bad/id"}),
+            serde_json::json!({"type":"companion.focus","familiar":"bad/id","source":"a","activity":"b"}),
+            serde_json::json!({"type":"companion.reveal","familiars":[]}),
+            serde_json::json!({"type":"companion.reveal","familiars":["main","main"]}),
+            serde_json::json!({"type":"familiar.close","ids":["bad/id"]}),
+            serde_json::json!({"type":"familiar.open","items":[]}),
+            serde_json::json!({"type":"familiar.open","items":[{"source":"a","activity":"b","preset":"wisp"}]}),
+            serde_json::json!({"type":"familiar.attach","items":[{"id":"main","source":"a","instance":"bad/id","activity":"b"}]}),
+            serde_json::json!({"type":"familiar.list","offset":-1}),
+            serde_json::json!({"type":"companion.targets","offset":-1}),
+            serde_json::json!({"type":"familiar.open","items":vec![serde_json::json!({"source":"a","activity":"b"});17]}),
+            serde_json::json!({"type":"familiar.attach","items":vec![serde_json::json!({"id":"main","source":"a","activity":"b"});17]}),
+        ] {
+            let mut packet = packet;
+            packet["version"] = 1.into();
+            assert!(
+                Request::parse(&serde_json::to_vec(&packet).unwrap()).is_err(),
+                "{packet}"
+            );
+        }
+        let request = Request::parse(br#"{"version":1,"type":"familiar.open","items":[{"source":"a","activity":"b"}],"future":true}"#).unwrap();
+        let Event::Open { items } = request.event else {
+            panic!("expected open");
+        };
+        assert_eq!(items[0].preset, "djinn");
+        assert!(items[0].id.is_none());
+    }
 
     #[test]
     fn summaries_are_optional_bounded_utf8_and_safe() {
@@ -245,10 +514,18 @@ mod tests {
 
     #[test]
     fn validates_wire_and_optional_fields() {
+        assert!(matches!(
+            Request::parse(br#"{"type":"companion.reveal","version":1}"#)
+                .unwrap()
+                .event,
+            Event::Reveal { familiars: None }
+        ));
         assert!(
             Request::parse(br#"{"type":"source.heartbeat","version":1,"future":true}"#).is_ok()
         );
         for line in [
+            r#"{"type":"companion.reveal","version":2}"#,
+            r#"{"type":"companion.reveal"}"#,
             r#"{"type":"companion.status","version":1,"offset":-1}"#,
             r#"{"type":"companion.status","version":2}"#,
             r#"{"type":"companion.next"}"#,
@@ -268,7 +545,10 @@ mod tests {
             Request::parse(br#"{"type":"companion.status","version":1}"#)
                 .unwrap()
                 .event,
-            Event::Status { offset: 0 }
+            Event::Status {
+                offset: 0,
+                familiar: None
+            }
         ));
         assert!(matches!(
             Request::parse(

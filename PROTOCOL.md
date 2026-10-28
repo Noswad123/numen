@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implemented initial local v1 API: newline-delimited JSON over a user-private Unix-domain socket. This is not a stable public SDK. Sources report semantic activity, not animations; no Djinn integration exists yet. `numen run` and headless `numen listen` use the same service.
+Implemented additive local v1 API: newline-delimited JSON over a user-private Unix-domain socket. The first multi-familiar foundation is delivered and verified by automated checks and a three-view Metal smoke test. This is not a stable public SDK. Sources report semantic activity, not animations; no automatic Djinn adapter exists yet. Graphical `run` supports lifecycle control; headless `listen` supports discovery/legacy selection, not GUI lifecycle.
 
 ## API / Interfaces
 
@@ -41,23 +41,66 @@ Each processed complete message receives an ordered JSON-line ACK:
 | `source.register` | `source`, `instance`, `activities` (array of activity records) | Required before producer events; establishes connection identity and an authoritative initial snapshot. No completion celebration. |
 | `activity.state` | Activity record fields | Replaces one activity with a strictly newer sequence; may generate a new success/failure transition cue. |
 | `source.heartbeat` | None | Refreshes source liveness without changing activities. |
+| `companion.service` | None | Read-only ACK data `{api_version:1, pid, service_instance, graphical, lifecycle, navigation}`; control readiness, not GPU readiness. |
+| `companion.quit` | None | Requires graphical shutdown callback; ACK data `{"quitting":true}` schedules global service exit, not source application termination. |
 | `source.snapshot` | `activities` | Atomically replaces current activities, subject to sequencing/tombstone checks; no replayed terminal cues. |
 | `activity.remove` | `activity`, `sequence` | Removes activity, retaining its sequence tombstone. Sequence must be strictly newer. |
-| `companion.status` | None; optional nonnegative `offset` (default 0) | Returns a page of shared-focused status in ACK `data`. |
-| `companion.focus` | `source`, `activity`; optional `instance` | Selects exactly one matching live activity or errors; clears any cue and returns status at offset 0. |
-| `companion.next` | None | Cycles lexical live activities with wraparound, clears any cue and returns status at offset 0; errors if none exist. |
+| `companion.status` | Optional nonnegative `offset` (default 0), `familiar` | Returns scoped shared-focused status in ACK `data`; omitted familiar means `main`. |
+| `companion.focus` | `source`, `activity`; optional `instance`, `familiar` | Selects exactly one live match not owned by another familiar; clears that familiar's cue and returns scoped status at offset 0. |
+| `companion.next` | Optional `familiar` | Cycles eligible lexical live activities, including terminals, with wraparound; clears its cue and returns scoped status. Errors if no eligible records. |
+| `companion.reveal` | Optional `familiars` array | Timed reveal of the subset, or all actual current views when omitted/null. Returns legacy status at offset 0, without changing selections. Headless errors. |
+| `familiar.list` | Optional nonnegative `offset` (default 0) | Four familiar registry rows per page, including unavailable bindings and capabilities. |
+| `companion.targets` | Optional nonnegative `offset`, `familiar` | Four connected protocol-advertised activity rows per page with ownership/eligibility. |
+| `familiar.open` | `items` array | Atomically adds 1–16 attached familiars to a graphical service; ACK data `{"opened":["ID"]}`. |
+| `familiar.attach` | `items` array | Atomically retargets 1–16 existing familiars; ACK data `{"attached":["ID"]}`. |
+| `familiar.close` | `ids` array | Atomically removes 1–16 familiars, not their source applications; ACK data `{"closed":["ID"]}`. |
+| `familiar.go-to-mouse` | `ids` array | Starts/restarts live-pointer pursuit for 1–16 unique existing familiar IDs; ACK data `{"moving":["ID"]}` means accepted, not arrived. Requires an installed navigation callback. |
 
 **Identity is connection-scoped.** Only registration supplies `source` and `instance`; subsequent state, heartbeat, snapshot and remove messages operate on that registered identity. Do not use the old draft's source/instance fields on each state message to route updates. A second registration on the same connection is rejected, as is a live duplicate `(source, instance)` on another connection.
 
 Control requests are an exception to producer registration: a standalone control connection need not register or claim a producer slot. Controls also work on a registered connection but **do not refresh producer liveness** or change its registered identity. Unregistered connections still have the two-second connection deadline; controls do not extend it. The source/instance fields in `companion.focus` identify the selection target, not the control client's identity.
 
-Successful control ACKs add `data`, the status object (the CLI prints this object without the ACK envelope):
+Successful controls add `data`: status for legacy selection/reveal controls, paged discovery for list/targets, or lifecycle ID arrays. The CLI prints `data` without the ACK envelope. Familiar identifiers use the same 1–96 ASCII-character rules. Optional `familiar` fields are additive/backward compatible; explicit unknown IDs error. Omitted status/focus/next still scope only to `main`. Once `main` closes, legacy status has null focus without recreating it; focus/next require an existing familiar.
+
+`numen bubbles` sends `companion.reveal` with no subset; `bubbles --familiar main familiar-1` sends `familiars: ["main","familiar-1"]`. A supplied array must contain 1–16 distinct existing IDs, validated before delivery. Reveal changes neither source identity, focus, state, cues nor liveness and never requests activation. “All” is service-local, now across all actual current views, not independent processes. `run --no-bubble` ignores every reveal; ACK is **acceptance, not a displayed frame**. The GUI reveal mailbox is bounded to 32 requests × 16 IDs and preserves subsets; an explicit all request subsumes pending subsets. Headless `Server::start` has no reveal handler and rejects reveal; legacy single-view reveal handlers cannot handle subsets.
+
+The GUI uses `Server::start_graphical(path, on_views, on_reveal, optional_on_go_to_mouse, on_quit, bootstrap_main)`. Navigation is supplied only after successful macOS `PointerReader` initialization. `on_views` receives the initial and each changed **complete** `Vec<FamiliarPresentation>` snapshot (`{id, preset, presentation}`); `on_reveal` receives `Option<Vec<String>>`; navigation receives `Vec<String>`; quit has no arguments. Callbacks run on the worker and must promptly enqueue/coalesce bounded UI work, not perform OS work. Old constructors remain test compatibility helpers without shutdown callbacks. `FamiliarControl::next(id)` and `close(id)` are bounded nonblocking GUI commands. Legacy headless output remains a `Presentation` for `main`.
+
+### Service readiness and graceful quit
+
+`numen service-info` sends `companion.service` without additional fields. API version is 1; data has `api_version`, nonzero `pid`, unique `service_instance`, `graphical`, `lifecycle`, and `navigation`, with no shutdown flag. These describe control handlers, not GPU/frame readiness. The query does not mutate sources or refresh producer liveness; its PID is information, never authorization to signal a process.
+
+Any request may include optional **root** `service_instance` using the same 1–96 ASCII identifier rules. If present it must exactly match this listener's instance; mismatch rejects before source/control mutation, liveness refresh or callback, with `service instance changed; reopen menu`. The menu pins discovery metadata and seals all subsequent RPCs, never repinning stale selected IDs after restart. New menus require instance metadata; older services must be restarted. One-shot CLI clients and producers may omit the precondition for compatibility. This per-listener generation identity is distinct from producer `instance`, is not persisted, and is not an authentication secret; private socket ownership/permissions remain the access boundary.
+
+`numen quit` sends `companion.quit` without additional fields. Current graphical startup installs the shutdown callback; headless/legacy handlers without one reject it. Success is `{"version":1,"ok":true,"data":{"quitting":true}}`: scheduled, not completed. After ACK flush, callback delivery waits for client EOF or 500 ms; later pipelined input is ignored. A coalesced root `AppEvent::QuitService` exits even with zero windows, drops all views and releases the server/owned socket/global hotkey. No source applications are terminated and no metadata PID is killed. Close remains per-view and last-close retains the service.
+
+Only offline **menu** Open can bootstrap detached current-executable `run --empty` (unless `--no-start`), with a five-second control-readiness bound. Discovery alone never spawns or writes files. Direct CLI/wire Open still needs a running graphical service. `run --empty` uses `Store::empty()`: no unattached `main` appears, even on source updates; it conflicts with manual/demo. Concurrent startup reuses the UDS winner; headless/outdated/unsafe existing services are never replaced or killed. See [Wisp](WISP.md) and [architecture](ARCHITECTURE.md#menu-bootstrap-and-quit).
+
+`numen go-to-mouse --familiar ID1 ID2` sends `familiar.go-to-mouse` with `ids`, not `familiars`. The field is required and non-null: 1–16 distinct valid IDs, each existing at dispatch. Missing/empty arrays, duplicates, invalid IDs and unknown/closed IDs reject the entire request before any callback; there is no implicit all or partial delivery. Unsupported handlers (including headless and old `start_with_familiars`) reject with `go-to-mouse requires graphical navigation support`. Success is `{"version":1,"ok":true,"data":{"moving":["ID1","ID2"]}}`; no arrival/completion event or guarantee is implied. Like other controls, this requires no producer registration and does not refresh liveness or mutate bindings/activity state.
+
+Navigation delivery uses a bounded target-only GUI queue (32 requests × 16 IDs), coalesces pending target sets, and applies the newest registry snapshot before starting views. Reissue restarts intent; a closing/failed view may disappear after acceptance. Current support is macOS only. Hard deadline gates bound fresh read-only pointer sampling and physics. Contact matches the compositor's physical sprite-alpha raster and requires actual native feedback against a held pose; predicted movement is not arrival. Success jumps once, then the latest attached emotes resume without expired cues or ongoing follow. No agent success is published. Space pauses motion/animation, not bubble deadlines; occlusion alone does not suspend pursuit or celebration. Native drag, digits, right-cycle, L, Tab and close cancel without success; reveal-all does not. See [coordinate details](ARCHITECTURE.md#navigation-and-coordinate-contract).
 
 ```json
 {"version":1,"ok":true,"data":{"mode":"shared-focused","focus":{"source":"djinn","instance":"producer-1","activity":"chatid"},"focus_available":true,"activities":[{"source":"djinn","instance":"producer-1","activity":"chatid","state":"working","attention":false,"reason":null,"summary":"Investigating retry backoff"}],"offset":0,"total":1,"next_offset":null}}
 ```
 
 `focus` is null before an activity has ever been selected; otherwise it is the exact `{source, instance, activity}` pin, even if unavailable. `focus_available` reports whether that record is currently present. `activities` contains up to **4** live `Selection` records, in lexical `(source, instance, activity)` order, including terminal states but excluding tombstones. Each selection has the fields shown above (no sequence); `summary` is optional and omitted when absent. `offset` echoes the requested index; `total` counts all live records; `next_offset` is the next page index or null. Out-of-range offsets return an empty page. Pages are current views, not an atomic multi-request snapshot; concurrent producer updates may change them. Four-record pages keep worst-case control ACKs, including summaries, below 8 KiB.
+
+Explicit scoped status additionally includes `familiar_id`. `activities` still lists canonical live activities, not just eligible targets. Use discovery ownership fields when building a selector.
+
+### Discovery and lifecycle
+
+`familiar.list` data is `{familiars, offset, total, next_offset}`. Each row has `id`, `preset`, `attachment` (exact tuple or null), `available`, optional cached `summary`, and `capabilities`. Multi-familiar GUI rows advertise `["info","attach","close"]`, extended to `["info","attach","close","go-to-mouse"]` only when the server has a navigation callback. Headless/legacy handlers advertise `[]`. Core store capabilities remain static; server-side advertisement matches installed handlers, not source capability claims. Other platforms currently omit navigation.
+
+`companion.targets` data is `{targets, offset, total, next_offset}`. Rows flatten the Selection fields above and add `claimed_by` (ID or null) and `eligible` (boolean). Only currently connected protocol-advertised activities appear, including terminals; unavailable waiting pins are not live targets but still reserve ownership. Eligibility means unclaimed, or already owned by the supplied familiar. The menu fetches fresh pages per selection, filters ineligible rows and excludes earlier pending choices. This is neither OS process discovery nor an actual Djinn adapter. Both discovery endpoints page four rows with the same paging semantics as status.
+
+Open items are `{id?, preset?, source, instance?, activity}`; preset defaults to `djinn`, the only supported preset. Attach items are `{id, source, instance?, activity}`. Targets are **flattened inside each item**, not nested or a shared batch target. IDs for presets and active familiars occupy different concepts. Offline CLI `presets` returns `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]}` without contacting a service.
+
+Open/Attach/Close require the multi-familiar graphical handler, not headless `listen` or a legacy reveal-only handler. Open does not bootstrap the service. Each Open/Attach entry resolves exactly one currently live `(source, instance, activity)`; omitted instance errors if ambiguous. Ownership is exclusive across all familiars, **including disconnected waiting pins**. Unknown presets, duplicate IDs/targets, unavailable/ambiguous targets or ownership conflicts reject the entire batch with no changes. Close likewise validates every distinct existing ID first. Attach allows reselecting one's own target, but cannot take a target currently held by another familiar even if that owner is in the same batch: swaps are rejected. Validation is repeated at mutation, not trusted from a previous discovery page. Sources are never executed or stopped.
+
+At most **16 active familiars**, including bootstrap `main`. Generated `familiar-N` IDs increase monotonically over the service lifetime without accumulating generated-ID history. Explicit-ID history is limited to 256 IDs plus reserved `main` (257 history entries total). Closed IDs cannot be reused, including generated IDs. Omit Open `id` to continue using generated IDs after explicit history fills. All state is ephemeral; restart resets IDs and no persistent profiles exist.
+
+Lifecycle ACKs confirm atomic registry acceptance, not GPU readiness. Complete snapshots drive asynchronous native-window/surface creation; a failure can remove the affected view after Open succeeded. Q/Esc/native close addresses only that familiar. Last-close leaves IPC/hotkey alive with zero windows; later Open remains valid. Manual/demo are socket-free single-view sessions whose close exits the process. Ctrl-C quits the service.
 
 ## Data Flow
 
@@ -69,17 +112,23 @@ Successful control ACKs add `data`, the status object (the CLI prints this objec
 
 ### Presentation policy
 
-The implemented mode is **shared-focused**: one visible familiar represents one selected conversation/activity, never aggregate concurrent conversations. With no pin yet, the first available activity is auto-chosen once; records arriving together in the initial snapshot are ordered lexically. Later arrivals cannot steal selection. The exact `(source, instance, activity)` pin survives removal, snapshot omission, disconnect and expiry. If unavailable, there is no base and the familiar rests until explicit selection/next (or that exact record becomes available again). There is no OS-focus inference.
+Each familiar implements **shared-focused** semantics: one selected activity, never aggregate work. Only bootstrap `main` auto-chooses the first unclaimed live activity once, lexically among records arriving together. Later arrivals cannot steal selection. Each exact pin survives removal, snapshot omission, disconnect and expiry with no base; it retains ownership while resting until explicit selection/next or that exact record returns. There is no OS-focus inference.
 
-`companion.focus` requires exactly one live match: missing or ambiguous matches error without changing the pin. Include `instance` to disambiguate identical source/activity pairs. `companion.next` cycles all live records, including terminal records, in lexical `(source, instance, activity)` order; an unavailable pin starts at the first record. Selection clears cues and never celebrates historical outcomes. Background activities remain tracked/queryable but cannot emote, cue or take over because of attention, failure or success.
+`companion.focus` requires exactly one live match not owned by another familiar; missing/ambiguous/conflicting matches leave the pin unchanged. Include `instance` to disambiguate. `companion.next` cycles eligible live records, including terminals, in lexical `(source, instance, activity)` order; an unavailable pin starts at the first eligible record. Selection clears only that familiar's cue without historical celebration. Background updates cannot take over. Bindings, cues and summary caches are per familiar over one canonical activity store.
 
 Only new `activity.state` transitions of the focused activity into succeeded/failed generate a **1.5-second** cue. Repeating the same terminal state with a newer sequence does not replay it. Failure replaces success; success cannot hide an active failure cue. Focused attention clears/drops cues, never queues them for later. Cancelled, idle, removal and disconnect do not generate completion cues.
 
 `Presentation {base, cue, following?}` preserves the focused record's identity even when its base state is terminal. Optional `following` has `{source, instance, activity, summary?, available}`; it retains the exact pin and last selected summary through removal, snapshot omission, disconnect and expiry. When unavailable, `base` and `cue` are null but `following.available` is false: this is not an unfocused presentation. Before selection, `following` is None and omitted (the default is `{"base":null,"cue":null}`). Focus changes replace the summary cache, including with None, so another chat's text cannot carry over. Background updates do not affect it.
 
-The GUI translates semantic states independently: external waiting → `review`, attention waiting → `waiting`, terminal base → idle. Fresh terminal cues play once, then rest unless the same focused activity has already resumed work. There is no restoration to other background work. The default bubble shows selected identity, summary (activity ID fallback), and **current base status**, not a transient cue: Idle, Working, Needs your input, Waiting on dependency, Completed, Failed, Cancelled, or Unavailable. With no selection it says Choose a conversation / Not following. Manual/demo expression overrides are visibly labeled Preview. Metadata-only changes repaint even while paused or on the same animation, without restarting animation or requesting focus.
+The GUI translates semantic states independently: external waiting → `review`, attention waiting → `waiting`, terminal base → idle. Fresh terminal cues play once, then rest unless the same focused activity has already resumed work. There is no restoration to other background work. When visible, the bubble shows selected identity, summary (activity ID fallback), and **current base status**, not a transient cue: Idle, Working, Needs your input, Waiting on dependency, Completed, Failed, Cancelled, or Unavailable. With no selection it says Choose a conversation / Not following. Manual/demo expression overrides are visibly labeled Preview. Metadata-only changes repaint even while paused or on the same animation, without restarting animation or requesting focus.
+
+Visibility is local GUI policy, not a producer field. It starts hidden; first selection/new focus and selected status/summary changes show brief notifications (default five seconds). Initial empty No conversation, heartbeats, reason-only changes, cue expiry and background updates do not notify. Automatic changes while visible do not extend the deadline. After expiry, 750 ms quiet time suppresses automatic changes without queueing them; explicit reveal/new focus bypasses quiet time and refreshes the duration. Hide runs even when paused/occluded. `--bubble-duration` accepts finite 0.25–30 seconds; `--always-bubble` opts into persistent debug/preview display and conflicts with hard-disable `--no-bubble`.
+
+Global macOS Option+I (Alt+I) registers once per process and reveals all current views; focused local fallback reveals that view. CLI `bubbles` supports all or a subset. Carbon via `global-hotkey` 0.9 is not all-keystroke capture/EventTap. Registration failure is nonfatal; another process may own the chord, so choose `--socket PATH`. `--no-hotkey` retains local fallback. `--no-bubble` skips registration and ignores every reveal without redacting metadata. The chord may override a dead-accent shortcut; actual background-focus chord acceptance remains pending, with no synthetic OS input used.
 
 A latest-only mailbox coalesces presentations with one pending GUI wake; acceptance is not an animation queue. Manual expression override is separate from service selection: L resumes the current selected base without changing conversation or replaying a cue; Tab queues next-selection and resumes live control. Both require a live-enabled GUI session.
+
+Tab/L reveal that view on live resume; 1–9/right-click reveal its Preview. Demo cycling does not auto-reveal. Only left-click or initial `main` with explicit startup `--focus` requests focus; later Open, notifications and reveal do not.
 
 ## Edge Cases
 
@@ -87,7 +136,7 @@ A latest-only mailbox coalesces presentations with one pending GUI wake; accepta
 
 - At most **16 registered sources** and **24 total connections** (`MAX_CLIENTS = MAX_SOURCES + 8`), including unregistered and standalone control clients. This leaves eight additional client slots beyond full producer capacity, not an unlimited or separately reserved control pool. At most **32 distinct activity IDs per source lifetime**, including removed/omitted tombstones; snapshots cannot contain duplicate IDs or more than 32 records.
 - One nonblocking worker polls every **25 ms**, with one bounded read and at most **8 messages per client per tick**. Input is bounded to 8 KiB plus the newline allowance; queued output is bounded to 16 KiB. There is no Tokio runtime or unbounded event log.
-- GUI focus requests use a **32-entry** bounded `FocusControl` channel and nonblocking `try_send`; at most eight are processed per worker tick. A full/disconnected channel reports failure rather than blocking the GUI. Tab resumes live control after successful enqueue, not after an acknowledged selection; an empty activity set cannot be cycled.
+- GUI `FamiliarControl::next(id)` / `close(id)` use a **32-entry** channel with nonblocking `try_send`; at most eight commands are processed per worker tick. Tab resumes after enqueue, not acknowledged selection. Close intent retries on saturation; accepted closes wait for registry snapshot removal without repeated submission. Native/GPU failure closes only its failed live view; common font initialization remains fatal. Per-view hide/pause deadlines are independent; the global exit deadline survives zero views.
 - Write-half-close drains complete buffered frames and ordered ACKs for up to **2 seconds**; an incomplete trailing EOF frame is discarded, not parsed. Full EOF retires the source after draining (or the drain deadline); a peer unable to receive ACKs cannot hold it indefinitely.
 - `listen` emits JSON `Presentation` changes (`base`, `cue`, optional `following`), not raw requests or every ACK. Latest-only coalescing and a detached stdout writer prevent an unread pipe from blocking the service/deadline. Intermediate views may be missed; the latest pending view is retained. Shutdown may truncate the last diagnostic line if the writer is blocked.
 
@@ -97,9 +146,11 @@ Numen makes no LLM calls, reads no transcripts and automatically copies no raw p
 
 Display typography is a local GUI concern, not a wire field or producer instruction. The physical-pixel CPU compositor uses `fontdue` advances, kerning, metrics and antialiased coverage, not bitmap cells or full-canvas nearest upscaling. Identity/status are clipped by measured width; summaries wrap to at most three lines according to available space/line height, with U+2026 `…` truncation. Larger fonts may reduce visible lines without resizing the sprite. These display limits do not truncate stored UTF-8 metadata or change the 160-byte validation limit.
 
-The default face is installed SauceCodePro Nerd Font Regular, discovered through `fontdb` system/user directories, with embedded OFL Source Code Pro Regular as fallback if the default is unavailable. No Kitty configuration is parsed at runtime. Explicit `run --font-family NAME` (exact Normal/Regular face) or `--font-file PATH` (face/index 0) errors on missing/invalid selection; they conflict. `--font-size` is finite 8–32, default 16 logical units scaled with the scene/display. Unicode/Nerd icon coverage depends on the face; missing glyphs use its U+FFFD, then `?`, then `.notdef`. No full script shaping, color emoji or fallback-font chain exists. See [font selection and limits](assets/fonts/README.md).
+The default face is installed SauceCodePro Nerd Font Regular, discovered through `fontdb` system/user directories, with embedded OFL Source Code Pro Regular as fallback if the default is unavailable. No Kitty configuration is parsed at runtime. Explicit `run --font-family NAME` (exact Normal/Regular face) or `--font-file PATH` (face/index 0) errors on missing/invalid selection; they conflict. `--font-size` is finite 8–32, default 12 logical units scaled with the scene/display. Unicode/Nerd icon coverage depends on the face; missing glyphs use its U+FFFD, then `?`, then `.notdef`. No full script shaping, color emoji or fallback-font chain exists. See [font selection and limits](assets/fonts/README.md).
 
-`--no-bubble` skips font lookup/loading even for an unusable family/file (CLI validation still applies), but does not redact metadata. `listen`, `publish`, `status`, `focus`, `check-assets`, and `font-license` never initialize fonts; `font-license` prints the full embedded SIL OFL 1.1 text without a GUI.
+`run --sprite-scale` is also local presentation configuration: finite 0.25–2, default 0.5, independent of bubble/text. The native window starts at 96 × 104 logical units, expands to 384 × 248 while revealed, and shrinks back with no hidden full-bubble input area. Native atlas cells remain 192 × 208; `--sprite-scale 1` gives 192 × 208 hidden or 384 × 352 revealed. Geometry preserves the sprite anchor where possible, clamps expansion to current monitor bounds, and restores the saved hidden position unless an explicit left-drag commits a new location; unsupported positioning is best-effort. `--scale` remains the whole-scene multiplier, default 1.5, including the font; text is rasterized at font size times actual physical scene scale. None of these options changes wire fields, source metadata, selection or payload limits.
+
+Bubble-capable GUIs load fonts once at initialization even while initially hidden. `--no-bubble` skips font lookup/loading even for an unusable family/file (CLI validation still applies), but does not redact metadata. `listen`, `publish`, `status`, `focus`, `bubbles`, `check-assets`, and `font-license` never initialize fonts; `font-license` prints the full embedded SIL OFL 1.1 text without a GUI.
 
 ### Socket paths and ownership
 
@@ -115,6 +166,14 @@ The bundled synchronous publisher bounds connection, write and ACK waits to 500 
 
 ## Example usage
 
+Service-only controls need no producer registration:
+
+```json
+{"version":1,"type":"companion.service"}
+```
+
+On a separate connection, `{"version":1,"type":"companion.quit"}` schedules graphical shutdown. Do not pipeline further controls after quit. CLI equivalents are `./target/debug/numen service-info` and `./target/debug/numen quit`.
+
 After a debug build, start `./target/debug/numen run`, or use `./target/debug/numen listen --exit-after 5` for headless diagnostics. In another terminal:
 
 ```sh
@@ -126,6 +185,9 @@ After a debug build, start `./target/debug/numen run`, or use `./target/debug/nu
 ./target/debug/numen status --offset 4
 ./target/debug/numen focus --source djinn --activity chatid --instance producer-1
 ./target/debug/numen focus --next
+./target/debug/numen bubbles # Graphical run only; brief reveal without changing selection
+./target/debug/numen go-to-mouse --familiar main # Navigation-capable graphical run only
+./target/debug/numen --socket /path/to/private/events.sock bubbles
 ```
 
 Defaults are source `diagnostic`, activity `task`, generated PID/time instance and three seconds per state. Each state is held while connected, with approximately one-second heartbeats. Demo sends working → waiting/attention → succeeded → working → failed → cancelled → idle. After the final hold it removes the activity with a newer sequence and disconnects. No GUI or asset decoding is needed for publishing.
@@ -147,21 +209,36 @@ The registration snapshot expresses current truth without a cue; the subsequent 
 
 The sequence-3 snapshot above omits `summary` on its present record, clearing the previous summary; the bubble then falls back to `task`.
 
-Control-only connection examples (no `source.register` needed; targets must already exist):
+Control-only connection examples (no `source.register` needed; focus/next require existing targets, reveal requires a graphical service):
 
 ```json
 {"version":1,"type":"companion.status"}
 {"version":1,"type":"companion.status","offset":4}
 {"version":1,"type":"companion.focus","source":"djinn","activity":"chatid","instance":"producer-1"}
 {"version":1,"type":"companion.next"}
+{"version":1,"type":"companion.reveal"}
+{"version":1,"type":"familiar.list","offset":0}
+{"version":1,"type":"companion.targets","familiar":"main","offset":0}
+{"version":1,"type":"familiar.open","items":[{"id":"build-pet","preset":"djinn","source":"build","instance":"worker-2","activity":"task"}]}
+{"version":1,"type":"companion.status","familiar":"build-pet"}
+{"version":1,"type":"companion.reveal","familiars":["build-pet"]}
+{"version":1,"type":"familiar.go-to-mouse","ids":["main","build-pet"]}
+{"version":1,"type":"familiar.attach","items":[{"id":"build-pet","source":"build","instance":"worker-3","activity":"task"}]}
+{"version":1,"type":"familiar.close","ids":["build-pet"]}
 ```
 
+Open/Attach examples require distinct, connected, eligible targets at mutation time. CLI equivalents are `open --source build --instance worker-2 --activity task --id build-pet` and `attach --familiar build-pet --source build --instance worker-3 --activity task`. For multiple selections, `open --batch FILE` / `attach --batch FILE` (or `--batch -` for stdin) reads a **root JSON array** of the corresponding item objects, not a request envelope; use `id`, not `familiar`, inside items. Batch input and the final request envelope must both fit the 8 KiB limit. `close --familiar ID1 ID2` sends an atomic close batch.
+
 ## Related files
+
+- [Wisp](WISP.md), [`src/menu.rs`](src/menu.rs), [`src/bootstrap.rs`](src/bootstrap.rs): client-side selection and menu-only empty bootstrap, not automatic source adapters.
 
 - [`src/protocol.rs`](src/protocol.rs): wire types, validation and constants.
 - [`src/ipc.rs`](src/ipc.rs): transport, ACKs, ownership, publisher and lifecycle tests.
 - [`src/activity.rs`](src/activity.rs): sequencing, snapshots, liveness and reduction.
 - [`src/display.rs`](src/display.rs), [`src/window.rs`](src/window.rs): GUI mapping and live input.
+- [`src/motion.rs`](src/motion.rs), [`src/pointer.rs`](src/pointer.rs): local pursuit/arrival and read-only macOS pointer snapshots, not producer activity events.
+- [`src/visibility.rs`](src/visibility.rs), [`src/hotkey.rs`](src/hotkey.rs): local notification policy and global shortcut registration, not wire activity fields.
 - [`src/bubble.rs`](src/bubble.rs), [`src/typography.rs`](src/typography.rs): focused summary/status text, physical-pixel rendering, font selection and preview tests.
 - [`src/main.rs`](src/main.rs), [`tests/cli.rs`](tests/cli.rs): CLI diagnostics and subprocess tests.
 - [README](README.md) and [Architecture](ARCHITECTURE.md): commands, validation status and future adapters.

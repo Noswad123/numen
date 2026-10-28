@@ -13,11 +13,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    activity::{Presentation, SourceId, Store},
+    activity::{FamiliarPresentation, Presentation, SourceId, Store},
     protocol::{self, Activity, ActivityState, Event, MAX_LINE, MAX_SOURCES, Request},
 };
 
@@ -35,6 +35,39 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 const EOF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OUTPUT: usize = 16 * 1024;
 const MESSAGES_PER_TICK: usize = 8;
+type TargetedReveal = dyn Fn(Option<Vec<String>>) + Send;
+type GoToMouse = dyn Fn(Vec<String>) + Send;
+
+#[derive(Default)]
+struct TargetedControls {
+    reveal: Option<Box<TargetedReveal>>,
+    go_to_mouse: Option<Box<GoToMouse>>,
+    quit: Option<Box<dyn Fn() + Send>>,
+}
+
+struct WorkerConfig {
+    targeted: TargetedControls,
+    bootstrap_main: bool,
+    service_instance: String,
+}
+
+struct ControlContext {
+    targeted: TargetedControls,
+    multi: bool,
+    service_instance: String,
+}
+
+fn new_service_instance() -> Result<String> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let instance = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    );
+    protocol::validate_id(&instance)?;
+    Ok(instance)
+}
 // Leave bounded control capacity even when all producer slots are occupied.
 const MAX_CLIENTS: usize = MAX_SOURCES + 8;
 
@@ -67,6 +100,11 @@ fn check_path(path: &Path) -> Result<()> {
         "socket path must name a socket file"
     );
     Ok(())
+}
+
+/// Validate or create only the private parent directory, without touching `path`.
+pub fn prepare_socket_parent(path: &Path) -> Result<()> {
+    private_parent(path, true)
 }
 
 fn private_parent(path: &Path, create: bool) -> Result<()> {
@@ -275,16 +313,52 @@ pub struct Server {
 
 #[derive(Clone)]
 pub struct FocusControl {
-    sender: SyncSender<()>,
+    sender: SyncSender<FamiliarCommand>,
 }
 
+#[derive(Debug)]
+enum FamiliarCommand {
+    Next(String),
+    Close(String),
+}
+
+#[derive(Clone)]
+pub struct FamiliarControl {
+    sender: SyncSender<FamiliarCommand>,
+}
+
+impl FamiliarControl {
+    pub fn next(&self, id: &str) -> Result<()> {
+        protocol::validate_id(id)?;
+        self.sender
+            .try_send(FamiliarCommand::Next(id.into()))
+            .context("queue familiar cycle")
+    }
+
+    pub fn close(&self, id: &str) -> Result<()> {
+        protocol::validate_id(id)?;
+        self.sender
+            .try_send(FamiliarCommand::Close(id.into()))
+            .context("queue familiar close")
+    }
+}
+
+#[cfg(test)]
 impl FocusControl {
     pub fn next(&self) -> Result<()> {
-        self.sender.try_send(()).context("queue focus cycle")
+        self.sender
+            .try_send(FamiliarCommand::Next("main".into()))
+            .context("queue focus cycle")
     }
 }
 
 impl Server {
+    pub fn familiar_control(&self) -> FamiliarControl {
+        FamiliarControl {
+            sender: self.focus.sender.clone(),
+        }
+    }
+    #[cfg(test)]
     pub fn focus_control(&self) -> FocusControl {
         self.focus.clone()
     }
@@ -292,6 +366,137 @@ impl Server {
     /// The callback runs on the service worker and must return promptly (for
     /// example, enqueue a GUI event). Drop wakes and joins that worker.
     pub fn start(path: &Path, on_change: impl Fn(Presentation) + Send + 'static) -> Result<Self> {
+        Self::start_inner(
+            path,
+            on_change,
+            None,
+            None,
+            TargetedControls::default(),
+            true,
+        )
+    }
+
+    /// Reveal requests call `on_reveal` once on the worker. It must return
+    /// promptly, for example by enqueueing a coalesced GUI broadcast event.
+    /// A successful acknowledgment means accepted, not that a frame was drawn.
+    #[cfg(test)]
+    pub fn start_with_reveal(
+        path: &Path,
+        on_change: impl Fn(Presentation) + Send + 'static,
+        on_reveal: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
+        Self::start_inner(
+            path,
+            on_change,
+            Some(Box::new(on_reveal)),
+            None,
+            TargetedControls::default(),
+            true,
+        )
+    }
+
+    /// Callbacks run on the worker and must promptly enqueue/coalesce UI work.
+    /// Views include the initial registry and every changed complete snapshot.
+    #[cfg(test)]
+    pub fn start_with_familiars(
+        path: &Path,
+        on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
+        on_reveal: impl Fn(Option<Vec<String>>) + Send + 'static,
+    ) -> Result<Self> {
+        Self::start_with_familiars_config(path, on_views, on_reveal, true)
+    }
+
+    /// With `bootstrap_main` false, the initial view snapshot is empty.
+    #[cfg(test)]
+    pub fn start_with_familiars_config(
+        path: &Path,
+        on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
+        on_reveal: impl Fn(Option<Vec<String>>) + Send + 'static,
+        bootstrap_main: bool,
+    ) -> Result<Self> {
+        Self::start_inner(
+            path,
+            |_| {},
+            None,
+            Some(Box::new(on_views)),
+            TargetedControls {
+                reveal: Some(Box::new(on_reveal)),
+                go_to_mouse: None,
+                quit: None,
+            },
+            bootstrap_main,
+        )
+    }
+
+    /// Callbacks run on the worker and must only post bounded UI events, not do
+    /// OS work. A `data: {moving: ids}` acknowledgment means the navigation
+    /// request was accepted, not that the familiars have arrived.
+    #[cfg(test)]
+    pub fn start_with_navigation(
+        path: &Path,
+        on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
+        on_reveal: impl Fn(Option<Vec<String>>) + Send + 'static,
+        on_go_to_mouse: impl Fn(Vec<String>) + Send + 'static,
+    ) -> Result<Self> {
+        Self::start_with_navigation_config(path, on_views, on_reveal, on_go_to_mouse, true)
+    }
+
+    /// With `bootstrap_main` false, the initial view snapshot is empty.
+    #[cfg(test)]
+    pub fn start_with_navigation_config(
+        path: &Path,
+        on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
+        on_reveal: impl Fn(Option<Vec<String>>) + Send + 'static,
+        on_go_to_mouse: impl Fn(Vec<String>) + Send + 'static,
+        bootstrap_main: bool,
+    ) -> Result<Self> {
+        Self::start_inner(
+            path,
+            |_| {},
+            None,
+            Some(Box::new(on_views)),
+            TargetedControls {
+                reveal: Some(Box::new(on_reveal)),
+                go_to_mouse: Some(Box::new(on_go_to_mouse)),
+                quit: None,
+            },
+            bootstrap_main,
+        )
+    }
+
+    /// Callbacks run on the worker and must promptly enqueue bounded UI work.
+    /// Quit is scheduled after its ACK is flushed and the peer closes, or after
+    /// 500 ms if the peer stays open. The UI owns event-loop exit and server drop.
+    pub fn start_graphical(
+        path: &Path,
+        on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
+        on_reveal: impl Fn(Option<Vec<String>>) + Send + 'static,
+        on_go_to_mouse: Option<Box<GoToMouse>>,
+        on_quit: impl Fn() + Send + 'static,
+        bootstrap_main: bool,
+    ) -> Result<Self> {
+        Self::start_inner(
+            path,
+            |_| {},
+            None,
+            Some(Box::new(on_views)),
+            TargetedControls {
+                reveal: Some(Box::new(on_reveal)),
+                go_to_mouse: on_go_to_mouse,
+                quit: Some(Box::new(on_quit)),
+            },
+            bootstrap_main,
+        )
+    }
+
+    fn start_inner(
+        path: &Path,
+        on_change: impl Fn(Presentation) + Send + 'static,
+        on_reveal: Option<Box<dyn Fn() + Send>>,
+        on_views: Option<Box<dyn Fn(Vec<FamiliarPresentation>) + Send>>,
+        targeted: TargetedControls,
+        bootstrap_main: bool,
+    ) -> Result<Self> {
         private_parent(path, true)?;
         match fs::symlink_metadata(path) {
             Ok(_) => {
@@ -320,12 +525,28 @@ impl Server {
         let owner = SocketOwner::new(path, &socket_metadata(path)?);
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        // Listener identity is a restart precondition, not an authentication secret.
+        let service_instance = new_service_instance()?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let (sender, receiver) = mpsc::sync_channel(32);
         let worker = thread::Builder::new()
             .name("numen-ipc".into())
-            .spawn(move || run(listener, worker_stop, receiver, on_change))?;
+            .spawn(move || {
+                run(
+                    listener,
+                    worker_stop,
+                    receiver,
+                    on_change,
+                    on_reveal,
+                    on_views,
+                    WorkerConfig {
+                        targeted,
+                        bootstrap_main,
+                        service_instance,
+                    },
+                )
+            })?;
         Ok(Self {
             stop,
             worker: Some(worker),
@@ -354,15 +575,42 @@ struct Client {
     source: Option<SourceId>,
     read_eof: bool,
     drain_started: Option<Instant>,
+    pending_quit: bool,
+    quit_flushed: Option<Instant>,
 }
 
 impl Client {
+    #[cfg(test)]
     fn step(
         &mut self,
         store: &mut Store,
         now: Instant,
         changed: &mut impl FnMut(&mut Store, Instant),
+        on_reveal: Option<&(dyn Fn() + Send)>,
     ) -> bool {
+        self.step_inner(
+            store,
+            now,
+            changed,
+            on_reveal,
+            &ControlContext {
+                targeted: TargetedControls::default(),
+                multi: false,
+                service_instance: "test-service".into(),
+            },
+        )
+    }
+
+    fn step_inner(
+        &mut self,
+        store: &mut Store,
+        now: Instant,
+        changed: &mut impl FnMut(&mut Store, Instant),
+        on_reveal: Option<&(dyn Fn() + Send)>,
+        controls: &ControlContext,
+    ) -> bool {
+        let multi = controls.multi;
+        let targeted = &controls.targeted;
         if self
             .drain_started
             .is_some_and(|started| now.saturating_duration_since(started) >= EOF_DRAIN_TIMEOUT)
@@ -393,6 +641,11 @@ impl Client {
             }
         }
         for _ in 0..MESSAGES_PER_TICK {
+            if self.pending_quit {
+                // Discard pipelined requests, but keep bounded reads to detect EOF.
+                self.input.clear();
+                break;
+            }
             let Some(end) = self.input.iter().position(|b| *b == b'\n') else {
                 if self.read_eof {
                     // EOF cannot complete a trailing frame. Discard it only
@@ -406,22 +659,124 @@ impl Client {
             if end > MAX_LINE {
                 return false;
             }
+            let mut skip_changed = false;
             let result = Request::parse(&self.input[..end]).and_then(|request| {
+                if request
+                    .service_instance
+                    .as_ref()
+                    .is_some_and(|expected| expected != &controls.service_instance)
+                {
+                    skip_changed = true;
+                    bail!("service instance changed; reopen menu");
+                }
                 let event = match request.event {
-                    Event::Status { offset } => {
-                        return Ok(Some(serde_json::to_value(store.status(offset))?));
+                    Event::Quit => {
+                        skip_changed = true;
+                        ensure!(
+                            targeted.quit.is_some(),
+                            "companion.quit unsupported: no graphical shutdown callback"
+                        );
+                        self.pending_quit = true;
+                        return Ok(Some(json!({"quitting":true})));
+                    }
+                    Event::Service => {
+                        skip_changed = true;
+                        // Reports control readiness, not completion of a GPU frame.
+                        return Ok(Some(json!({
+                            "api_version": 1,
+                            "service_instance": controls.service_instance,
+                            "pid": std::process::id(),
+                            "graphical": multi,
+                            "lifecycle": multi,
+                            "navigation": targeted.go_to_mouse.is_some(),
+                        })));
+                    }
+                    Event::Status { offset, familiar } => {
+                        return Ok(Some(serde_json::to_value(
+                            store.status_for(offset, familiar.as_deref())?,
+                        )?));
                     }
                     Event::Focus {
                         source,
                         instance,
                         activity,
+                        familiar,
                     } => {
-                        store.focus(&source, instance.as_deref(), &activity)?;
+                        if let Some(id) = familiar.as_deref() {
+                            store.focus_for(id, &source, instance.as_deref(), &activity)?;
+                        } else {
+                            store.focus(&source, instance.as_deref(), &activity)?;
+                        }
+                        return Ok(Some(serde_json::to_value(
+                            store.status_for(0, familiar.as_deref())?,
+                        )?));
+                    }
+                    Event::Next { familiar } => {
+                        if let Some(id) = familiar.as_deref() {
+                            store.cycle_for(id)?;
+                        } else {
+                            store.cycle()?;
+                        }
+                        return Ok(Some(serde_json::to_value(
+                            store.status_for(0, familiar.as_deref())?,
+                        )?));
+                    }
+                    Event::Reveal { familiars } => {
+                        if let Some(ids) = &familiars {
+                            for id in ids {
+                                store.require_familiar(id)?;
+                            }
+                        }
+                        if let Some(reveal) = &targeted.reveal {
+                            reveal(familiars);
+                        } else {
+                            ensure!(
+                                familiars.is_none(),
+                                "targeted reveal requires multi-familiar graphical support"
+                            );
+                            on_reveal.context("no graphical familiar")?();
+                        }
                         return Ok(Some(serde_json::to_value(store.status(0))?));
                     }
-                    Event::Next => {
-                        store.cycle()?;
-                        return Ok(Some(serde_json::to_value(store.status(0))?));
+                    Event::FamiliarList { offset } => {
+                        let mut list = store.list(offset);
+                        if let Some(rows) = list["familiars"].as_array_mut() {
+                            for row in rows {
+                                if !multi {
+                                    row["capabilities"] = json!([]);
+                                } else if targeted.go_to_mouse.is_some() {
+                                    row["capabilities"] =
+                                        json!(["info", "attach", "close", "go-to-mouse"]);
+                                }
+                            }
+                        }
+                        return Ok(Some(list));
+                    }
+                    Event::GoToMouse { ids } => {
+                        let go_to_mouse = targeted
+                            .go_to_mouse
+                            .as_ref()
+                            .context("go-to-mouse requires graphical navigation support")?;
+                        for id in &ids {
+                            store.require_familiar(id)?;
+                        }
+                        go_to_mouse(ids.clone());
+                        return Ok(Some(json!({"moving":ids})));
+                    }
+                    Event::Targets { offset, familiar } => {
+                        return Ok(Some(store.targets(offset, familiar.as_deref())?));
+                    }
+                    Event::Open { items } => {
+                        ensure!(multi, "no graphical familiar");
+                        return Ok(Some(json!({"opened":store.open(&items)?})));
+                    }
+                    Event::Attach { items } => {
+                        ensure!(multi, "no graphical familiar");
+                        return Ok(Some(json!({"attached":store.attach(&items)?})));
+                    }
+                    Event::Close { ids } => {
+                        ensure!(multi, "no graphical familiar");
+                        return Ok(Some(json!({"closed":store.close(&ids)?})));
                     }
                     event => event,
                 };
@@ -458,7 +813,9 @@ impl Client {
                 return false;
             }
             self.output.extend(line);
-            changed(store, now);
+            if !skip_changed {
+                changed(store, now);
+            }
         }
         if self.written < self.output.len() {
             match self.stream.write(&self.output[self.written..]) {
@@ -475,6 +832,12 @@ impl Client {
         if self.written == self.output.len() {
             self.output.clear();
             self.written = 0;
+            if self.pending_quit {
+                let flushed = *self.quit_flushed.get_or_insert_with(Instant::now);
+                if self.read_eof || now.saturating_duration_since(flushed) >= IO_TIMEOUT {
+                    return false;
+                }
+            }
         }
         if self.read_eof && !self.input.contains(&b'\n') {
             self.input.clear();
@@ -486,29 +849,75 @@ impl Client {
 fn run(
     listener: UnixListener,
     stop: Arc<AtomicBool>,
-    focus: Receiver<()>,
+    focus: Receiver<FamiliarCommand>,
     on_change: impl Fn(Presentation),
+    on_reveal: Option<Box<dyn Fn() + Send>>,
+    on_views: Option<Box<dyn Fn(Vec<FamiliarPresentation>) + Send>>,
+    config: WorkerConfig,
 ) {
-    let mut store = Store::default();
+    let WorkerConfig {
+        targeted,
+        bootstrap_main,
+        service_instance,
+    } = config;
+    let controls = ControlContext {
+        targeted,
+        multi: on_views.is_some(),
+        service_instance,
+    };
+    let mut store = if bootstrap_main {
+        Store::default()
+    } else {
+        Store::empty()
+    };
     let mut previous = Presentation::default();
     on_change(previous.clone());
+    let mut previous_views = store.presentations(Instant::now());
+    if let Some(callback) = &on_views {
+        callback(previous_views.clone());
+    }
     let mut changed = |store: &mut Store, now| {
         let view = store.presentation(now);
         if view != previous {
             previous = view.clone();
             on_change(view);
         }
+        let views = store.presentations(now);
+        if views != previous_views {
+            previous_views = views.clone();
+            if let Some(callback) = &on_views {
+                callback(views);
+            }
+        }
     };
     let mut clients: Vec<Client> = Vec::new();
+    let mut quit_requested = false;
     while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
         let expired = store.expire(now);
-        clients.retain(|c| !c.source.as_ref().is_some_and(|id| expired.contains(id)));
+        let mut quit_ready = false;
+        clients.retain(|c| {
+            let alive = !c.source.as_ref().is_some_and(|id| expired.contains(id));
+            quit_ready |= !alive && c.pending_quit;
+            alive
+        });
         for _ in 0..MESSAGES_PER_TICK {
-            if focus.try_recv().is_err() {
+            let Ok(command) = focus.try_recv() else {
                 break;
+            };
+            let result = match command {
+                FamiliarCommand::Next(id) => store.cycle_for(&id),
+                FamiliarCommand::Close(id) => {
+                    if on_views.is_some() {
+                        store.close(&[id]).map(|_| ())
+                    } else {
+                        Err(anyhow::anyhow!("no graphical familiar"))
+                    }
+                }
+            };
+            if let Err(error) = result {
+                eprintln!("numen familiar control: {error}");
             }
-            let _ = store.cycle();
             changed(&mut store, now);
         }
         changed(&mut store, now);
@@ -525,6 +934,8 @@ fn run(
                             source: None,
                             read_eof: false,
                             drain_started: None,
+                            pending_quit: false,
+                            quit_flushed: None,
                         });
                     }
                 }
@@ -534,8 +945,15 @@ fn run(
             }
         }
         clients.retain_mut(|client| {
-            let alive = client.step(&mut store, now, &mut changed);
+            let alive = client.step_inner(
+                &mut store,
+                now,
+                &mut changed,
+                on_reveal.as_deref(),
+                &controls,
+            );
             if !alive {
+                quit_ready |= client.pending_quit;
                 if let Some(id) = &client.source {
                     store.disconnect(id);
                 }
@@ -543,6 +961,12 @@ fn run(
             }
             alive
         });
+        if quit_ready && !quit_requested {
+            quit_requested = true;
+            if let Some(quit) = &controls.targeted.quit {
+                quit();
+            }
+        }
         thread::park_timeout(TICK);
     }
 }
@@ -579,7 +1003,18 @@ pub fn control(path: &Path, request: serde_json::Value) -> Result<serde_json::Va
     ensure!(
         matches!(
             Request::parse(&bytes)?.event,
-            Event::Status { .. } | Event::Focus { .. } | Event::Next
+            Event::Status { .. }
+                | Event::Service
+                | Event::Quit
+                | Event::Focus { .. }
+                | Event::Next { .. }
+                | Event::Reveal { .. }
+                | Event::FamiliarList { .. }
+                | Event::Targets { .. }
+                | Event::Open { .. }
+                | Event::Attach { .. }
+                | Event::Close { .. }
+                | Event::GoToMouse { .. }
         ),
         "expected companion control request"
     );
@@ -705,6 +1140,753 @@ mod tests {
         (dir, path)
     }
 
+    #[test]
+    fn listener_instances_are_unique_across_same_process_listeners_and_restarts() {
+        let (_dir, path) = fixture();
+        let other_path = path.with_file_name("other.sock");
+        let server = Server::start(&path, |_| {}).unwrap();
+        let _other = Server::start(&other_path, |_| {}).unwrap();
+        let request = json!({"version":1,"type":"companion.service"});
+        let first = control(&path, request.clone()).unwrap();
+        let other = control(&other_path, request.clone()).unwrap();
+        drop(server);
+        let _restarted = Server::start(&path, |_| {}).unwrap();
+        let restarted = control(&path, request).unwrap();
+        for info in [&first, &other, &restarted] {
+            assert_eq!(info["pid"], std::process::id());
+            protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
+        }
+        assert_ne!(first["service_instance"], other["service_instance"]);
+        assert_ne!(first["service_instance"], restarted["service_instance"]);
+        assert_ne!(other["service_instance"], restarted["service_instance"]);
+        assert!(
+            control(
+                &path,
+                json!({"version":1,"type":"companion.service",
+            "service_instance":first["service_instance"]})
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("service instance changed; reopen menu")
+        );
+    }
+
+    #[test]
+    fn stale_menu_cannot_close_reused_familiar_id_after_restart() {
+        let (_dir, path) = fixture();
+        let mut previous_instance = None;
+        for _ in 0..2 {
+            let server = Server::start_with_familiars_config(
+                &path,
+                |_| {},
+                |_| panic!("unexpected reveal"),
+                false,
+            )
+            .unwrap();
+            let info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+            let mut producer = Publisher::connect(&path, "test", "producer-1").unwrap();
+            producer
+                .update("task", 1, ActivityState::Working, false, None)
+                .unwrap();
+            assert_eq!(
+                control(
+                    &path,
+                    json!({"version":1,"type":"familiar.open",
+                "items":[{"source":"test","activity":"task"}]})
+                )
+                .unwrap(),
+                json!({"opened":["familiar-1"]})
+            );
+            if let Some(stale) = previous_instance {
+                let before = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+                assert!(
+                    control(
+                        &path,
+                        json!({"version":1,"type":"familiar.close",
+                    "ids":["familiar-1"],"service_instance":stale})
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("service instance changed; reopen menu")
+                );
+                assert_eq!(
+                    control(&path, json!({"version":1,"type":"familiar.list"})).unwrap(),
+                    before
+                );
+            }
+            previous_instance = Some(info["service_instance"].clone());
+            drop(producer);
+            drop(server);
+        }
+    }
+
+    #[test]
+    fn matching_service_preconditions_accept_producers_and_graphical_controls() {
+        let (_dir, path) = fixture();
+        let (reveal_tx, reveals) = mpsc::channel();
+        let (quit_tx, quits) = mpsc::channel();
+        let _server = Server::start_graphical(
+            &path,
+            |_| {},
+            move |ids| reveal_tx.send(ids).unwrap(),
+            None,
+            move || quit_tx.send(()).unwrap(),
+            false,
+        )
+        .unwrap();
+        let info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+        let instance = &info["service_instance"];
+        assert_eq!(
+            control(
+                &path,
+                json!({"version":1,"type":"companion.service",
+            "service_instance":instance})
+            )
+            .unwrap(),
+            info
+        );
+        let mut producer = Publisher {
+            stream: connect_private(&path).unwrap(),
+        };
+        producer
+            .send(json!({"version":1,"type":"source.register","source":"test",
+            "instance":"producer-1","activities":[],"service_instance":instance}))
+            .unwrap();
+        producer
+            .send(
+                json!({"version":1,"type":"activity.state","activity":"task",
+            "sequence":1,"state":"working","service_instance":instance}),
+            )
+            .unwrap();
+        producer.heartbeat().unwrap();
+        assert_eq!(
+            control(
+                &path,
+                json!({"version":1,"type":"familiar.open",
+            "items":[{"source":"test","instance":"producer-1","activity":"task"}],
+            "service_instance":instance})
+            )
+            .unwrap(),
+            json!({"opened":["familiar-1"]})
+        );
+        control(
+            &path,
+            json!({"version":1,"type":"companion.reveal",
+            "familiars":["familiar-1"],"service_instance":instance}),
+        )
+        .unwrap();
+        assert_eq!(
+            reveals.recv_timeout(IO_TIMEOUT).unwrap(),
+            Some(vec![String::from("familiar-1")])
+        );
+        assert_eq!(
+            control(
+                &path,
+                json!({"version":1,"type":"familiar.close",
+            "ids":["familiar-1"],"service_instance":instance})
+            )
+            .unwrap(),
+            json!({"closed":["familiar-1"]})
+        );
+        assert_eq!(
+            control(
+                &path,
+                json!({"version":1,"type":"companion.quit",
+            "service_instance":instance})
+            )
+            .unwrap(),
+            json!({"quitting":true})
+        );
+        quits.recv_timeout(IO_TIMEOUT).unwrap();
+        assert!(reveals.try_recv().is_err());
+        assert!(quits.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_service_preconditions_never_touch_store_callbacks_or_client_binding() {
+        let packets = [
+            json!({"type":"familiar.open","items":[{"source":"test","activity":"task"}]}),
+            json!({"type":"familiar.close","ids":["main"]}),
+            json!({"type":"familiar.attach","items":[{"id":"main","source":"test","activity":"task"}]}),
+            json!({"type":"companion.focus","source":"test","activity":"other"}),
+            json!({"type":"companion.next"}),
+            json!({"type":"companion.reveal","familiars":["main"]}),
+            json!({"type":"familiar.go-to-mouse","ids":["main"]}),
+            json!({"type":"companion.quit"}),
+            json!({"type":"companion.service"}),
+            json!({"type":"companion.status"}),
+            json!({"type":"familiar.list"}),
+            json!({"type":"companion.targets"}),
+            json!({"type":"source.register","source":"new","instance":"producer-2","activities":[]}),
+            json!({"type":"activity.state","activity":"task","sequence":3,"state":"working"}),
+            json!({"type":"source.heartbeat"}),
+            json!({"type":"source.snapshot","activities":[]}),
+            json!({"type":"activity.remove","activity":"task","sequence":3}),
+        ];
+        for mut packet in packets {
+            let now = Instant::now();
+            let id = ("test".into(), "producer-1".into());
+            let mut store = Store::default();
+            let mut activity = Activity {
+                activity: "task".into(),
+                sequence: 1,
+                state: ActivityState::Working,
+                attention: false,
+                reason: None,
+                summary: Some("Keep summary".into()),
+            };
+            store
+                .register(id.clone(), vec![activity.clone()], now)
+                .unwrap();
+            activity.sequence = 2;
+            activity.state = ActivityState::Failed;
+            store.apply(&id, Event::State { activity }, now).unwrap();
+            let before = store.presentations(now);
+            assert!(before[0].presentation.cue.is_some());
+            let status = serde_json::to_value(store.status(0)).unwrap();
+            let list = store.list(0);
+            let targets = store.targets(0, None).unwrap();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            let source = (packet["type"] != "source.register").then(|| id.clone());
+            let mut client = Client {
+                stream,
+                input: Vec::new(),
+                output: Vec::new(),
+                written: 0,
+                connected: now + Duration::from_secs(9),
+                source: source.clone(),
+                read_eof: false,
+                drain_started: None,
+                pending_quit: false,
+                quit_flushed: None,
+            };
+            let controls = ControlContext {
+                targeted: TargetedControls {
+                    reveal: Some(Box::new(|_| panic!("stale reveal"))),
+                    go_to_mouse: Some(Box::new(|_| panic!("stale navigation"))),
+                    quit: Some(Box::new(|| panic!("stale quit"))),
+                },
+                multi: true,
+                service_instance: "current-service".into(),
+            };
+            packet["version"] = 1.into();
+            // Case-only differences must also fail: this comparison is exact.
+            packet["service_instance"] = "Current-service".into();
+            writeln!(peer, "{packet}").unwrap();
+            assert!(client.step_inner(
+                &mut store,
+                now + Duration::from_secs(9),
+                &mut |_, _| panic!("stale request must not recompute presentations"),
+                Some(&|| panic!("stale legacy reveal")),
+                &controls,
+            ));
+            let mut response = String::new();
+            std::io::BufRead::read_line(&mut io::BufReader::new(&mut peer), &mut response).unwrap();
+            let ack: Ack = serde_json::from_str(&response).unwrap();
+            assert!(!ack.ok, "{packet}");
+            assert_eq!(
+                ack.error.as_deref(),
+                Some("service instance changed; reopen menu")
+            );
+            assert!(ack.data.is_none());
+            assert_eq!(client.source, source);
+            assert!(!client.pending_quit);
+            assert!(client.quit_flushed.is_none());
+            assert_eq!(store.presentations(now), before);
+            assert_eq!(serde_json::to_value(store.status(0)).unwrap(), status);
+            assert_eq!(store.list(0), list);
+            assert_eq!(store.targets(0, None).unwrap(), targets);
+            assert_eq!(
+                store.expire(now + crate::activity::SOURCE_TIMEOUT),
+                vec![id]
+            );
+            assert_eq!(serde_json::to_value(store.status(0)).unwrap()["total"], 0);
+        }
+    }
+
+    #[test]
+    fn graphical_quit_ack_precedes_peer_close_and_callback_is_once() {
+        for bootstrap_main in [false, true] {
+            let (_dir, path) = fixture();
+            let (views_tx, views) = mpsc::channel();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = calls.clone();
+            let (tx, quits) = mpsc::channel();
+            let _server = Server::start_graphical(
+                &path,
+                move |v| views_tx.send(v).unwrap(),
+                |_| {},
+                None,
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tx.send(()).unwrap();
+                },
+                bootstrap_main,
+            )
+            .unwrap();
+            assert_eq!(
+                views.recv_timeout(IO_TIMEOUT).unwrap().len(),
+                usize::from(bootstrap_main)
+            );
+            let info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+            protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                info,
+                json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false})
+            );
+            let mut peer = Publisher {
+                stream: connect_private(&path).unwrap(),
+            };
+            assert_eq!(
+                peer.exchange(json!({"version":1,"type":"companion.quit"}))
+                    .unwrap(),
+                Some(json!({"quitting":true}))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(quits.try_recv().is_err());
+            drop(peer);
+            quits.recv_timeout(IO_TIMEOUT).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            // A callback schedules UI exit; it does not stop the worker itself.
+            assert_eq!(
+                control(&path, json!({"version":1,"type":"companion.quit"})).unwrap(),
+                json!({"quitting":true})
+            );
+            assert!(quits.recv_timeout(IO_TIMEOUT + TICK * 2).is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(views.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn graphical_quit_wait_is_bounded_and_ignores_pipelined_requests() {
+        let (_dir, path) = fixture();
+        let (tx, quits) = mpsc::channel();
+        let _server = Server::start_graphical(
+            &path,
+            |_| {},
+            |_| {},
+            None,
+            move || tx.send(Instant::now()).unwrap(),
+            false,
+        )
+        .unwrap();
+        let mut peer = connect_private(&path).unwrap();
+        let started = Instant::now();
+        peer.write_all(b"{\"version\":1,\"type\":\"companion.quit\"}\n{\"version\":1,\"type\":\"companion.service\"}\n").unwrap();
+        let mut response = String::new();
+        std::io::BufRead::read_line(&mut io::BufReader::new(&mut peer), &mut response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+            json!({"version":1,"ok":true,"data":{"quitting":true}})
+        );
+        assert!(quits.try_recv().is_err());
+        // An unrelated client remains usable while the quitting peer stays open.
+        assert_eq!(
+            control(&path, json!({"version":1,"type":"companion.service"})).unwrap()["graphical"],
+            true
+        );
+        let called = quits.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(called.duration_since(started) >= IO_TIMEOUT);
+        assert!(called.duration_since(started) < Duration::from_millis(1500));
+        let mut extra = Vec::new();
+        peer.read_to_end(&mut extra).unwrap();
+        assert!(extra.is_empty());
+        assert!(quits.recv_timeout(TICK * 2).is_err());
+    }
+
+    #[test]
+    fn malformed_quit_never_schedules_shutdown_and_disconnected_quit_still_does() {
+        let (_dir, path) = fixture();
+        let (tx, quits) = mpsc::channel();
+        let _server = Server::start_graphical(
+            &path,
+            |_| {},
+            |_| {},
+            Some(Box::new(|_| {})),
+            move || tx.send(()).unwrap(),
+            false,
+        )
+        .unwrap();
+        let mut peer = connect_private(&path).unwrap();
+        peer.write_all(b"{\"version\":1,\"type\":\"companion.quit\",}\n{\"version\":2,\"type\":\"companion.quit\"}\n{\"type\":\"companion.quit\"}\n").unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        peer.read_to_string(&mut response).unwrap();
+        let acks: Vec<Ack> = response
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(acks.len(), 3);
+        assert!(acks.iter().all(|ack| !ack.ok));
+        assert!(quits.try_recv().is_err());
+        assert_eq!(
+            control(&path, json!({"version":1,"type":"companion.service"})).unwrap()["navigation"],
+            true
+        );
+        let mut peer = connect_private(&path).unwrap();
+        peer.write_all(b"{\"version\":1,\"type\":\"companion.quit\"}\n")
+            .unwrap();
+        // Acceptance still schedules shutdown even if the peer never reads its ACK.
+        drop(peer);
+        quits.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(quits.recv_timeout(TICK * 2).is_err());
+    }
+
+    #[test]
+    fn quit_is_unsupported_without_shutdown_callback() {
+        for mode in 0..4 {
+            let (_dir, path) = fixture();
+            let _server = match mode {
+                0 => Server::start(&path, |_| {}),
+                1 => Server::start_with_reveal(&path, |_| {}, || {}),
+                2 => Server::start_with_familiars(&path, |_| {}, |_| {}),
+                _ => Server::start_with_navigation(&path, |_| {}, |_| {}, |_| {}),
+            }
+            .unwrap();
+            let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+            producer
+                .update("task", 1, ActivityState::Working, false, None)
+                .unwrap();
+            let before = control(&path, json!({"version":1,"type":"companion.status"})).unwrap();
+            let request = json!({"version":1,"type":"companion.quit"});
+            assert!(
+                control(&path, request.clone())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("companion.quit unsupported")
+            );
+            assert!(
+                producer
+                    .exchange(request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("companion.quit unsupported")
+            );
+            assert_eq!(
+                control(&path, json!({"version":1,"type":"companion.status"})).unwrap(),
+                before
+            );
+            producer.heartbeat().unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_gui_workers_publish_empty_or_legacy_initial_registry() {
+        for navigation in [false, true] {
+            for bootstrap_main in [false, true] {
+                let (_dir, path) = fixture();
+                let (tx, views) = mpsc::channel();
+                let on_views = move |v| {
+                    tx.send(v).unwrap();
+                };
+                let _server = if navigation {
+                    Server::start_with_navigation_config(
+                        &path,
+                        on_views,
+                        |_| {},
+                        |_| {},
+                        bootstrap_main,
+                    )
+                } else {
+                    Server::start_with_familiars_config(&path, on_views, |_| {}, bootstrap_main)
+                }
+                .unwrap();
+                let initial = views.recv_timeout(IO_TIMEOUT).unwrap();
+                assert_eq!(initial.len(), usize::from(bootstrap_main));
+                if bootstrap_main {
+                    assert_eq!(initial[0].id, "main");
+                }
+                let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+                producer
+                    .update("first", 1, ActivityState::Working, false, None)
+                    .unwrap();
+                let status =
+                    control(&path, json!({"version":1,"type":"companion.status"})).unwrap();
+                if bootstrap_main {
+                    assert_eq!(status["focus"]["activity"], "first");
+                    assert_eq!(views.recv_timeout(IO_TIMEOUT).unwrap()[0].id, "main");
+                } else {
+                    assert!(status["focus"].is_null());
+                    assert_eq!(status["focus_available"], false);
+                    assert_eq!(status["total"], 1);
+                    assert!(views.try_recv().is_err());
+                    let opened = control(&path, json!({"version":1,"type":"familiar.open","items":[{"source":"test","activity":"first"}]})).unwrap();
+                    assert_eq!(opened, json!({"opened":["familiar-1"]}));
+                    let snapshot = views.recv_timeout(IO_TIMEOUT).unwrap();
+                    assert_eq!(snapshot.len(), 1);
+                    assert_eq!(snapshot[0].id, "familiar-1");
+                    assert_eq!(
+                        snapshot[0].presentation.base.as_ref().unwrap().activity,
+                        "first"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registered_quit_does_not_touch_store_and_waits_for_ack_flush() {
+        for supported in [false, true] {
+            let now = Instant::now() - Duration::from_secs(9);
+            let id = ("test".into(), "one".into());
+            let mut store = Store::default();
+            let mut activity = Activity {
+                activity: "task".into(),
+                sequence: 1,
+                state: ActivityState::Working,
+                attention: false,
+                reason: None,
+                summary: Some("Keep summary".into()),
+            };
+            store
+                .register(id.clone(), vec![activity.clone()], now)
+                .unwrap();
+            activity.sequence = 2;
+            activity.state = ActivityState::Failed;
+            store.apply(&id, Event::State { activity }, now).unwrap();
+            let before = store.presentations(now);
+            assert!(before[0].presentation.cue.is_some());
+            let status = serde_json::to_value(store.status(0)).unwrap();
+            let list = store.list(0);
+            let (mut stream, mut peer) = UnixStream::pair().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            // Fill the server's send buffer so its first ACK write cannot finish.
+            let padding = [b'x'; 4096];
+            let mut filled = 0;
+            loop {
+                match stream.write(&padding) {
+                    Ok(n) => {
+                        assert!(n > 0);
+                        filled += n;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("fill socket: {e}"),
+                }
+            }
+            let mut client = Client {
+                stream,
+                input: Vec::new(),
+                output: Vec::new(),
+                written: 0,
+                connected: now,
+                source: Some(id.clone()),
+                read_eof: false,
+                drain_started: None,
+                pending_quit: false,
+                quit_flushed: None,
+            };
+            let targeted = TargetedControls {
+                quit: supported.then(|| Box::new(|| {}) as Box<dyn Fn() + Send>),
+                ..TargetedControls::default()
+            };
+            let controls = ControlContext {
+                targeted,
+                multi: true,
+                service_instance: "test-service".into(),
+            };
+            peer.write_all(b"{\"version\":1,\"type\":\"companion.quit\"}\n")
+                .unwrap();
+            assert!(client.step_inner(
+                &mut store,
+                Instant::now(),
+                &mut |_, _| panic!("quit must not recompute presentations"),
+                None,
+                &controls,
+            ));
+            assert_eq!(client.pending_quit, supported);
+            assert!(client.quit_flushed.is_none());
+            assert!(!client.output.is_empty());
+            let mut discarded = vec![0; filled];
+            peer.read_exact(&mut discarded).unwrap();
+            assert!(client.step_inner(
+                &mut store,
+                Instant::now(),
+                &mut |_, _| panic!("quit must not recompute presentations"),
+                None,
+                &controls,
+            ));
+            let mut response = String::new();
+            std::io::BufRead::read_line(&mut io::BufReader::new(&mut peer), &mut response).unwrap();
+            let ack: Ack = serde_json::from_str(&response).unwrap();
+            assert_eq!(ack.ok, supported);
+            if supported {
+                assert_eq!(ack.data, Some(json!({"quitting":true})));
+                assert!(client.quit_flushed.is_some());
+            } else {
+                assert!(ack.error.unwrap().contains("companion.quit unsupported"));
+            }
+            assert_eq!(client.source, Some(id.clone()));
+            assert_eq!(store.presentations(now), before);
+            assert_eq!(serde_json::to_value(store.status(0)).unwrap(), status);
+            assert_eq!(store.list(0), list);
+            assert_eq!(
+                store.expire(now + crate::activity::SOURCE_TIMEOUT),
+                vec![id]
+            );
+        }
+    }
+
+    #[test]
+    fn service_info_reports_worker_capabilities_before_and_after_registration() {
+        for mode in 0..4 {
+            let (_dir, path) = fixture();
+            let _server = match mode {
+                0 => Server::start(&path, |_| {}),
+                1 => Server::start_with_reveal(&path, |_| {}, || {}),
+                2 => Server::start_with_familiars(&path, |_| {}, |_| {}),
+                _ => Server::start_with_navigation(&path, |_| {}, |_| {}, |_| {}),
+            }
+            .unwrap();
+            let request = json!({"version":1,"type":"companion.service"});
+            let info = control(&path, request.clone()).unwrap();
+            protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
+            let expected = json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":mode >= 2,"lifecycle":mode >= 2,"navigation":mode == 3});
+            assert_eq!(info, expected);
+            let mut peer = Publisher {
+                stream: connect_private(&path).unwrap(),
+            };
+            assert!(
+                peer.exchange(json!({"version":2,"type":"companion.service"}))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported protocol version")
+            );
+            assert_eq!(
+                peer.exchange(request.clone()).unwrap(),
+                Some(expected.clone())
+            );
+            let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+            assert_eq!(producer.exchange(request).unwrap(), Some(expected));
+            producer.heartbeat().unwrap();
+        }
+    }
+
+    #[test]
+    fn service_query_does_not_touch_store_cues_or_source_liveness() {
+        let now = Instant::now();
+        let id = ("test".into(), "one".into());
+        let mut store = Store::default();
+        let mut activity = Activity {
+            activity: "task".into(),
+            sequence: 1,
+            state: ActivityState::Working,
+            attention: false,
+            reason: None,
+            summary: Some("Keep summary".into()),
+        };
+        store
+            .register(id.clone(), vec![activity.clone()], now)
+            .unwrap();
+        activity.sequence = 2;
+        activity.state = ActivityState::Failed;
+        store.apply(&id, Event::State { activity }, now).unwrap();
+        let before = store.presentations(now);
+        assert!(before[0].presentation.cue.is_some());
+        let status = serde_json::to_value(store.status(0)).unwrap();
+        let list = store.list(0);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        let mut client = Client {
+            stream,
+            input: Vec::new(),
+            output: Vec::new(),
+            written: 0,
+            connected: now,
+            source: Some(id.clone()),
+            read_eof: false,
+            drain_started: None,
+            pending_quit: false,
+            quit_flushed: None,
+        };
+        peer.write_all(b"{\"version\":1,\"type\":\"companion.service\"}\n")
+            .unwrap();
+        assert!(client.step_inner(
+            &mut store,
+            now + Duration::from_secs(9),
+            &mut |_, _| panic!("service query must not recompute presentations"),
+            None,
+            &ControlContext {
+                targeted: TargetedControls::default(),
+                multi: true,
+                service_instance: "test-service".into(),
+            }
+        ));
+        let mut response = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut peer), &mut response)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+            json!({"version":1,"ok":true,"data":{"api_version":1,"service_instance":"test-service","pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false}})
+        );
+        assert_eq!(client.source, Some(id.clone()));
+        assert_eq!(store.presentations(now), before);
+        assert_eq!(serde_json::to_value(store.status(0)).unwrap(), status);
+        assert_eq!(store.list(0), list);
+        assert_eq!(
+            store.expire(now + crate::activity::SOURCE_TIMEOUT),
+            vec![id]
+        );
+    }
+
+    #[test]
+    fn prepare_parent_preserves_data_and_rejects_unsafe_paths() {
+        let (dir, path) = fixture();
+        fs::write(&path, "keep existing data").unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        prepare_socket_parent(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"keep existing data");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert!(control(&path, json!({"version":1,"type":"companion.service"})).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"keep existing data");
+        let leaf = dir.path().join("private").join("startup.log");
+        prepare_socket_parent(&leaf).unwrap();
+        assert!(!leaf.exists());
+        assert_eq!(
+            fs::metadata(leaf.parent().unwrap()).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert!(prepare_socket_parent(&dir.path().join("missing/nested/events.sock")).is_err());
+        assert!(!dir.path().join("missing").exists());
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(leaf.parent().unwrap(), &link).unwrap();
+        assert!(prepare_socket_parent(&link.join("events.sock")).is_err());
+        let socket_link = dir.path().join("alias.sock");
+        std::os::unix::fs::symlink(&path, &socket_link).unwrap();
+        prepare_socket_parent(&socket_link).unwrap();
+        assert!(
+            control(
+                &socket_link,
+                json!({"version":1,"type":"companion.service"})
+            )
+            .is_err()
+        );
+        assert!(
+            fs::symlink_metadata(&socket_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let socket = dir.path().join("live.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let socket_inode = fs::metadata(&socket).unwrap().ino();
+        prepare_socket_parent(&socket).unwrap();
+        assert_eq!(fs::metadata(&socket).unwrap().ino(), socket_inode);
+        assert!(prepare_socket_parent(&path.join("events.sock")).is_err());
+        assert!(prepare_socket_parent(Path::new(&"x".repeat(101))).is_err());
+        assert!(prepare_socket_parent(Path::new("bad\0path")).is_err());
+        assert!(prepare_socket_parent(Path::new("/dev/null")).is_err());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prepare_socket_parent(&path).is_err());
+        assert_eq!(fs::metadata(dir.path()).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(fs::read(&path).unwrap(), b"keep existing data");
+        assert!(control(&path, json!({"version":1,"type":"companion.service"})).is_err());
+    }
+
     fn until(
         rx: &Receiver<Presentation>,
         predicate: impl Fn(&Presentation) -> bool,
@@ -721,11 +1903,483 @@ mod tests {
     }
 
     #[test]
+    fn navigation_socket_dispatch_is_atomic_and_does_not_change_views_or_bindings() {
+        let (_dir, path) = fixture();
+        let (tx, views) = mpsc::channel();
+        let (motion_tx, motions) = mpsc::sync_channel(16);
+        let _server = Server::start_with_navigation(
+            &path,
+            move |v| {
+                tx.send(v).unwrap();
+            },
+            |_| {},
+            move |ids| {
+                motion_tx.try_send(ids).unwrap();
+            },
+        )
+        .unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        producer
+            .update("a", 1, ActivityState::Working, false, None)
+            .unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        producer
+            .update("b", 1, ActivityState::Working, false, None)
+            .unwrap();
+        control(&path, json!({"version":1,"type":"familiar.open","items":[{"id":"second","source":"test","activity":"b"}]})).unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        producer
+            .update_with_summary(
+                "a",
+                2,
+                ActivityState::Failed,
+                false,
+                None,
+                Some("Keep summary and cue"),
+            )
+            .unwrap();
+        let before_views = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert!(before_views[0].presentation.cue.is_some());
+        let list_request = json!({"version":1,"type":"familiar.list"});
+        let before_list = control(&path, list_request.clone()).unwrap();
+        for row in before_list["familiars"].as_array().unwrap() {
+            let caps = row["capabilities"].as_array().unwrap();
+            assert_eq!(
+                caps,
+                &vec![
+                    json!("info"),
+                    json!("attach"),
+                    json!("close"),
+                    json!("go-to-mouse")
+                ]
+            );
+        }
+        let status_request = json!({"version":1,"type":"companion.status"});
+        let before_status = control(&path, status_request.clone()).unwrap();
+        let request = json!({"version":1,"type":"familiar.go-to-mouse","ids":["second","main"]});
+        assert_eq!(
+            control(&path, request.clone()).unwrap(),
+            json!({"moving":["second","main"]})
+        );
+        assert_eq!(
+            motions.recv_timeout(IO_TIMEOUT).unwrap(),
+            vec!["second", "main"]
+        );
+        // Registered producers can issue the same control without changing source binding.
+        assert_eq!(
+            producer.exchange(request).unwrap(),
+            Some(json!({"moving":["second","main"]}))
+        );
+        assert_eq!(
+            motions.recv_timeout(IO_TIMEOUT).unwrap(),
+            vec!["second", "main"]
+        );
+        assert!(motions.try_recv().is_err());
+        let mut peer = Publisher {
+            stream: connect_private(&path).unwrap(),
+        };
+        for packet in [
+            json!({"version":1,"type":"familiar.go-to-mouse","ids":["main","missing"]}),
+            json!({"version":1,"type":"familiar.go-to-mouse","ids":["main","main"]}),
+            json!({"version":1,"type":"familiar.go-to-mouse"}),
+            json!({"version":1,"type":"familiar.go-to-mouse","ids":[]}),
+        ] {
+            assert!(peer.exchange(packet).is_err());
+            assert!(motions.try_recv().is_err());
+        }
+        assert_eq!(control(&path, list_request).unwrap(), before_list);
+        assert_eq!(control(&path, status_request).unwrap(), before_status);
+        assert!(views.try_recv().is_err());
+        producer.heartbeat().unwrap();
+    }
+
+    #[test]
+    fn navigation_is_rejected_and_not_advertised_without_callback() {
+        for mode in 0..3 {
+            let (_dir, path) = fixture();
+            let _server = match mode {
+                0 => Server::start(&path, |_| {}).unwrap(),
+                1 => Server::start_with_reveal(&path, |_| {}, || {}).unwrap(),
+                _ => Server::start_with_familiars(&path, |_| {}, |_| {}).unwrap(),
+            };
+            let request = json!({"version":1,"type":"familiar.go-to-mouse","ids":["main"]});
+            assert!(
+                control(&path, request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("go-to-mouse requires graphical navigation support")
+            );
+            let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+            assert_eq!(
+                list["familiars"][0]["capabilities"],
+                if mode == 2 {
+                    json!(["info", "attach", "close"])
+                } else {
+                    json!([])
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_control_does_not_refresh_producer_liveness() {
+        let now = Instant::now();
+        let id = ("test".into(), "one".into());
+        let mut store = Store::default();
+        store.register(id.clone(), vec![], now).unwrap();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut client = Client {
+            stream,
+            input: Vec::new(),
+            output: Vec::new(),
+            written: 0,
+            connected: now,
+            source: Some(id.clone()),
+            read_eof: false,
+            drain_started: None,
+            pending_quit: false,
+            quit_flushed: None,
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        let targeted = TargetedControls {
+            reveal: None,
+            go_to_mouse: Some(Box::new(move |ids| tx.try_send(ids).unwrap())),
+            quit: None,
+        };
+        peer.write_all(b"{\"version\":1,\"type\":\"familiar.go-to-mouse\",\"ids\":[\"main\"]}\n")
+            .unwrap();
+        assert!(client.step_inner(
+            &mut store,
+            now + Duration::from_secs(9),
+            &mut |_, _| {},
+            None,
+            &ControlContext {
+                targeted,
+                multi: true,
+                service_instance: "test-service".into(),
+            }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), vec!["main"]);
+        assert_eq!(client.source, Some(id.clone()));
+        assert_eq!(
+            store.expire(now + crate::activity::SOURCE_TIMEOUT),
+            vec![id]
+        );
+    }
+
+    #[test]
     fn focus_queue_is_bounded_and_nonblocking() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let focus = FocusControl { sender };
         focus.next().unwrap();
         assert!(focus.clone().next().is_err());
+    }
+
+    #[test]
+    fn familiar_queue_is_bounded_and_validates_ids() {
+        let (sender, _receiver) = mpsc::sync_channel(32);
+        let handle = FamiliarControl { sender };
+        assert!(handle.next("bad/id").is_err());
+        for _ in 0..32 {
+            handle.next("main").unwrap();
+        }
+        assert!(handle.close("main").is_err());
+        assert!(handle.clone().next("main").is_err());
+    }
+
+    #[test]
+    fn multi_familiar_socket_snapshots_lifecycle_and_targeted_reveal() {
+        let (_dir, path) = fixture();
+        let (tx, views) = mpsc::channel();
+        let (rtx, reveals) = mpsc::channel();
+        let server = Server::start_with_familiars(
+            &path,
+            move |v| {
+                let _ = tx.send(v);
+            },
+            move |ids| {
+                let _ = rtx.send(ids);
+            },
+        )
+        .unwrap();
+        let initial = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(
+            initial,
+            vec![FamiliarPresentation {
+                id: "main".into(),
+                preset: "djinn".into(),
+                presentation: Presentation::default()
+            }]
+        );
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        producer
+            .update("a", 1, ActivityState::Working, false, None)
+            .unwrap();
+        let main = views.recv_timeout(IO_TIMEOUT).unwrap();
+        producer
+            .update("b", 1, ActivityState::Succeeded, false, None)
+            .unwrap();
+        assert!(views.try_recv().is_err());
+        let opened = control(&path, json!({"version":1,"type":"familiar.open","items":[{"id":"second","source":"test","activity":"b"}]})).unwrap();
+        assert_eq!(opened, json!({"opened":["second"]}));
+        let both = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0], main[0]);
+        assert!(both[1].presentation.cue.is_none());
+        let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+        let rows = list["familiars"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["capabilities"], json!(["info", "attach", "close"]));
+        }
+        producer
+            .update_with_summary(
+                "b",
+                2,
+                ActivityState::Failed,
+                false,
+                None,
+                Some("Only second"),
+            )
+            .unwrap();
+        let changed = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(changed[0], both[0]);
+        assert!(changed[1].presentation.cue.is_some());
+        control(
+            &path,
+            json!({"version":1,"type":"companion.reveal","familiars":["second"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            reveals.recv_timeout(IO_TIMEOUT).unwrap(),
+            Some(vec!["second".into()])
+        );
+        control(&path, json!({"version":1,"type":"companion.reveal"})).unwrap();
+        assert_eq!(reveals.recv_timeout(IO_TIMEOUT).unwrap(), None);
+        assert!(
+            control(
+                &path,
+                json!({"version":1,"type":"companion.reveal","familiars":["missing"]})
+            )
+            .is_err()
+        );
+        assert!(reveals.try_recv().is_err());
+        assert!(views.try_recv().is_err());
+        assert!(control(&path, json!({"version":1,"type":"companion.focus","familiar":"second","source":"test","activity":"a"})).is_err());
+        let status = control(
+            &path,
+            json!({"version":1,"type":"companion.status","familiar":"second"}),
+        )
+        .unwrap();
+        assert_eq!(status["familiar_id"], "second");
+        assert_eq!(status["focus"]["activity"], "b");
+        control(
+            &path,
+            json!({"version":1,"type":"familiar.close","ids":["main"]}),
+        )
+        .unwrap();
+        let remaining = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "second");
+        producer.heartbeat().unwrap();
+        producer
+            .update("a", 2, ActivityState::Succeeded, false, None)
+            .unwrap();
+        assert!(views.try_recv().is_err());
+        server.familiar_control().next("second").unwrap();
+        let cycled = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(cycled[0].presentation.base.as_ref().unwrap().activity, "a");
+        assert!(cycled[0].presentation.cue.is_none());
+        server.familiar_control().close("second").unwrap();
+        assert!(views.recv_timeout(IO_TIMEOUT).unwrap().is_empty());
+        producer.heartbeat().unwrap();
+        producer
+            .update("b", 3, ActivityState::Working, false, None)
+            .unwrap();
+        assert!(views.try_recv().is_err());
+        let status = control(&path, json!({"version":1,"type":"companion.status"})).unwrap();
+        assert_eq!(status["focus"], serde_json::Value::Null);
+        assert_eq!(status["total"], 2);
+    }
+
+    #[test]
+    fn headless_and_legacy_gui_reject_new_lifecycle_controls_but_allow_discovery() {
+        for legacy_gui in [false, true] {
+            let (_dir, path) = fixture();
+            let _server = if legacy_gui {
+                Server::start_with_reveal(&path, |_| {}, || {}).unwrap()
+            } else {
+                Server::start(&path, |_| {}).unwrap()
+            };
+            for request in [
+                json!({"version":1,"type":"familiar.open","items":[{"source":"a","activity":"b"}]}),
+                json!({"version":1,"type":"familiar.attach","items":[{"id":"main","source":"a","activity":"b"}]}),
+                json!({"version":1,"type":"familiar.close","ids":["main"]}),
+            ] {
+                assert!(
+                    control(&path, request)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("no graphical familiar")
+                );
+            }
+            let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+            assert_eq!(list["familiars"][0]["id"], "main");
+            assert_eq!(list["familiars"][0]["attachment"], serde_json::Value::Null);
+            assert_eq!(list["familiars"][0]["capabilities"], json!([]));
+            assert_eq!(
+                control(&path, json!({"version":1,"type":"companion.targets"})).unwrap()["total"],
+                0
+            );
+            assert!(
+                control(
+                    &path,
+                    json!({"version":1,"type":"companion.reveal","familiars":["main"]})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn reveal_roundtrips_without_registration_or_presentation_changes() {
+        let (_dir, path) = fixture();
+        let (views_tx, views) = mpsc::channel();
+        let (reveal_tx, reveals) = mpsc::sync_channel(16);
+        let server = Server::start_with_reveal(
+            &path,
+            move |p| views_tx.send(p).unwrap(),
+            move || reveal_tx.try_send(()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            views.recv_timeout(IO_TIMEOUT).unwrap(),
+            Presentation::default()
+        );
+        let request = json!({"version":1,"type":"companion.reveal"});
+        let empty = control(&path, request.clone()).unwrap();
+        assert_eq!(empty["total"], 0);
+        assert_eq!(empty["focus"], serde_json::Value::Null);
+        reveals.recv_timeout(IO_TIMEOUT).unwrap();
+        assert!(views.try_recv().is_err());
+
+        let mut publisher = Publisher::connect(&path, "test", "one").unwrap();
+        publisher
+            .update("a", 1, ActivityState::Working, false, None)
+            .unwrap();
+        until(&views, |p| p.base.is_some());
+        publisher
+            .update("b", 1, ActivityState::Working, false, None)
+            .unwrap();
+        control(
+            &path,
+            json!({"version":1,"type":"companion.focus","source":"test","activity":"b"}),
+        )
+        .unwrap();
+        until(&views, |p| {
+            p.base.as_ref().is_some_and(|s| s.activity == "b")
+        });
+        publisher
+            .update_with_summary(
+                "b",
+                2,
+                ActivityState::Succeeded,
+                false,
+                None,
+                Some("Selected conversation"),
+            )
+            .unwrap();
+        let before = until(&views, |p| p.cue.is_some());
+        let status = control(&path, json!({"version":1,"type":"companion.status"})).unwrap();
+        for _ in 0..3 {
+            assert_eq!(control(&path, request.clone()).unwrap(), status);
+            reveals.recv_timeout(IO_TIMEOUT).unwrap();
+            assert_eq!(
+                publisher.exchange(request.clone()).unwrap().unwrap(),
+                status
+            );
+            reveals.recv_timeout(IO_TIMEOUT).unwrap();
+        }
+        assert_eq!(before.base.as_ref().unwrap().activity, "b");
+        assert_eq!(
+            before.cue.as_ref().unwrap().selection.summary.as_deref(),
+            Some("Selected conversation")
+        );
+        assert!(views.try_recv().is_err());
+        assert!(reveals.try_recv().is_err());
+        // The ordinary producer path still works on the same connection.
+        publisher.heartbeat().unwrap();
+        publisher
+            .update("b", 3, ActivityState::Working, false, None)
+            .unwrap();
+        let after = until(&views, |p| {
+            p.base
+                .as_ref()
+                .is_some_and(|s| s.state == ActivityState::Working)
+        });
+        assert_eq!(after.cue, before.cue);
+        drop(server);
+    }
+
+    #[test]
+    fn headless_reveal_is_rejected_clearly() {
+        let (_dir, path) = fixture();
+        let server = Server::start(&path, |_| {}).unwrap();
+        let request = json!({"version":1,"type":"companion.reveal"});
+        assert!(
+            control(&path, request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("no graphical familiar")
+        );
+        let mut publisher = Publisher::connect(&path, "test", "one").unwrap();
+        assert!(
+            publisher
+                .exchange(request)
+                .unwrap_err()
+                .to_string()
+                .contains("no graphical familiar")
+        );
+        publisher.heartbeat().unwrap();
+        publisher
+            .update("task", 1, ActivityState::Working, false, None)
+            .unwrap();
+        drop(server);
+    }
+
+    #[test]
+    fn malformed_reveal_and_invalid_version_do_not_invoke_callback() {
+        let (_dir, path) = fixture();
+        let (tx, rx) = mpsc::sync_channel(4);
+        let server =
+            Server::start_with_reveal(&path, |_| {}, move || tx.try_send(()).unwrap()).unwrap();
+        let mut peer = UnixStream::connect(&path).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+        peer.write_all(b"{\"version\":1,\"type\":\"companion.reveal\",}\n{\"version\":2,\"type\":\"companion.reveal\"}\n{\"type\":\"companion.reveal\"}\n").unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        peer.read_to_string(&mut response).unwrap();
+        let acks: Vec<Ack> = response
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(acks.len(), 3);
+        assert!(acks.iter().all(|ack| !ack.ok));
+        assert!(
+            acks[1]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("unsupported protocol version")
+        );
+        assert!(rx.try_recv().is_err());
+        control(&path, json!({"version":1,"type":"companion.reveal"})).unwrap();
+        rx.recv_timeout(IO_TIMEOUT).unwrap();
+        assert!(rx.try_recv().is_err());
+        drop(server);
     }
 
     #[test]
@@ -758,9 +2412,21 @@ mod tests {
             source: Some(id.clone()),
             read_eof: false,
             drain_started: None,
+            pending_quit: false,
+            quit_flushed: None,
         };
-        peer.write_all(b"{\"version\":1,\"type\":\"companion.focus\",\"source\":\"test\",\"activity\":\"task\"}\n{\"version\":1,\"type\":\"companion.next\"}\n{\"version\":1,\"type\":\"companion.status\"}\n").unwrap();
-        assert!(client.step(&mut store, now + Duration::from_secs(9), &mut |_, _| {}));
+        peer.write_all(b"{\"version\":1,\"type\":\"companion.focus\",\"source\":\"test\",\"activity\":\"task\"}\n{\"version\":1,\"type\":\"companion.next\"}\n{\"version\":1,\"type\":\"companion.status\"}\n{\"version\":1,\"type\":\"companion.reveal\"}\n").unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let reveal = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+        };
+        assert!(client.step(
+            &mut store,
+            now + Duration::from_secs(9),
+            &mut |_, _| {},
+            Some(&reveal)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(client.source, Some(id.clone()));
         assert_eq!(
             store.expire(now + crate::activity::SOURCE_TIMEOUT),
@@ -1188,11 +2854,13 @@ mod tests {
             source: Some(id),
             read_eof: false,
             drain_started: None,
+            pending_quit: false,
+            quit_flushed: None,
         };
-        assert!(client.step(&mut store, now, &mut |_, _| {}));
+        assert!(client.step(&mut store, now, &mut |_, _| {}, None));
         assert!(client.read_eof);
         assert_eq!(client.input.iter().filter(|b| **b == b'\n').count(), 1);
-        assert!(!client.step(&mut store, now + TICK, &mut |_, _| {}));
+        assert!(!client.step(&mut store, now + TICK, &mut |_, _| {}, None));
         drop(client);
         let mut response = String::new();
         peer.read_to_string(&mut response).unwrap();
@@ -1237,19 +2905,22 @@ mod tests {
             source: Some(("test".into(), "one".into())),
             read_eof: false,
             drain_started: None,
+            pending_quit: false,
+            quit_flushed: None,
         };
         let mut store = Store::default();
         let queued = client.output.clone();
-        assert!(client.step(&mut store, now, &mut |_, _| {}));
+        assert!(client.step(&mut store, now, &mut |_, _| {}, None));
         assert_eq!(client.output, queued);
         assert_eq!(client.written, 0);
         assert!(client.step(
             &mut store,
             now + EOF_DRAIN_TIMEOUT - Duration::from_nanos(1),
-            &mut |_, _| {}
+            &mut |_, _| {},
+            None
         ));
         assert_eq!(client.drain_started, Some(now));
-        assert!(!client.step(&mut store, now + EOF_DRAIN_TIMEOUT, &mut |_, _| {}));
+        assert!(!client.step(&mut store, now + EOF_DRAIN_TIMEOUT, &mut |_, _| {}, None));
     }
 
     #[test]
@@ -1266,14 +2937,17 @@ mod tests {
             source: None,
             read_eof: false,
             drain_started: None,
+            pending_quit: false,
+            quit_flushed: None,
         };
         let mut store = Store::default();
         assert!(client.step(
             &mut store,
             now + REGISTER_TIMEOUT - Duration::from_nanos(1),
-            &mut |_, _| {}
+            &mut |_, _| {},
+            None
         ));
-        assert!(!client.step(&mut store, now + REGISTER_TIMEOUT, &mut |_, _| {}));
+        assert!(!client.step(&mut store, now + REGISTER_TIMEOUT, &mut |_, _| {}, None));
     }
 
     #[test]

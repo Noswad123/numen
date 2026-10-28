@@ -552,3 +552,814 @@ fn listener_deadline_survives_sustained_traffic_with_unread_stdout() {
     let (stdout, _) = listener.output();
     assert!(!stdout.is_empty());
 }
+
+#[test]
+fn presets_are_available_without_a_service() {
+    let (_dir, socket) = fixture();
+    assert_eq!(
+        control(&socket, &["presets"]),
+        json!({"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]})
+    );
+    assert!(!socket.exists());
+}
+
+#[test]
+fn headless_discovery_reports_live_targets_but_no_lifecycle_capabilities() {
+    let (_dir, socket) = fixture();
+    let mut listener = ChildGuard(
+        command(&socket)
+            .args(["listen", "--exit-after", "3"])
+            .spawn()
+            .unwrap(),
+    );
+    let mut producer = BufReader::new(ready(&mut listener, &socket));
+    let deadline = Instant::now() + LIMIT;
+    acknowledge(
+        &mut producer,
+        json!({"version":1,"type":"source.register","source":"djinn","instance":"one",
+        "activities":[
+            {"activity":"a","sequence":1,"state":"working"},
+            {"activity":"b","sequence":1,"state":"waiting","attention":true}
+        ]}),
+    );
+    let attachment = json!({"source":"djinn","instance":"one","activity":"a"});
+    let familiars = control(&socket, &["familiars"]);
+    assert_eq!(
+        familiars,
+        json!({"familiars":[{"id":"main","preset":"djinn","attachment":attachment,
+            "available":true,"capabilities":[]}],"offset":0,"total":1,"next_offset":null})
+    );
+    assert_eq!(
+        control(&socket, &["familiars", "--offset", "1"]),
+        json!({"familiars":[],"offset":1,"total":1,"next_offset":null})
+    );
+    let targets = json!([
+        {"source":"djinn","instance":"one","activity":"a","state":"working",
+            "attention":false,"reason":null,"claimed_by":"main","eligible":false},
+        {"source":"djinn","instance":"one","activity":"b","state":"waiting",
+            "attention":true,"reason":null,"claimed_by":null,"eligible":true}
+    ]);
+    assert_eq!(
+        control(&socket, &["targets"]),
+        json!({"targets":targets,"offset":0,"total":2,"next_offset":null})
+    );
+    let mut own_targets = targets.clone();
+    own_targets[0]["eligible"] = json!(true);
+    assert_eq!(
+        control(&socket, &["targets", "--familiar", "main"]),
+        json!({"targets":own_targets,"offset":0,"total":2,"next_offset":null})
+    );
+    assert_eq!(
+        control(&socket, &["targets", "--familiar", "main", "--offset", "1"]),
+        json!({"targets":[targets[1]],"offset":1,"total":2,"next_offset":null})
+    );
+    let mut explicit_main = control(&socket, &["status", "--familiar", "main"]);
+    assert_eq!(
+        explicit_main.as_object_mut().unwrap().remove("familiar_id"),
+        Some(json!("main"))
+    );
+    assert_eq!(explicit_main, control(&socket, &["status"]));
+    let initial_status = explicit_main;
+
+    for args in [
+        vec!["open", "--source", "djinn", "--activity", "b"],
+        vec![
+            "attach",
+            "--familiar",
+            "main",
+            "--source",
+            "djinn",
+            "--activity",
+            "b",
+        ],
+        vec!["close", "--familiar", "main"],
+    ] {
+        let mut child = ChildGuard(command(&socket).args(&args).spawn().unwrap());
+        let status = child.wait_until(deadline);
+        let (stdout, stderr) = child.output();
+        assert!(
+            !status.success(),
+            "accepted headless lifecycle command {args:?}"
+        );
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        assert!(
+            stderr.contains("no graphical familiar"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let mut motion = ChildGuard(
+        command(&socket)
+            .args(["go-to-mouse", "--familiar", "main"])
+            .spawn()
+            .unwrap(),
+    );
+    let status = motion.wait_until(deadline);
+    let (stdout, stderr) = motion.output();
+    assert!(!status.success(), "accepted headless motion command");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("go-to-mouse requires graphical navigation support"),
+        "{stderr}"
+    );
+    assert_eq!(control(&socket, &["familiars"]), familiars);
+    assert_eq!(control(&socket, &["status"]), initial_status);
+    assert_eq!(control(&socket, &["status"])["focus"], attachment);
+    let status = listener.wait_until(deadline);
+    let (_, stderr) = listener.output();
+    assert!(status.success(), "{stderr}");
+    assert!(!socket.exists());
+}
+
+// Keep lifecycle serialization independent of a graphical server and its callbacks.
+fn mock_control(args: &[&str], input: Option<&Value>, expected: Value, data: Value) {
+    let (_dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + LIMIT;
+    let mut child = ChildGuard(
+        command(&socket)
+            .args(args)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    if let Some(input) = input {
+        child
+            .0
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+    } else {
+        drop(child.0.stdin.take());
+    }
+    let stream = loop {
+        match server.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "{args:?}: client never connected"
+                );
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "{args:?}: client exited"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("accept: {error}"),
+        }
+    };
+    // macOS may inherit O_NONBLOCK from the accepting listener.
+    stream.set_nonblocking(false).unwrap();
+    stream.set_read_timeout(Some(LIMIT)).unwrap();
+    stream.set_write_timeout(Some(LIMIT)).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).unwrap() > 0, "missing request");
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap(),
+        expected,
+        "{args:?}"
+    );
+    writeln!(
+        reader.get_mut(),
+        "{}",
+        json!({"version":1,"ok":true,"data":data})
+    )
+    .unwrap();
+    let status = child.wait_until(deadline);
+    let (stdout, stderr) = child.output();
+    assert!(status.success(), "{args:?}: {stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap(),
+        data,
+        "{args:?}"
+    );
+    line.clear();
+    assert_eq!(
+        reader.read_line(&mut line).unwrap(),
+        0,
+        "extra request: {line}"
+    );
+    assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn lifecycle_commands_serialize_each_selection_and_print_ack_data() {
+    let open = json!([
+        {"id":"first","preset":"djinn","source":"djinn","instance":"one","activity":"a"},
+        {"source":"build","activity":"b"}
+    ]);
+    mock_control(
+        &["open", "--batch", "-"],
+        Some(&open),
+        json!({"version":1,"type":"familiar.open","items":open}),
+        json!({"opened":["first","generated"]}),
+    );
+    let attach = json!([
+        {"id":"first","source":"build","instance":"two","activity":"b"},
+        {"id":"second","source":"djinn","activity":"a"}
+    ]);
+    mock_control(
+        &["attach", "--batch", "-"],
+        Some(&attach),
+        json!({"version":1,"type":"familiar.attach","items":attach}),
+        json!({"attached":["first","second"]}),
+    );
+    for (args, item) in [
+        (
+            vec!["open", "--source", "djinn", "--activity", "a"],
+            json!({"id":null,"preset":"djinn","source":"djinn","instance":null,"activity":"a"}),
+        ),
+        (
+            vec![
+                "open",
+                "--source",
+                "build",
+                "--instance",
+                "two",
+                "--activity",
+                "b",
+                "--id",
+                "second",
+                "--preset",
+                "djinn",
+            ],
+            json!({"id":"second","preset":"djinn","source":"build","instance":"two","activity":"b"}),
+        ),
+        (
+            vec![
+                "attach",
+                "--familiar",
+                "second",
+                "--source",
+                "djinn",
+                "--activity",
+                "a",
+            ],
+            json!({"id":"second","source":"djinn","instance":null,"activity":"a"}),
+        ),
+        (
+            vec![
+                "attach",
+                "--familiar",
+                "first",
+                "--source",
+                "build",
+                "--instance",
+                "two",
+                "--activity",
+                "b",
+            ],
+            json!({"id":"first","source":"build","instance":"two","activity":"b"}),
+        ),
+    ] {
+        let kind = format!("familiar.{}", args[0]);
+        let data = if args[0] == "open" {
+            json!({"opened":["second"]})
+        } else {
+            json!({"attached":[item["id"]]})
+        };
+        mock_control(
+            &args,
+            None,
+            json!({"version":1,"type":kind,"items":[item]}),
+            data,
+        );
+    }
+    mock_control(
+        &["close", "--familiar", "first", "second"],
+        None,
+        json!({"version":1,"type":"familiar.close","ids":["first","second"]}),
+        json!({"closed":["first","second"]}),
+    );
+}
+
+#[test]
+fn targeted_controls_serialize_familiar_ids_and_print_ack_data() {
+    mock_control(
+        &["go-to-mouse", "--familiar", "main", "second"],
+        None,
+        json!({"version":1,"type":"familiar.go-to-mouse","ids":["main","second"]}),
+        json!({"moving":["main","second"]}),
+    );
+    for (args, expected) in [
+        (
+            vec!["bubbles", "--familiar", "first", "second"],
+            json!({"version":1,"type":"companion.reveal","familiars":["first","second"]}),
+        ),
+        (
+            vec!["status", "--familiar", "second", "--offset", "4"],
+            json!({"version":1,"type":"companion.status","familiar":"second","offset":4}),
+        ),
+        (
+            vec!["focus", "--next", "--familiar", "second"],
+            json!({"version":1,"type":"companion.next","familiar":"second"}),
+        ),
+        (
+            vec![
+                "focus",
+                "--familiar",
+                "second",
+                "--source",
+                "djinn",
+                "--activity",
+                "a",
+            ],
+            json!({"version":1,"type":"companion.focus","familiar":"second","source":"djinn","instance":null,"activity":"a"}),
+        ),
+        (
+            vec![
+                "focus",
+                "--familiar",
+                "first",
+                "--source",
+                "build",
+                "--instance",
+                "two",
+                "--activity",
+                "b",
+            ],
+            json!({"version":1,"type":"companion.focus","familiar":"first","source":"build","instance":"two","activity":"b"}),
+        ),
+    ] {
+        mock_control(
+            &args,
+            None,
+            expected,
+            json!({"focus":{"source":"build","instance":"two","activity":"b"},"activities":[]}),
+        );
+    }
+}
+
+#[test]
+fn invalid_batches_and_selections_are_rejected_before_connecting() {
+    let (_dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    for (args, input, diagnostic) in [
+        (
+            vec!["open", "--batch", "-"],
+            Some(json!([])),
+            "expected 1..16 items",
+        ),
+        (
+            vec!["attach", "--batch", "-"],
+            Some(json!([])),
+            "expected 1..16 familiar IDs",
+        ),
+        (
+            vec!["attach", "--batch", "-"],
+            Some(json!([
+                {"id":"same","source":"djinn","activity":"a"},
+                {"id":"same","source":"build","activity":"b"}
+            ])),
+            "duplicate familiar ID",
+        ),
+        (
+            vec!["close", "--familiar", "same", "same"],
+            None,
+            "duplicate familiar ID",
+        ),
+        (
+            vec!["bubbles", "--familiar", "same", "same"],
+            None,
+            "duplicate familiar ID",
+        ),
+        (vec!["go-to-mouse"], None, "required"),
+        (
+            vec!["go-to-mouse", "--familiar"],
+            None,
+            "a value is required",
+        ),
+        (vec!["go-to-mouse", "--familiar", ""], None, "identifier"),
+        (
+            vec!["go-to-mouse", "--familiar", "same", "same"],
+            None,
+            "duplicate familiar ID",
+        ),
+        (
+            vec![
+                "go-to-mouse",
+                "--familiar",
+                "a",
+                "b",
+                "c",
+                "d",
+                "e",
+                "f",
+                "g",
+                "h",
+                "i",
+                "j",
+                "k",
+                "l",
+                "m",
+                "n",
+                "o",
+                "p",
+                "q",
+            ],
+            None,
+            "expected 1..16 familiar IDs",
+        ),
+        (
+            vec!["open", "--batch", "-"],
+            Some(json!([
+                {"id":"bad/id","source":"djinn","activity":"a"}
+            ])),
+            "identifier",
+        ),
+        (
+            vec!["open", "--batch", "-"],
+            Some(json!([
+                {"source":"bad/id","activity":"a"}
+            ])),
+            "identifier",
+        ),
+        (
+            vec!["attach", "--batch", "-"],
+            Some(json!([
+                {"id":"main","source":"djinn","instance":"bad/id","activity":"a"}
+            ])),
+            "identifier",
+        ),
+        (
+            vec!["attach", "--batch", "-"],
+            Some(json!([
+                {"id":"bad/id","source":"djinn","activity":"a"}
+            ])),
+            "identifier",
+        ),
+        (
+            vec!["attach", "--batch", "-"],
+            Some(json!([
+                {"id":"main","source":"djinn","activity":"bad/id"}
+            ])),
+            "identifier",
+        ),
+    ] {
+        let mut child = ChildGuard(
+            command(&socket)
+                .args(&args)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        if let Some(input) = input {
+            child
+                .0
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.to_string().as_bytes())
+                .unwrap();
+        } else {
+            drop(child.0.stdin.take());
+        }
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert!(!status.success(), "accepted {args:?}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        assert!(stderr.contains(diagnostic), "{args:?}: {stderr}");
+        assert!(
+            matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "{args:?}: validation connected to the service"
+        );
+    }
+}
+
+#[test]
+fn wisp_action_prints_absolute_argv_without_writing_home_or_catalog() {
+    let (dir, socket) = fixture();
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let sentinel = home.join("keep");
+    fs::write(&sentinel, b"untouched").unwrap();
+    let catalog = dir.path().join("actions.toml");
+    for explicit_file in [false, true] {
+        let mut cmd = command(&socket);
+        cmd.arg("wisp-action")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("PATH", &home);
+        if explicit_file {
+            cmd.arg("--file").arg(&catalog);
+        }
+        let mut child = ChildGuard(cmd.spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert!(status.success(), "{stderr}");
+        let value: toml::Value = toml::from_str(&stdout).unwrap();
+        let actions = value["action"].as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
+        assert_eq!(action["id"].as_str(), Some("numen"));
+        assert_eq!(action["title"].as_str(), Some("Numen"));
+        assert_eq!(action["kind"].as_str(), Some("summon"));
+        assert!(action.get("key").is_none());
+        let argv: Vec<_> = action["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part.as_str().unwrap())
+            .collect();
+        assert_eq!(argv.len(), 4);
+        assert!(Path::new(argv[0]).is_absolute());
+        assert_eq!(
+            fs::canonicalize(argv[0]).unwrap(),
+            fs::canonicalize(env!("CARGO_BIN_EXE_numen")).unwrap()
+        );
+        assert_eq!(&argv[1..], &["--socket", socket.to_str().unwrap(), "menu"]);
+        assert!(!catalog.exists());
+        assert!(!socket.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn wisp_action_install_preserves_backup_is_idempotent_and_refuses_conflicts() {
+    let (dir, socket) = fixture();
+    let home = dir.path().join("unused-home");
+    let catalog = dir.path().join("actions.toml");
+    let original = b"# user comments\n[[action]]\nid = 'other' # retain me\ncommand = ['hello']";
+    fs::write(&catalog, original).unwrap();
+    let install = || {
+        let mut child = ChildGuard(
+            command(&socket)
+                .args(["wisp-action", "--install", "--file"])
+                .arg(&catalog)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("PATH", &home)
+                .spawn()
+                .unwrap(),
+        );
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        (status, stdout, stderr)
+    };
+    let (status, stdout, stderr) = install();
+    assert!(status.success(), "{stderr}");
+    let backup = PathBuf::from(
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("Snapshot backup: "))
+            .expect("missing backup path"),
+    );
+    assert_eq!(backup.parent(), Some(dir.path()));
+    assert_eq!(fs::read(&backup).unwrap(), original);
+    let live_backup = PathBuf::from(
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("Live inode backup (retains late editor writes): "))
+            .expect("missing live inode backup path"),
+    );
+    assert_eq!(live_backup.parent(), Some(dir.path()));
+    assert_eq!(fs::read(&live_backup).unwrap(), original);
+    let installed = fs::read(&catalog).unwrap();
+    assert!(installed.starts_with(original));
+    let value: toml::Value = toml::from_str(std::str::from_utf8(&installed).unwrap()).unwrap();
+    let actions = value["action"].as_array().unwrap();
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0]["id"].as_str(), Some("other"));
+    assert_eq!(actions[1]["id"].as_str(), Some("numen"));
+    let entries = fs::read_dir(dir.path()).unwrap().count();
+    let (status, stdout, stderr) = install();
+    assert!(status.success(), "{stderr}");
+    assert!(stdout.contains("already installed"), "{stdout}");
+    assert_eq!(fs::read(&catalog).unwrap(), installed);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), entries);
+    let conflict = b"# custom Numen\n[[action]]\nid = 'numen'\ncommand = ['different']\n";
+    fs::write(&catalog, conflict).unwrap();
+    let (status, _, stderr) = install();
+    assert!(!status.success());
+    assert!(stderr.contains("different numen action"), "{stderr}");
+    assert_eq!(fs::read(&catalog).unwrap(), conflict);
+    assert_eq!(fs::read(&backup).unwrap(), original);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), entries);
+    assert!(!home.exists());
+    assert!(!socket.exists());
+}
+
+fn pty() -> (fs::File, fs::File) {
+    use std::os::fd::FromRawFd;
+    let mut master = -1;
+    let mut slave = -1;
+    // Both descriptors become owned Files immediately after successful allocation.
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(result, 0, "openpty: {}", io::Error::last_os_error());
+    unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) }
+}
+
+#[test]
+fn menu_requires_both_ttys_before_probing_or_bootstrapping() {
+    let (dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let missing_parent = dir.path().join("missing");
+    let absent_socket = missing_parent.join("s");
+    let (_master, slave) = pty();
+    for path in [&socket, &absent_socket] {
+        for (tty_stdin, tty_stderr) in [(false, false), (true, false), (false, true)] {
+            let mut cmd = command(path);
+            // The absent socket's parent must not become the child's working directory.
+            cmd.current_dir(dir.path())
+                .args(["menu", "--fzf"])
+                .arg(dir.path().join("missing-fzf"))
+                .stdin(if tty_stdin {
+                    Stdio::from(slave.try_clone().unwrap())
+                } else {
+                    Stdio::null()
+                });
+            if tty_stderr {
+                cmd.stderr(Stdio::from(slave.try_clone().unwrap()));
+            }
+            let mut child = ChildGuard(cmd.spawn().unwrap());
+            let status = child.wait_until(Instant::now() + LIMIT);
+            let (stdout, stderr) = child.output();
+            assert!(!status.success());
+            assert!(stdout.is_empty(), "{stdout}");
+            if !tty_stderr {
+                assert!(stderr.contains("interactive TTY"), "{stderr}");
+                assert!(stderr.contains("Wisp run/summon, not exec"), "{stderr}");
+            }
+            assert!(
+                matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            assert!(!missing_parent.exists());
+            assert!(!dir.path().join("service.log").exists());
+        }
+    }
+}
+
+#[test]
+fn menu_help_lists_flags_without_a_tty_or_service() {
+    let (_dir, socket) = fixture();
+    let mut child = ChildGuard(
+        command(&socket)
+            .args(["menu", "--help"])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let status = child.wait_until(Instant::now() + LIMIT);
+    let (stdout, stderr) = child.output();
+    assert!(status.success(), "{stderr}");
+    for flag in ["--no-start", "--fzf", "--help"] {
+        assert!(stdout.contains(flag), "missing {flag}: {stdout}");
+    }
+    assert!(!stderr.contains("interactive TTY"), "{stderr}");
+    assert!(!socket.exists());
+}
+
+#[test]
+fn service_info_reports_actual_headless_listener_pid_and_capabilities() {
+    let (_dir, socket) = fixture();
+    let mut listener = ChildGuard(
+        command(&socket)
+            .args(["listen", "--exit-after", "1.5"])
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + LIMIT;
+    drop(ready(&mut listener, &socket));
+    let mut info = control(&socket, &["service-info"]);
+    let instance = info
+        .as_object_mut()
+        .unwrap()
+        .remove("service_instance")
+        .unwrap();
+    assert!(
+        instance
+            .as_str()
+            .is_some_and(|instance| !instance.is_empty())
+    );
+    assert_eq!(
+        control(&socket, &["service-info"])["service_instance"],
+        instance
+    );
+    assert_eq!(
+        info,
+        json!({"api_version":1,"pid":listener.0.id(),"graphical":false,
+            "lifecycle":false,"navigation":false})
+    );
+    let status = listener.wait_until(deadline);
+    let (_, stderr) = listener.output();
+    assert!(status.success(), "{stderr}");
+    assert!(!socket.exists());
+}
+
+#[test]
+fn menu_with_mock_fzf_and_pty_dispatches_info_without_a_gui() {
+    let (dir, socket) = fixture();
+    let fzf = dir.path().join("fake-fzf");
+    // Consume every offered row, then return a real row with fzf's blank expect-key line.
+    fs::write(&fzf, b"#!/bin/sh\nselected=''\nwhile IFS= read -r row; do\n  case \"$row\" in\n    \"familiar:main\t\"*|\"info\t\"*) selected=$row ;;\n  esac\ndone\n[ -n \"$selected\" ] || exit 1\nprintf '\\n%s\\n' \"$selected\"\n").unwrap();
+    fs::set_permissions(&fzf, fs::Permissions::from_mode(0o700)).unwrap();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let (_master, slave) = pty();
+    let deadline = Instant::now() + LIMIT;
+    let mut child = ChildGuard(
+        command(&socket)
+            .args(["menu", "--no-start", "--fzf"])
+            .arg(&fzf)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    let mut dispatched = false;
+    let mut discovered = false;
+    while !dispatched {
+        assert!(Instant::now() < deadline, "menu did not dispatch Info");
+        let stream = match server.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "menu exited before Info"
+                );
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error) => panic!("accept: {error}"),
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "missing request");
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["version"], 1);
+        let data = match request["type"].as_str().unwrap() {
+            "companion.service" => {
+                assert_eq!(request, json!({"version":1,"type":"companion.service"}));
+                json!({"api_version":1,"pid":123,"graphical":true,
+                    "lifecycle":true,"navigation":false,"service_instance":"mock-menu-service"})
+            }
+            "familiar.list" => {
+                assert_eq!(
+                    request,
+                    json!({"version":1,"type":"familiar.list","offset":0,
+                    "service_instance":"mock-menu-service"})
+                );
+                discovered = true;
+                json!({"familiars":[{"id":"main","preset":"djinn","attachment":null,
+                    "available":false,"summary":null,"capabilities":["info"]}],
+                    "offset":0,"total":1,"next_offset":null})
+            }
+            "companion.reveal" => {
+                assert!(discovered);
+                assert_eq!(
+                    request,
+                    json!({"version":1,"type":"companion.reveal","familiars":["main"],
+                        "service_instance":"mock-menu-service"})
+                );
+                dispatched = true;
+                json!({"summary":"Info must not print this status data"})
+            }
+            _ => panic!("unexpected menu request: {request}"),
+        };
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            json!({"version":1,"ok":true,"data":data})
+        )
+        .unwrap();
+        line.clear();
+        assert_eq!(
+            reader.read_line(&mut line).unwrap(),
+            0,
+            "extra request: {line}"
+        );
+    }
+    let status = child.wait_until(deadline);
+    let (stdout, _) = child.output();
+    assert!(status.success(), "menu failed: {status}");
+    assert_eq!(stdout.trim(), "Accepted info: main");
+    assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(!dir.path().join("service.log").exists());
+}

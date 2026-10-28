@@ -8,7 +8,9 @@ const SPRITE_WIDTH: usize = 192;
 const SPRITE_HEIGHT: usize = 208;
 const WIDTH: usize = 384;
 const BUBBLE_HEIGHT: usize = 144;
+#[cfg(test)]
 const HEIGHT: usize = BUBBLE_HEIGHT + SPRITE_HEIGHT;
+#[cfg(test)]
 const SPRITE_LEFT: usize = (WIDTH - SPRITE_WIDTH) / 2;
 const IVORY: [u8; 4] = [255, 250, 235, 255];
 const BORDER: [u8; 4] = [194, 177, 143, 255];
@@ -22,11 +24,22 @@ pub struct BubbleText {
     pub status: String,
 }
 
-pub fn dimensions(show: bool) -> (u32, u32) {
-    if show {
-        (WIDTH as u32, HEIGHT as u32)
+fn bounded_sprite_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(0.25, 2.0)
     } else {
-        (192, 208)
+        0.5
+    }
+}
+
+pub fn dimensions(show: bool, sprite_scale: f32) -> (u32, u32) {
+    let sprite_scale = bounded_sprite_scale(sprite_scale);
+    let width = (SPRITE_WIDTH as f32 * sprite_scale).ceil() as u32;
+    let height = (SPRITE_HEIGHT as f32 * sprite_scale).ceil() as u32;
+    if show {
+        (WIDTH as u32, BUBBLE_HEIGHT as u32 + height)
+    } else {
+        (width, height)
     }
 }
 
@@ -91,6 +104,58 @@ pub fn text(view: &Presentation, preview: Option<Animation>) -> BubbleText {
 pub struct Renderer {
     typeface: Option<Typeface>,
     font_size: f32,
+    sprite_scale: f32,
+}
+
+/// The exact physical pixel grid painted by the compositor, excluding bubbles.
+pub struct SpriteProjection {
+    canvas: Canvas,
+    sprite_scale: f32,
+    left: f32,
+    top: f32,
+    pub bounds: (usize, usize, usize, usize),
+}
+
+impl SpriteProjection {
+    pub fn new(size: (u32, u32), show: bool, sprite_scale: f32) -> Self {
+        let sprite_scale = bounded_sprite_scale(sprite_scale);
+        let canvas = Canvas::new(size, show, sprite_scale);
+        let width = SPRITE_WIDTH as f32 * sprite_scale;
+        let height = SPRITE_HEIGHT as f32 * sprite_scale;
+        let (left, top) = if show {
+            ((WIDTH as f32 - width) / 2.0, BUBBLE_HEIGHT as f32)
+        } else {
+            (0.0, 0.0)
+        };
+        let bounds = canvas.bounds((left, top, width, height));
+        Self {
+            canvas,
+            sprite_scale,
+            left,
+            top,
+            bounds,
+        }
+    }
+
+    /// Coordinates must be inside `bounds`. Returns a source RGBA byte offset.
+    pub fn source_offset(&self, x: usize, y: usize) -> usize {
+        let sx = ((((x as f32 + 0.5 - self.canvas.x) / self.canvas.scale - self.left)
+            / self.sprite_scale)
+            .floor() as usize)
+            .min(SPRITE_WIDTH - 1);
+        let sy = ((((y as f32 + 0.5 - self.canvas.y) / self.canvas.scale - self.top)
+            / self.sprite_scale)
+            .floor() as usize)
+            .min(SPRITE_HEIGHT - 1);
+        (sy * SPRITE_WIDTH + sx) * 4
+    }
+
+    pub fn alpha(&self, sprite: &[u8]) -> Vec<u8> {
+        let (x0, y0, x1, y1) = self.bounds;
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| sprite[self.source_offset(x, y) + 3]))
+            .collect()
+    }
 }
 
 impl Renderer {
@@ -100,9 +165,15 @@ impl Renderer {
             font_size: if font_size.is_finite() {
                 font_size.clamp(8.0, 32.0)
             } else {
-                16.0
+                12.0
             },
+            sprite_scale: 1.0,
         }
+    }
+
+    pub fn with_sprite_scale(mut self, scale: f32) -> Self {
+        self.sprite_scale = bounded_sprite_scale(scale);
+        self
     }
 
     /// `size` is the physical framebuffer size, not the logical window size.
@@ -121,7 +192,7 @@ impl Renderer {
         if size.0 == 0 || size.1 == 0 {
             return;
         }
-        let canvas = Canvas::new(size, show);
+        let canvas = Canvas::new(size, show, self.sprite_scale);
         if show {
             for (rect, radius, color) in [
                 ((4.0, 4.0, 376.0, 122.0), 13.0, BORDER),
@@ -197,19 +268,11 @@ impl Renderer {
             }
         }
         // Only the artwork is nearest-resampled. Copy straight RGBA, including hidden RGB.
-        let (left, top) = if show {
-            (SPRITE_LEFT as f32, BUBBLE_HEIGHT as f32)
-        } else {
-            (0.0, 0.0)
-        };
-        let (x0, y0, x1, y1) = canvas.bounds((left, top, 192.0, 208.0));
+        let projection = SpriteProjection::new(size, show, self.sprite_scale);
+        let (x0, y0, x1, y1) = projection.bounds;
         for y in y0..y1 {
             for x in x0..x1 {
-                let sx = (((x as f32 + 0.5 - canvas.x) / canvas.scale - left).floor() as usize)
-                    .min(SPRITE_WIDTH - 1);
-                let sy = (((y as f32 + 0.5 - canvas.y) / canvas.scale - top).floor() as usize)
-                    .min(SPRITE_HEIGHT - 1);
-                let source = (sy * SPRITE_WIDTH + sx) * 4;
+                let source = projection.source_offset(x, y);
                 let target = (y * size.0 as usize + x) * 4;
                 frame[target..target + 4].copy_from_slice(&sprite[source..source + 4]);
             }
@@ -322,8 +385,8 @@ struct Canvas {
 }
 
 impl Canvas {
-    fn new(size: (u32, u32), show: bool) -> Self {
-        let logical = dimensions(show);
+    fn new(size: (u32, u32), show: bool, sprite_scale: f32) -> Self {
+        let logical = dimensions(show, sprite_scale);
         let scale = (size.0 as f32 / logical.0 as f32).min(size.1 as f32 / logical.1 as f32);
         Self {
             size,
@@ -417,6 +480,196 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disjoint_pose_frames_use_only_the_current_compositor_alpha() {
+        use crate::motion::{Point, RasterMask, SpriteGeometry};
+        let geometry = SpriteGeometry {
+            origin: Point::default(),
+            pixel_scale: 1.0,
+        };
+        let projection = SpriteProjection::new((192, 208), false, 1.0);
+        let points = [(10, 10), (150, 10), (150, 150)];
+        for &(x, y) in &points {
+            let mut sprite = vec![0; SPRITE_WIDTH * SPRITE_HEIGHT * 4];
+            sprite[(y * SPRITE_WIDTH + x) * 4 + 3] = 255;
+            let mask = RasterMask::new(192, 208, projection.alpha(&sprite));
+            let mut painted = vec![0; sprite.len()];
+            Renderer::new(None, 12.0).compose(
+                &mut painted,
+                (192, 208),
+                &sprite,
+                &Presentation::default(),
+                None,
+                false,
+            );
+            for &(px, py) in &points {
+                let contact = mask.contact(
+                    Point {
+                        x: px as f64 + 0.5,
+                        y: py as f64 + 0.5,
+                    },
+                    geometry,
+                );
+                assert_eq!(contact, (px, py) == (x, y));
+                assert_eq!(contact, painted[(py * SPRITE_WIDTH + px) * 4 + 3] >= 32);
+            }
+        }
+    }
+
+    #[test]
+    fn pursuit_contact_matches_composed_sprite_raster_on_fractional_grids() {
+        use crate::motion::{Navigator, Point, PursuitStep, RasterMask, SpriteGeometry};
+        use std::time::Instant;
+        let now = Instant::now();
+        for sprite_scale in [0.25, 0.5] {
+            for backing in [1.0_f32, 2.0] {
+                for scene in [1.0_f32, 1.375] {
+                    for show in [false, true] {
+                        let logical = dimensions(show, sprite_scale);
+                        let size = (
+                            (logical.0 as f32 * scene * backing).round() as u32 + 3,
+                            (logical.1 as f32 * scene * backing).round() as u32,
+                        );
+                        let projection = SpriteProjection::new(size, show, sprite_scale);
+                        let (x0, y0, x1, y1) = projection.bounds;
+                        // Alternating threshold-adjacent alpha exposes discarded
+                        // source pixels and pixel-center/rounding discrepancies.
+                        let mut sprite = vec![0; SPRITE_WIDTH * SPRITE_HEIGHT * 4];
+                        for (index, rgba) in sprite.chunks_exact_mut(4).enumerate() {
+                            rgba.copy_from_slice(&[
+                                110,
+                                80,
+                                40,
+                                [0, 31, 32, 255][(index + index / SPRITE_WIDTH) % 4],
+                            ]);
+                        }
+                        let mask = RasterMask::new(x1 - x0, y1 - y0, projection.alpha(&sprite));
+                        let mut rendered = vec![0; size.0 as usize * size.1 as usize * 4];
+                        Renderer::new(None, 12.0)
+                            .with_sprite_scale(sprite_scale)
+                            .compose(
+                                &mut rendered,
+                                size,
+                                &sprite,
+                                &Presentation::default(),
+                                None,
+                                show,
+                            );
+                        let backing = f64::from(backing);
+                        let world = Point {
+                            x: -200.0,
+                            y: -100.0,
+                        };
+                        let geometry = SpriteGeometry {
+                            origin: Point {
+                                x: world.x + x0 as f64 / backing,
+                                y: world.y + y0 as f64 / backing,
+                            },
+                            pixel_scale: 1.0 / backing,
+                        };
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                let cursor = Point {
+                                    x: world.x + (x as f64 + 0.5) / backing,
+                                    y: world.y + (y as f64 + 0.5) / backing,
+                                };
+                                let contact = Navigator::new(40.0, now)
+                                    .step_raster(now, cursor, geometry, &mask);
+                                let alpha = rendered[(y * size.0 as usize + x) * 4 + 3];
+                                assert_eq!(
+                                    contact == PursuitStep::Arrived,
+                                    alpha >= 32,
+                                    "pixel ({x}, {y}), scene {scene}, backing {backing}, sprite {sprite_scale}, bubble {show}"
+                                );
+                            }
+                        }
+                        if show {
+                            let cursor = Point {
+                                x: world.x + 20.0 * f64::from(scene),
+                                y: world.y + 20.0 * f64::from(scene),
+                            };
+                            assert_ne!(
+                                Navigator::new(40.0, now).step_raster(now, cursor, geometry, &mask),
+                                PursuitStep::Arrived
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fully_discarded_opaque_source_pixel_blocks_instead_of_chasing_invisible_art() {
+        use crate::motion::{Navigator, Point, PursuitStep, RasterMask, SpriteGeometry};
+        let mut sprite = vec![0; SPRITE_WIDTH * SPRITE_HEIGHT * 4];
+        sprite[3] = 255;
+        let size = dimensions(false, 0.25);
+        let projection = SpriteProjection::new(size, false, 0.25);
+        let alpha = projection.alpha(&sprite);
+        assert!(alpha.iter().all(|&a| a == 0));
+        let mask = RasterMask::new(size.0 as usize, size.1 as usize, alpha);
+        let now = std::time::Instant::now();
+        assert!(matches!(
+            Navigator::new(40.0, now).step_raster(
+                now,
+                Point { x: 0.125, y: 0.125 },
+                SpriteGeometry {
+                    origin: Point::default(),
+                    pixel_scale: 1.0
+                },
+                &mask
+            ),
+            PursuitStep::Blocked(_)
+        ));
+        let mut frame = vec![0; size.0 as usize * size.1 as usize * 4];
+        Renderer::new(None, 12.0).with_sprite_scale(0.25).compose(
+            &mut frame,
+            size,
+            &sprite,
+            &Presentation::default(),
+            None,
+            false,
+        );
+        assert!(frame.chunks_exact(4).all(|p| p[3] == 0));
+    }
+
+    #[test]
+    fn transparent_sprite_never_uses_bubble_alpha_for_contact() {
+        use crate::motion::{Navigator, Point, PursuitStep, RasterMask, SpriteGeometry};
+        let sprite = vec![0; SPRITE_WIDTH * SPRITE_HEIGHT * 4];
+        let size = dimensions(true, 0.25);
+        let projection = SpriteProjection::new(size, true, 0.25);
+        let (x0, y0, x1, y1) = projection.bounds;
+        let mask = RasterMask::new(x1 - x0, y1 - y0, projection.alpha(&sprite));
+        let mut frame = vec![0; size.0 as usize * size.1 as usize * 4];
+        Renderer::new(None, 12.0).with_sprite_scale(0.25).compose(
+            &mut frame,
+            size,
+            &sprite,
+            &Presentation::default(),
+            None,
+            true,
+        );
+        assert!(frame.chunks_exact(4).any(|p| p[3] >= 32));
+        let now = std::time::Instant::now();
+        assert!(matches!(
+            Navigator::new(40.0, now).step_raster(
+                now,
+                Point { x: 20.0, y: 20.0 },
+                SpriteGeometry {
+                    origin: Point {
+                        x: x0 as f64,
+                        y: y0 as f64
+                    },
+                    pixel_scale: 1.0
+                },
+                &mask
+            ),
+            PursuitStep::Blocked(_)
+        ));
+    }
     use crate::activity::{Cue, Following, Selection};
 
     fn view(state: ActivityState, attention: bool) -> Presentation {
@@ -452,9 +705,10 @@ mod tests {
         following.activity = "chat-7".into();
         following.summary =
             Some("Investigating retry backoff and fixing stalled conversations".into());
-        let (width, height) = dimensions(true);
+        let (width, height) = dimensions(true, 0.5);
         let mut frame = vec![0; width as usize * height as usize * 4];
-        let mut renderer = Renderer::new(Some(Typeface::load(None, None).unwrap()), 16.0);
+        let mut renderer =
+            Renderer::new(Some(Typeface::load(None, None).unwrap()), 12.0).with_sprite_scale(0.5);
         renderer.compose(
             &mut frame,
             (width, height),
@@ -511,7 +765,7 @@ mod tests {
         let mut frame = vec![99; WIDTH * HEIGHT * 4];
         Renderer::new(Some(Typeface::bundled().unwrap()), 16.0).compose(
             &mut frame,
-            dimensions(true),
+            dimensions(true, 1.0),
             sprite,
             view,
             None,
@@ -644,7 +898,7 @@ mod tests {
         let mut face = Typeface::bundled().unwrap();
         let mut frames = Vec::new();
         for density in [1, 2] {
-            let canvas = Canvas::new((384 * density, 352 * density), true);
+            let canvas = Canvas::new((384 * density, 352 * density), true, 1.0);
             let px = 16.0 * density as f32;
             let baseline = 40.0 * density as f32;
             let mut frame = IVORY.repeat(canvas.size.0 as usize * canvas.size.1 as usize);
@@ -703,7 +957,7 @@ mod tests {
 
     #[test]
     fn text_is_clipped_to_content_and_blends_straight_alpha() {
-        let canvas = Canvas::new(dimensions(true), true);
+        let canvas = Canvas::new(dimensions(true, 1.0), true, 1.0);
         let mut face = Typeface::bundled().unwrap();
         let background = [240, 220, 180, 100];
         let mut frame = background.repeat(WIDTH * HEIGHT);
@@ -736,7 +990,7 @@ mod tests {
         let sprite = vec![127; SPRITE_WIDTH * SPRITE_HEIGHT * 4];
         let mut renderer = Renderer::new(None, 16.0);
         for (size, show) in [((424, 352), true), ((384, 392), true), ((232, 208), false)] {
-            let logical = dimensions(show);
+            let logical = dimensions(show, 1.0);
             let left = (size.0 - logical.0) as usize / 2;
             let top = (size.1 - logical.1) as usize / 2;
             let mut padded = vec![99; size.0 as usize * size.1 as usize * 4];
@@ -778,7 +1032,7 @@ mod tests {
 
     #[test]
     fn font_size_limits_and_large_font_layout_reserve_status_space() {
-        assert_eq!(Renderer::new(None, f32::NAN).font_size, 16.0);
+        assert_eq!(Renderer::new(None, f32::NAN).font_size, 12.0);
         assert_eq!(Renderer::new(None, 1.0).font_size, 8.0);
         assert_eq!(Renderer::new(None, 99.0).font_size, 32.0);
         let mut face = Typeface::bundled().unwrap();
@@ -806,8 +1060,8 @@ mod tests {
 
     #[test]
     fn composition_preserves_sprite_bytes_and_transparent_background() {
-        assert_eq!(dimensions(true), (384, 352));
-        assert_eq!(dimensions(false), (192, 208));
+        assert_eq!(dimensions(true, 1.0), (384, 352));
+        assert_eq!(dimensions(false, 1.0), (192, 208));
         let sprite: Vec<_> = (0..SPRITE_WIDTH * SPRITE_HEIGHT * 4)
             .map(|i| (i % 251) as u8)
             .collect();
@@ -847,7 +1101,7 @@ mod tests {
         let mut renderer = Renderer::new(None, 16.0);
         renderer.compose(
             &mut legacy,
-            dimensions(false),
+            dimensions(false, 1.0),
             &sprite,
             &view,
             Some(Animation::Failed),
@@ -874,6 +1128,53 @@ mod tests {
     }
 
     #[test]
+    fn half_size_sprite_compacts_window_without_scaling_bubble_or_font() {
+        assert_eq!(dimensions(true, 0.5), (384, 248));
+        assert_eq!(dimensions(false, 0.5), (96, 104));
+        let sprite: Vec<_> = (0..SPRITE_WIDTH * SPRITE_HEIGHT * 4)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let selected = view(ActivityState::Working, false);
+        let mut full = vec![0; WIDTH * HEIGHT * 4];
+        Renderer::new(Some(Typeface::bundled().unwrap()), 12.0).compose(
+            &mut full,
+            dimensions(true, 1.0),
+            &sprite,
+            &selected,
+            None,
+            true,
+        );
+        let half_size = dimensions(true, 0.5);
+        let mut half = vec![0; half_size.0 as usize * half_size.1 as usize * 4];
+        Renderer::new(Some(Typeface::bundled().unwrap()), 12.0)
+            .with_sprite_scale(0.5)
+            .compose(&mut half, half_size, &sprite, &selected, None, true);
+        assert_eq!(
+            &full[..BUBBLE_HEIGHT * WIDTH * 4],
+            &half[..BUBBLE_HEIGHT * WIDTH * 4]
+        );
+        for y in 0..104 {
+            for x in 0..96 {
+                let source = (((y * 2 + 1) * SPRITE_WIDTH) + x * 2 + 1) * 4;
+                let target = (((y + BUBBLE_HEIGHT) * WIDTH) + x + 144) * 4;
+                assert_eq!(&half[target..target + 4], &sprite[source..source + 4]);
+            }
+        }
+        // A half-size sprite on a 2x display still has one physical pixel per
+        // source pixel: text/display density and sprite scale are independent.
+        let mut dense_sprite = vec![0; sprite.len()];
+        Renderer::new(None, 12.0).with_sprite_scale(0.5).compose(
+            &mut dense_sprite,
+            (192, 208),
+            &sprite,
+            &selected,
+            None,
+            false,
+        );
+        assert_eq!(dense_sprite, sprite);
+    }
+
+    #[test]
     fn summary_only_update_changes_render_without_animation_change() {
         let mut view = view(ActivityState::Working, false);
         let sprite = vec![0; SPRITE_WIDTH * SPRITE_HEIGHT * 4];
@@ -892,7 +1193,7 @@ mod tests {
     fn rejects_wrong_frame_length() {
         Renderer::new(None, 16.0).compose(
             &mut [],
-            dimensions(true),
+            dimensions(true, 1.0),
             &vec![0; 192 * 208 * 4],
             &Presentation::default(),
             None,
@@ -905,7 +1206,7 @@ mod tests {
     fn rejects_wrong_sprite_length() {
         Renderer::new(None, 16.0).compose(
             &mut vec![0; 192 * 208 * 4],
-            dimensions(false),
+            dimensions(false, 1.0),
             &[],
             &Presentation::default(),
             None,

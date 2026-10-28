@@ -1,16 +1,23 @@
 mod activity;
 mod animation;
 mod assets;
+mod bootstrap;
 mod bubble;
 mod display;
+mod hotkey;
 mod ipc;
+mod menu;
+mod motion;
+mod pointer;
 mod protocol;
 mod typography;
+mod visibility;
 mod window;
+mod wisp_action;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -43,20 +50,56 @@ enum Command {
     Status(StatusOptions),
     /// Select a conversation for the shared familiar, or cycle to the next one.
     Focus(FocusOptions),
+    /// Briefly reveal all enabled bubbles, or only the named familiars.
+    Bubbles(BubbleOptions),
+    /// List running familiar instances (including unavailable attachments).
+    Familiars(PageOptions),
+    /// List compatible live targets and their current familiar owners.
+    Targets(TargetOptions),
+    /// List available character presets without starting a service.
+    Presets,
+    /// Open a familiar attached to a distinct live source.
+    Open(OpenOptions),
+    /// Choose a distinct source for each selected familiar.
+    Attach(AttachOptions),
+    /// Remove selected familiars without stopping their source applications.
+    Close(CloseOptions),
+    /// Run selected familiars to the live mouse pointer and celebrate once on arrival.
+    GoToMouse(CloseOptions),
+    /// Familiar-first terminal menu for Wisp or an interactive terminal.
+    Menu(menu::MenuOptions),
+    /// Print a Wisp launcher action, or install it explicitly with a backup.
+    WispAction(wisp_action::ActionOptions),
+    /// Inspect the running service's version, PID and graphical capabilities.
+    ServiceInfo,
+    /// Gracefully stop the graphical service and its familiars, not source applications.
+    Quit,
     /// Validate the bundled atlas and print clip information without opening a window.
     CheckAssets,
     /// Print the license for the bundled fallback font.
     FontLicense,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct RunOptions {
     /// Disable the event listener; use only local expression controls.
     #[arg(long)]
     manual: bool,
+    /// Start the graphical service with no initial familiar (menu bootstrap).
+    #[arg(long, conflicts_with_all = ["manual", "demo"])]
+    empty: bool,
     /// Hide the conversation thought bubble (also useful for privacy).
     #[arg(long)]
     no_bubble: bool,
+    /// Keep the bubble visible instead of using transient notifications.
+    #[arg(long, conflicts_with = "no_bubble")]
+    always_bubble: bool,
+    /// Duration of a notification or on-demand reveal, in seconds.
+    #[arg(long, default_value = "5", value_parser = parse_bubble_duration)]
+    bubble_duration: Duration,
+    /// Do not register the macOS system-wide Option+I shortcut.
+    #[arg(long)]
+    no_hotkey: bool,
     /// Installed Regular font family; defaults to SauceCodePro Nerd Font when available.
     #[arg(long, conflicts_with = "font_file", value_parser = parse_font_family)]
     font_family: Option<String>,
@@ -64,14 +107,20 @@ pub struct RunOptions {
     #[arg(long, conflicts_with = "font_family")]
     font_file: Option<PathBuf>,
     /// Bubble font size in logical canvas units (scaled with the scene).
-    #[arg(long, default_value = "16", value_parser = parse_font_size)]
+    #[arg(long, default_value = "12", value_parser = parse_font_size)]
     font_size: f32,
+    /// Scale only Djinn's artwork, without shrinking the bubble or its text.
+    #[arg(long, default_value = "0.5", value_parser = parse_sprite_scale)]
+    sprite_scale: f32,
     /// Initial expression. Success, failure, and waving play once, then return to idle.
     #[arg(long, value_enum, default_value = "idle")]
     animation: Animation,
-    /// Scene scale: 384 × 352 with the bubble, or 192 × 208 in sprite-only mode.
+    /// Scale the whole scene; sprite size can be adjusted separately with --sprite-scale.
     #[arg(long, default_value = "1.5", value_parser = parse_scale)]
     scale: f64,
+    /// Go-to-mouse movement speed in desktop points per second.
+    #[arg(long, default_value = "360", value_parser = parse_move_speed)]
+    move_speed: f64,
     /// Cycle through every expression automatically, three seconds per selection.
     #[arg(long, conflicts_with = "paused")]
     demo: bool,
@@ -104,6 +153,90 @@ struct StatusOptions {
     /// Index of the first activity to list (four activities per page).
     #[arg(long, default_value_t = 0)]
     offset: usize,
+    #[arg(long, value_parser = parse_id)]
+    familiar: Option<String>,
+}
+
+#[derive(Args)]
+struct PageOptions {
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+}
+
+#[derive(Args)]
+struct TargetOptions {
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Include this familiar's own target as eligible for reattachment.
+    #[arg(long, value_parser = parse_id)]
+    familiar: Option<String>,
+}
+
+#[derive(Args)]
+struct BubbleOptions {
+    /// Omit to reveal all; repeat to select individual familiars.
+    #[arg(long, num_args = 1.., value_parser = parse_id)]
+    familiar: Vec<String>,
+}
+
+#[derive(Args)]
+struct CloseOptions {
+    #[arg(long, required = true, num_args = 1.., value_parser = parse_id)]
+    familiar: Vec<String>,
+}
+
+#[derive(Args)]
+struct AttachmentTarget {
+    #[arg(long, required_unless_present = "batch", conflicts_with = "batch", value_parser = parse_id)]
+    source: Option<String>,
+    #[arg(long, conflicts_with = "batch", value_parser = parse_id)]
+    instance: Option<String>,
+    #[arg(long, required_unless_present = "batch", conflicts_with = "batch", value_parser = parse_id)]
+    activity: Option<String>,
+}
+
+#[derive(Args)]
+struct OpenOptions {
+    /// Optional stable ID; otherwise generated by the running service.
+    #[arg(long, conflicts_with = "batch", value_parser = parse_id)]
+    id: Option<String>,
+    #[arg(long, default_value = "djinn", conflicts_with = "batch", value_parser = parse_id)]
+    preset: String,
+    #[command(flatten)]
+    target: AttachmentTarget,
+    /// Read a JSON array of per-familiar requests from a file, or - for stdin.
+    #[arg(long)]
+    batch: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct AttachOptions {
+    #[arg(long, required_unless_present = "batch", conflicts_with = "batch", value_parser = parse_id)]
+    familiar: Option<String>,
+    #[command(flatten)]
+    target: AttachmentTarget,
+    /// Read a JSON array of per-familiar requests from a file, or - for stdin.
+    #[arg(long)]
+    batch: Option<PathBuf>,
+}
+
+fn read_batch(path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    let input: Box<dyn Read> = if path == std::path::Path::new("-") {
+        Box::new(io::stdin())
+    } else {
+        Box::new(
+            std::fs::File::open(path).with_context(|| format!("open batch {}", path.display()))?,
+        )
+    };
+    let mut bytes = Vec::new();
+    input
+        .take(protocol::MAX_LINE as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= protocol::MAX_LINE,
+        "batch input exceeds 8 KiB"
+    );
+    serde_json::from_slice(&bytes).context("batch must be a JSON array of familiar requests")
 }
 
 #[derive(Args)]
@@ -119,9 +252,13 @@ struct FocusOptions {
     instance: Option<String>,
     #[arg(long, requires = "source", value_parser = parse_id)]
     activity: Option<String>,
+    /// Familiar to retarget/cycle; defaults to the bootstrap familiar main.
+    #[arg(long, value_parser = parse_id)]
+    familiar: Option<String>,
 }
 
 fn print_control(path: PathBuf, request: serde_json::Value) -> Result<()> {
+    protocol::Request::parse(&serde_json::to_vec(&request)?)?;
     let status = ipc::control(&path, request)?;
     println!("{}", serde_json::to_string_pretty(&status)?);
     Ok(())
@@ -182,6 +319,37 @@ fn parse_font_size(value: &str) -> Result<f32, String> {
         Ok(size)
     } else {
         Err("font size must be a finite number between 8 and 32".into())
+    }
+}
+
+fn parse_sprite_scale(value: &str) -> Result<f32, String> {
+    let scale: f32 = value
+        .parse()
+        .map_err(|_| "expected a sprite scale".to_owned())?;
+    if scale.is_finite() && (0.25..=2.0).contains(&scale) {
+        Ok(scale)
+    } else {
+        Err("sprite scale must be a finite number between 0.25 and 2".into())
+    }
+}
+
+fn parse_bubble_duration(value: &str) -> Result<Duration, String> {
+    let duration = parse_seconds(value)?;
+    if (Duration::from_millis(250)..=Duration::from_secs(30)).contains(&duration) {
+        Ok(duration)
+    } else {
+        Err("bubble duration must be between 0.25 and 30 seconds".into())
+    }
+}
+
+fn parse_move_speed(value: &str) -> Result<f64, String> {
+    let speed: f64 = value
+        .parse()
+        .map_err(|_| "expected a movement speed".to_owned())?;
+    if speed.is_finite() && (40.0..=2000.0).contains(&speed) {
+        Ok(speed)
+    } else {
+        Err("movement speed must be a finite number between 40 and 2000".into())
     }
 }
 
@@ -355,6 +523,87 @@ fn main() -> Result<()> {
         }
         Command::Listen(options) => listen(socket_path(cli.socket)?, options),
         Command::Publish(options) => publish(socket_path(cli.socket)?, options),
+        Command::Bubbles(options) => print_control(
+            socket_path(cli.socket)?,
+            serde_json::json!({
+                "version": 1, "type": "companion.reveal",
+                "familiars": if options.familiar.is_empty() { None } else { Some(options.familiar) },
+            }),
+        ),
+        Command::Familiars(options) => print_control(
+            socket_path(cli.socket)?,
+            serde_json::json!({
+                "version": 1, "type": "familiar.list", "offset": options.offset,
+            }),
+        ),
+        Command::Targets(options) => print_control(
+            socket_path(cli.socket)?,
+            serde_json::json!({
+                "version": 1, "type": "companion.targets", "offset": options.offset, "familiar": options.familiar,
+            }),
+        ),
+        Command::Presets => {
+            println!("{}", serde_json::to_string_pretty(&menu::presets())?);
+            Ok(())
+        }
+        Command::Menu(options) => menu::run(&socket_path(cli.socket)?, options),
+        Command::WispAction(options) => wisp_action::run(options, cli.socket.as_deref()),
+        Command::ServiceInfo => print_control(
+            socket_path(cli.socket)?,
+            serde_json::json!({
+                "version":1,"type":"companion.service",
+            }),
+        ),
+        Command::Quit => print_control(
+            socket_path(cli.socket)?,
+            serde_json::json!({
+                "version":1,"type":"companion.quit",
+            }),
+        ),
+        Command::Open(options) => {
+            let items = if let Some(path) = options.batch {
+                read_batch(&path)?
+            } else {
+                vec![
+                    serde_json::json!({"id": options.id, "preset": options.preset,
+                    "source": options.target.source.context("--source is required")?,
+                    "instance": options.target.instance,
+                    "activity": options.target.activity.context("--activity is required")?}),
+                ]
+            };
+            print_control(
+                socket_path(cli.socket)?,
+                serde_json::json!({"version":1,"type":"familiar.open","items":items}),
+            )
+        }
+        Command::Attach(options) => {
+            let items = if let Some(path) = options.batch {
+                read_batch(&path)?
+            } else {
+                vec![
+                    serde_json::json!({"id": options.familiar.context("--familiar is required")?,
+                    "source": options.target.source.context("--source is required")?,
+                    "instance": options.target.instance,
+                    "activity": options.target.activity.context("--activity is required")?}),
+                ]
+            };
+            print_control(
+                socket_path(cli.socket)?,
+                serde_json::json!({"version":1,"type":"familiar.attach","items":items}),
+            )
+        }
+        Command::Close(options) => print_control(
+            socket_path(cli.socket)?,
+            serde_json::json!({
+                "version":1,"type":"familiar.close","ids":options.familiar,
+            }),
+        ),
+        Command::GoToMouse(options) => print_control(
+            socket_path(cli.socket)?,
+            serde_json::json!({
+                "version":1,"type":"familiar.go-to-mouse","ids":options.familiar,
+            }),
+        ),
         Command::FontLicense => {
             print!("{}", typography::FALLBACK_FONT_LICENSE);
             Ok(())
@@ -362,17 +611,18 @@ fn main() -> Result<()> {
         Command::Status(options) => print_control(
             socket_path(cli.socket)?,
             serde_json::json!({
-                "version": 1, "type": "companion.status", "offset": options.offset,
+                "version": 1, "type": "companion.status", "offset": options.offset, "familiar": options.familiar,
             }),
         ),
         Command::Focus(options) => {
             let request = if options.next {
-                serde_json::json!({"version": 1, "type": "companion.next"})
+                serde_json::json!({"version": 1, "type": "companion.next", "familiar": options.familiar})
             } else {
                 serde_json::json!({"version": 1, "type": "companion.focus",
                     "source": options.source.context("--source is required")?,
                     "instance": options.instance,
-                    "activity": options.activity.context("--activity is required")?})
+                    "activity": options.activity.context("--activity is required")?,
+                    "familiar": options.familiar})
             };
             print_control(socket_path(cli.socket)?, request)
         }
@@ -415,6 +665,12 @@ mod tests {
         };
         assert_eq!(options.animation, Animation::Idle);
         assert_eq!(options.scale, 1.5);
+        assert_eq!(options.font_size, 12.0);
+        assert_eq!(options.sprite_scale, 0.5);
+        assert_eq!(options.move_speed, 360.0);
+        assert_eq!(options.bubble_duration, Duration::from_secs(5));
+        assert!(!options.always_bubble);
+        assert!(!options.empty);
         assert!(!options.focus);
         assert!(Cli::try_parse_from(["numen", "check-assets"]).is_ok());
         assert!(
@@ -436,6 +692,13 @@ mod tests {
         for size in ["0", "7.9", "32.1", "NaN", "inf"] {
             assert!(Cli::try_parse_from(["numen", "run", "--font-size", size]).is_err());
         }
+        for scale in ["0", "0.24", "2.1", "NaN", "inf"] {
+            assert!(Cli::try_parse_from(["numen", "run", "--sprite-scale", scale]).is_err());
+        }
+        for speed in ["0", "39", "2001", "NaN", "inf"] {
+            assert!(Cli::try_parse_from(["numen", "run", "--move-speed", speed]).is_err());
+        }
+        assert!(Cli::try_parse_from(["numen", "run", "--sprite-scale", "1"]).is_ok());
         assert!(Cli::try_parse_from(["numen", "run", "--font-family", " "]).is_err());
         assert!(
             Cli::try_parse_from([
@@ -460,6 +723,17 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["numen", "font-license"]).is_ok());
+        assert!(Cli::try_parse_from(["numen", "bubbles"]).is_ok());
+        assert!(Cli::try_parse_from(["numen", "menu", "--no-start"]).is_ok());
+        assert!(Cli::try_parse_from(["numen", "wisp-action"]).is_ok());
+        assert!(Cli::try_parse_from(["numen", "quit"]).is_ok());
+        assert!(Cli::try_parse_from(["numen", "run", "--empty"]).is_ok());
+        assert!(Cli::try_parse_from(["numen", "run", "--empty", "--manual"]).is_err());
+        assert!(Cli::try_parse_from(["numen", "run", "--empty", "--demo"]).is_err());
+        assert!(Cli::try_parse_from(["numen", "run", "--no-bubble", "--always-bubble"]).is_err());
+        for duration in ["0", "0.2", "31", "NaN", "inf"] {
+            assert!(Cli::try_parse_from(["numen", "run", "--bubble-duration", duration]).is_err());
+        }
     }
 
     #[test]
@@ -504,6 +778,79 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn familiar_controls_require_explicit_distinct_target_requests() {
+        for args in [
+            vec!["numen", "presets"],
+            vec!["numen", "familiars", "--offset", "4"],
+            vec!["numen", "targets", "--familiar", "main"],
+            vec![
+                "numen",
+                "open",
+                "--source",
+                "djinn",
+                "--activity",
+                "chat-2",
+                "--id",
+                "second",
+            ],
+            vec!["numen", "open", "--batch", "-"],
+            vec![
+                "numen",
+                "attach",
+                "--familiar",
+                "main",
+                "--source",
+                "djinn",
+                "--activity",
+                "chat-3",
+            ],
+            vec!["numen", "attach", "--batch", "-"],
+            vec!["numen", "close", "--familiar", "main", "second"],
+            vec!["numen", "go-to-mouse", "--familiar", "main", "second"],
+            vec!["numen", "bubbles", "--familiar", "second"],
+            vec!["numen", "status", "--familiar", "second"],
+            vec!["numen", "focus", "--next", "--familiar", "second"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
+        }
+        for args in [
+            vec!["numen", "open"],
+            vec!["numen", "open", "--source", "djinn"],
+            vec!["numen", "open", "--batch", "-", "--source", "djinn"],
+            vec![
+                "numen",
+                "attach",
+                "--source",
+                "djinn",
+                "--activity",
+                "chat-2",
+            ],
+            vec!["numen", "attach", "--batch", "-", "--familiar", "main"],
+            vec!["numen", "close"],
+            vec!["numen", "go-to-mouse"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn batch_file_input_is_bounded_and_requires_an_array() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(br#"[{"preset":"djinn","source":"djinn","activity":"chat-1"}]"#)
+            .unwrap();
+        let items = read_batch(file.path()).unwrap();
+        assert_eq!(items.len(), 1);
+        let mut invalid = tempfile::NamedTempFile::new().unwrap();
+        invalid.write_all(b"{}").unwrap();
+        assert!(read_batch(invalid.path()).is_err());
+        let mut oversized = tempfile::NamedTempFile::new().unwrap();
+        oversized
+            .write_all(&vec![b' '; protocol::MAX_LINE + 1])
+            .unwrap();
+        assert!(read_batch(oversized.path()).is_err());
     }
 
     use clap::CommandFactory;

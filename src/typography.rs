@@ -1,5 +1,5 @@
 //! Single-face text metrics and grayscale rasterization, without complex-script shaping.
-use std::{collections::HashMap, fs::File, io::Read, path::Path};
+use std::{collections::HashMap, fs::File, io::Read, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fontdb::{Database, Family, Query, Source, Stretch, Style, Weight};
@@ -17,7 +17,7 @@ pub struct RasterGlyph {
 }
 
 pub struct Typeface {
-    font: Font,
+    font: Arc<Font>,
     description: String,
     fallback_index: u16,
     cache_px: Option<u32>,
@@ -25,6 +25,17 @@ pub struct Typeface {
 }
 
 impl Typeface {
+    /// Share the parsed face, but keep each renderer's bounded raster cache private.
+    pub fn fork(&self) -> Self {
+        Self {
+            font: self.font.clone(),
+            description: self.description.clone(),
+            fallback_index: self.fallback_index,
+            cache_px: None,
+            glyphs: HashMap::new(),
+        }
+    }
+
     /// Explicit selections fail rather than silently substituting a different face.
     pub fn load(family: Option<&str>, file: Option<&Path>) -> Result<Self> {
         ensure!(
@@ -86,7 +97,7 @@ impl Typeface {
             // If neither replacement character exists, use this face's .notdef.
             .unwrap_or(0);
         Ok(Self {
-            font,
+            font: Arc::new(font),
             description,
             fallback_index,
             cache_px: None,
@@ -228,6 +239,22 @@ fn read_font(path: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn fork_shares_face_with_independent_fresh_cache() {
+        let mut face = Typeface::bundled().unwrap();
+        face.glyph('A', 12.0);
+        let mut fork = face.fork();
+        assert!(Arc::ptr_eq(&face.font, &fork.font));
+        assert_eq!(face.description(), fork.description());
+        assert_eq!(face.fallback_index, fork.fallback_index);
+        assert!(fork.glyphs.is_empty());
+        assert_eq!(fork.cache_px, None);
+        fork.glyph('B', 24.0);
+        assert_eq!(face.cache_px, Some(12.0_f32.to_bits()));
+        assert_eq!(face.glyphs.len(), 1);
+        assert_eq!(fork.cache_px, Some(24.0_f32.to_bits()));
+    }
 
     #[test]
     fn bundled_raster_has_antialiased_coverage_and_real_line_metrics() {
