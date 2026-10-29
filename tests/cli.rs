@@ -69,6 +69,9 @@ fn command(socket: &Path) -> Command {
         .arg("--socket")
         .arg(socket)
         .current_dir(socket.parent().unwrap())
+        .env("HOME", socket.parent().unwrap())
+        .env("XDG_CONFIG_HOME", socket.parent().unwrap().join("config"))
+        .env("XDG_RUNTIME_DIR", socket.parent().unwrap())
         .env("RUST_LOG", "numen=info,wgpu=warn")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -349,6 +352,9 @@ fn demo_publishes_ordered_protocol_states_and_disconnects() {
             ])
             .arg(&socket)
             .current_dir(socket.parent().unwrap())
+            .env("HOME", socket.parent().unwrap())
+            .env("XDG_CONFIG_HOME", socket.parent().unwrap().join("config"))
+            .env("XDG_RUNTIME_DIR", socket.parent().unwrap())
             .env("RUST_LOG", "numen=info,wgpu=warn")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -686,6 +692,21 @@ fn headless_discovery_reports_live_targets_but_no_lifecycle_capabilities() {
 
 // Keep lifecycle serialization independent of a graphical server and its callbacks.
 fn mock_control(args: &[&str], input: Option<&Value>, expected: Value, data: Value) {
+    let (status, stdout, stderr) = mock_control_result(args, input, expected, data.clone());
+    assert!(status.success(), "{args:?}: {stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap(),
+        data,
+        "{args:?}"
+    );
+}
+
+fn mock_control_result(
+    args: &[&str],
+    input: Option<&Value>,
+    expected: Value,
+    data: Value,
+) -> (ExitStatus, String, String) {
     let (_dir, socket) = fixture();
     let server = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
@@ -746,12 +767,6 @@ fn mock_control(args: &[&str], input: Option<&Value>, expected: Value, data: Val
     .unwrap();
     let status = child.wait_until(deadline);
     let (stdout, stderr) = child.output();
-    assert!(status.success(), "{args:?}: {stderr}");
-    assert_eq!(
-        serde_json::from_str::<Value>(&stdout).unwrap(),
-        data,
-        "{args:?}"
-    );
     line.clear();
     assert_eq!(
         reader.read_line(&mut line).unwrap(),
@@ -759,6 +774,179 @@ fn mock_control(args: &[&str], input: Option<&Value>, expected: Value, data: Val
         "extra request: {line}"
     );
     assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(!socket.parent().unwrap().join("config").exists());
+    (status, stdout, stderr)
+}
+
+#[test]
+fn preferences_forget_serializes_explicit_ids_once_and_accepts_only_the_exact_ack_set() {
+    let args = [
+        "preferences",
+        "forget",
+        "--familiar",
+        "third",
+        "first",
+        "second",
+    ];
+    let request = json!({"version":1,"type":"familiar.preferences.forget",
+        "ids":["third","first","second"]});
+    for forgotten in [
+        json!(["third", "first", "second"]),
+        json!(["second", "third", "first"]),
+    ] {
+        mock_control(&args, None, request.clone(), json!({"forgotten":forgotten}));
+    }
+    for data in [
+        json!({}),
+        json!({"forgotten":null}),
+        json!({"forgotten":"all"}),
+        json!({"forgotten":[]}),
+        json!({"forgotten":["first","second"]}),
+        json!({"forgotten":["first","second","second"]}),
+        json!({"forgotten":["first","second","other"]}),
+        json!({"forgotten":["first","second","third","other"]}),
+        json!({"forgotten":["first","second",3]}),
+    ] {
+        let (status, stdout, stderr) =
+            mock_control_result(&args, None, request.clone(), data.clone());
+        assert_eq!(status.code(), Some(1), "{data}: {stderr}");
+        assert!(stdout.is_empty(), "{data}: {stdout}");
+        assert!(stderr.contains("accepted forget"), "{data}: {stderr}");
+    }
+    let ids: Vec<_> = (0..16).map(|n| format!("f{n}")).collect();
+    let mut args = vec!["preferences", "forget", "--familiar"];
+    args.extend(ids.iter().map(String::as_str));
+    mock_control(
+        &args,
+        None,
+        json!({"version":1,"type":"familiar.preferences.forget","ids":ids}),
+        json!({"forgotten":ids}),
+    );
+    mock_control(
+        &["preferences", "forget", "--familiar", "only"],
+        None,
+        json!({"version":1,"type":"familiar.preferences.forget","ids":["only"]}),
+        json!({"forgotten":["only"]}),
+    );
+}
+
+#[test]
+fn preferences_forget_requires_unique_bounded_explicit_ids_before_connecting() {
+    let (dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let mut cases = vec![
+        vec!["preferences".to_owned()],
+        vec!["preferences".into(), "forget".into()],
+        vec!["preferences".into(), "forget".into(), "--all".into()],
+    ];
+    for ids in [
+        vec![],
+        vec!["".into()],
+        vec!["bad/id".into()],
+        vec!["bad\nidentifier".into()],
+        vec!["x".repeat(97)],
+        vec!["same".into(), "same".into()],
+        (0..17).map(|n| format!("f{n}")).collect(),
+    ] {
+        let mut args = vec!["preferences".into(), "forget".into(), "--familiar".into()];
+        args.extend(ids);
+        cases.push(args);
+    }
+    for args in cases {
+        let mut child = ChildGuard(command(&socket).args(&args).spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert!(!status.success(), "accepted {args:?}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        assert!(!stderr.is_empty(), "{args:?}");
+        assert!(
+            matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "{args:?}: connected before validation"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn preferences_run_flags_reject_invalid_paths_conflicts_and_headless_use_before_io() {
+    let (dir, socket) = fixture();
+    let preferences = dir.path().join("missing/preferences.json");
+    let absolute = preferences.to_str().unwrap();
+    for args in [
+        vec!["run", "--preferences-file", "relative.json"],
+        vec!["run", "--preferences-file", ""],
+        vec!["run", "--preferences-file", "/"],
+        vec!["run", "--no-preferences", "--preferences-file", absolute],
+        vec!["run", "--preferences-file", absolute, "--no-preferences"],
+        vec!["run", "--manual", "--preferences-file", "relative.json"],
+        vec!["run", "--demo", "--preferences-file", "relative.json"],
+        vec!["listen", "--preferences-file", absolute],
+        vec!["listen", "--no-preferences"],
+    ] {
+        let mut child = ChildGuard(command(&socket).args(&args).spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert_eq!(status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        assert!(stderr.contains("error:"), "{args:?}: {stderr}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn preferences_help_describes_remembering_and_explicit_forgetting_without_io() {
+    let (dir, socket) = fixture();
+    for (args, claims) in [
+        (
+            vec!["run", "--help"],
+            vec![
+                "--no-preferences",
+                "--preferences-file",
+                "reads and writes",
+                "absolute",
+            ],
+        ),
+        (
+            vec!["settings", "--help"],
+            vec![
+                "remembering enabled",
+                "saved asynchronously",
+                "attached chat",
+            ],
+        ),
+        (
+            vec!["preferences", "--help"],
+            vec![
+                "remembered appearance",
+                "without changing live attachments",
+                "forget",
+            ],
+        ),
+        (
+            vec!["preferences", "forget", "--help"],
+            vec![
+                "saved appearance/placement",
+                "leave current views unchanged",
+                "--familiar",
+            ],
+        ),
+    ] {
+        let mut child = ChildGuard(command(&socket).args(&args).spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert!(status.success(), "{args:?}: {stderr}");
+        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+        for claim in claims {
+            assert!(
+                stdout.contains(claim),
+                "{args:?}: missing {claim}: {stdout}"
+            );
+        }
+        assert!(!stdout.contains("runtime-only"), "{args:?}: {stdout}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 }
 
 #[test]
@@ -1342,7 +1530,7 @@ fn menu_help_lists_flags_without_a_tty_or_service() {
 
 #[test]
 fn service_info_reports_actual_headless_listener_pid_and_capabilities() {
-    let (_dir, socket) = fixture();
+    let (dir, socket) = fixture();
     let mut listener = ChildGuard(
         command(&socket)
             .args(["listen", "--exit-after", "1.5"])
@@ -1393,17 +1581,25 @@ fn service_info_reports_actual_headless_listener_pid_and_capabilities() {
     assert_eq!(doctor["service_state"], "reachable");
     assert_eq!(doctor["service"]["pid"], listener.0.id());
     assert_eq!(doctor["service"]["diagnostics"], diagnostics);
+    assert_eq!(
+        diagnostics["preferences"],
+        json!({"mode":"disabled","load":"not_loaded","write":"clean",
+            "reason":"disabled","accepted_revision":0,"durable_revision":0,
+            "records":0,"path":null})
+    );
     assert_eq!(doctor["client"]["build"], diagnostics["build"]);
     assert_eq!(doctor["build_comparison"], "match");
     assert_eq!(
         info,
         json!({"api_version":1,"pid":listener.0.id(),"graphical":false,
-            "lifecycle":false,"navigation":false})
+            "lifecycle":false,"navigation":false,"preferences":false})
     );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     let status = listener.wait_until(deadline);
     let (_, stderr) = listener.output();
     assert!(status.success(), "{stderr}");
     assert!(!socket.exists());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -1476,8 +1672,54 @@ fn doctor_default_socket_resolution_does_not_create_runtime_leaf() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
+#[test]
+fn doctor_does_not_open_or_mutate_default_preferences() {
+    use std::ffi::CString;
+
+    for xdg in [false, true] {
+        let (dir, socket) = fixture();
+        let config = dir.path().join(if xdg { "config" } else { ".config" });
+        let leaf = config.join("numen");
+        fs::create_dir_all(&leaf).unwrap();
+        let preferences = leaf.join("preferences.json");
+        let path = CString::new(preferences.as_os_str().as_bytes()).unwrap();
+        // Opening this default path for reading would block without a writer.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let before = fs::symlink_metadata(&preferences).unwrap();
+        for human in [false, true] {
+            let mut cmd = command(&socket);
+            cmd.arg("doctor");
+            if !human {
+                cmd.arg("--json");
+            }
+            if !xdg {
+                cmd.env_remove("XDG_CONFIG_HOME");
+            }
+            let mut child = ChildGuard(cmd.spawn().unwrap());
+            let status = child.wait_until(Instant::now() + LIMIT);
+            let (stdout, stderr) = child.output();
+            assert!(status.success(), "{stderr}");
+            assert!(stderr.is_empty(), "{stderr}");
+            if human {
+                assert!(stdout.contains("Service: not_running"), "{stdout}");
+            } else {
+                let report: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(report["service_state"], "not_running");
+            }
+            let after = fs::symlink_metadata(&preferences).unwrap();
+            assert_eq!(after.file_type(), before.file_type());
+            assert_eq!(after.permissions().mode(), before.permissions().mode());
+            assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+            assert_eq!(fs::read_dir(&leaf).unwrap().count(), 1);
+            assert_eq!(fs::read_dir(&config).unwrap().count(), 1);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+            assert!(!socket.exists());
+        }
+    }
+}
+
 fn doctor_mock(reply: Option<&str>, human: bool) -> (ExitStatus, String, String) {
-    let (_dir, socket) = fixture();
+    let (dir, socket) = fixture();
     let server = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     server.set_nonblocking(true).unwrap();
@@ -1524,6 +1766,7 @@ fn doctor_mock(reply: Option<&str>, human: bool) -> (ExitStatus, String, String)
         "extra request: {line}"
     );
     assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     (status, stdout, stderr)
 }
 
@@ -1542,6 +1785,132 @@ fn legacy_service() -> Value {
 
 // Keep this as wire text: constructing a Value would erase duplicate-key evidence.
 const DOCTOR_ACK: &str = r#"{"version":1,"ok":true,"data":{"api_version":1,"pid":123,"service_instance":"mock-service","graphical":true,"lifecycle":true,"navigation":true,"settings":true,"familiar_count":1,"source_count":0,"diagnostics":{"version":1,"executable":"/safe/path","build":{"version":"0.1.0","fingerprint":"unknown","source_fingerprint":"unknown","target":"target","profile":"profile"},"hotkeys":{"option_i":{"state":"registered","reason":null},"option_m":{"state":"registered","reason":null}}}}}"#;
+
+#[test]
+fn doctor_accepts_preferences_status_and_keeps_missing_metadata_unknown() {
+    let mut data = serde_json::from_str::<Value>(DOCTOR_ACK).unwrap()["data"].clone();
+    let missing = doctor_data(&data);
+    assert!(
+        missing["service"]["diagnostics"]
+            .get("preferences")
+            .is_none()
+    );
+    let (status, stdout, stderr) = doctor_mock(Some(DOCTOR_ACK), true);
+    assert!(status.success(), "{stderr}");
+    assert!(
+        stdout.contains("Preferences: unknown (reason: not_reported)"),
+        "{stdout}"
+    );
+
+    for preferences in [
+        json!({"mode":"disabled","load":"not_loaded","write":"clean",
+            "reason":"disabled","accepted_revision":0,"durable_revision":0,
+            "records":0,"path":null}),
+        json!({"mode":"writable","load":"loaded","write":"clean",
+            "reason":null,"accepted_revision":7,"durable_revision":7,
+            "records":128,"path":"/reported/not-local/preferences.json"}),
+        json!({"mode":"writable","load":"absent","write":"pending",
+            "reason":null,"accepted_revision":8,"durable_revision":7,
+            "records":3,"path":"/reported/not-local/preferences.json"}),
+        json!({"mode":"read_only","load":"rejected","write":"blocked",
+            "reason":"invalid_data","accepted_revision":0,"durable_revision":0,
+            "records":0,"path":null}),
+        json!({"mode":"read_only","load":"loaded","write":"failed",
+            "reason":"io_error","accepted_revision":8,"durable_revision":7,
+            "records":3,"path":"/reported/not-local/preferences.json"}),
+    ] {
+        data["diagnostics"]["preferences"] = preferences.clone();
+        let report = doctor_data(&data);
+        assert_eq!(report["service_state"], "reachable");
+        assert_eq!(report["service"]["diagnostics"]["preferences"], preferences);
+        let reply = json!({"version":1,"ok":true,"data":data}).to_string();
+        let (status, stdout, stderr) = doctor_mock(Some(&reply), true);
+        assert!(status.success(), "{preferences}: {stderr}");
+        assert!(stderr.is_empty(), "{preferences}: {stderr}");
+        assert!(
+            stdout.contains(&format!(
+                "Preferences: {}",
+                preferences["mode"].as_str().unwrap()
+            )),
+            "{preferences}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn doctor_rejects_malformed_preferences_before_printing_or_echoing_private_values() {
+    let mut data = serde_json::from_str::<Value>(DOCTOR_ACK).unwrap()["data"].clone();
+    let writable = json!({"mode":"writable","load":"loaded","write":"clean",
+        "reason":null,"accepted_revision":7,"durable_revision":7,
+        "records":3,"path":"/private-preferences-marker/preferences.json"});
+    let disabled = json!({"mode":"disabled","load":"not_loaded","write":"clean",
+        "reason":"disabled","accepted_revision":0,"durable_revision":0,
+        "records":0,"path":null});
+    let mut cases = vec![json!(false), json!({})];
+    for (field, value) in [
+        ("mode", json!("private-preferences-marker")),
+        ("load", json!("private-preferences-marker")),
+        ("write", json!("private-preferences-marker")),
+        ("reason", json!("private-preferences-marker")),
+        ("durable_revision", json!(8)),
+        ("accepted_revision", json!(-1)),
+        ("records", json!(129)),
+        ("records", json!("3")),
+        ("path", json!("")),
+        ("path", json!("private-preferences-marker/relative.json")),
+        (
+            "path",
+            json!(format!("/private-preferences-marker/{}", "x".repeat(1024))),
+        ),
+        ("path", json!(null)),
+        ("load", json!("not_loaded")),
+        ("load", json!("rejected")),
+        ("write", json!("failed")),
+        ("write", json!("pending")),
+        ("write", json!("blocked")),
+        ("reason", json!("io_error")),
+        ("reason", json!("capacity_reached")),
+    ] {
+        let mut preferences = writable.clone();
+        preferences[field] = value;
+        cases.push(preferences);
+    }
+    for c in [
+        '\0', '\n', '\u{7f}', '\u{85}', '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202e}',
+        '\u{2066}', '\u{2069}',
+    ] {
+        let mut preferences = writable.clone();
+        preferences["path"] = json!(format!("/private-preferences-marker/{c}file"));
+        cases.push(preferences);
+    }
+    for (field, value) in [
+        ("records", json!(1)),
+        ("accepted_revision", json!(1)),
+        ("durable_revision", json!(1)),
+        ("load", json!("loaded")),
+        ("write", json!("failed")),
+        ("reason", json!("io_error")),
+        (
+            "path",
+            json!("/private-preferences-marker/preferences.json"),
+        ),
+    ] {
+        let mut preferences = disabled.clone();
+        preferences[field] = value;
+        cases.push(preferences);
+    }
+    for preferences in cases {
+        data["diagnostics"]["preferences"] = preferences.clone();
+        let reply = json!({"version":1,"ok":true,"data":data}).to_string();
+        for human in [false, true] {
+            let (status, stdout, stderr) = doctor_mock(Some(&reply), human);
+            assert_eq!(status.code(), Some(1), "{preferences}: {stderr}");
+            assert!(stdout.is_empty(), "{preferences}: {stdout}");
+            assert!(!stderr.is_empty(), "{preferences}");
+            assert!(!stderr.contains("private-preferences-marker"), "{stderr}");
+        }
+    }
+}
 
 #[test]
 fn doctor_rejects_contradictory_shortcut_states_and_per_key_reasons() {

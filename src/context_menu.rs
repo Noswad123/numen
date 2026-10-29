@@ -2,7 +2,22 @@
 //! caller revalidates lifecycle/capabilities and executes it after tracking ends.
 use std::sync::{Arc, atomic::AtomicBool};
 
+use crate::activity::FocusTarget;
 use crate::protocol::{FamiliarSettings, SettingsPatch};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatChoice {
+    pub target: FocusTarget,
+    pub incarnation: u64,
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachmentContext {
+    pub current: Option<FocusTarget>,
+    pub available: bool,
+    pub choices: Vec<ChatChoice>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
@@ -10,6 +25,8 @@ pub enum Action {
     GoToMouse,
     SetPaused(bool),
     Settings(SettingsPatch),
+    ForgetPreferences,
+    Attach(usize),
     CloseFamiliar,
     QuitNumen,
 }
@@ -25,6 +42,8 @@ pub struct Context {
     pub bubbles: bool,
     pub navigation: bool,
     pub settings: Option<FamiliarSettings>,
+    pub preferences: bool,
+    pub attachments: Option<AttachmentContext>,
 }
 
 /// The only menu catalog: add future controls here, not in the native renderer.
@@ -35,6 +54,7 @@ pub enum Entry {
         action: Option<Action>,
         enabled: bool,
         checked: bool,
+        tooltip: Option<String>,
     },
     Submenu {
         label: String,
@@ -50,18 +70,21 @@ pub fn entries(context: Context) -> Vec<Entry> {
             action: Some(Action::RevealStatus),
             enabled: context.bubbles,
             checked: false,
+            tooltip: None,
         },
         Entry::Item {
             label: "Go to mouse".into(),
             action: Some(Action::GoToMouse),
             enabled: context.navigation,
             checked: false,
+            tooltip: None,
         },
         Entry::Item {
             label: if context.paused { "Resume" } else { "Pause" }.into(),
             action: Some(Action::SetPaused(!context.paused)),
             enabled: true,
             checked: context.paused,
+            tooltip: None,
         },
     ];
     if let Some(settings) = context.settings.filter(|s| s.validate().is_ok()) {
@@ -89,6 +112,7 @@ pub fn entries(context: Context) -> Vec<Entry> {
                             action: Some(Action::Settings(patch)),
                             enabled: true,
                             checked: current == *value,
+                            tooltip: None,
                         }
                     })
                     .collect();
@@ -98,6 +122,7 @@ pub fn entries(context: Context) -> Vec<Entry> {
                         action: None,
                         enabled: false,
                         checked: true,
+                        tooltip: None,
                     });
                 }
                 Entry::Submenu {
@@ -111,6 +136,18 @@ pub fn entries(context: Context) -> Vec<Entry> {
             entries: fields,
         });
     }
+    if context.preferences {
+        entries.push(Entry::Item {
+            label: "Forget saved preferences".into(),
+            action: Some(Action::ForgetPreferences),
+            enabled: true,
+            checked: false,
+            tooltip: None,
+        });
+    }
+    if let Some(attachments) = context.attachments {
+        entries.push(attachment_entries(attachments));
+    }
     entries.extend([
         Entry::Separator,
         Entry::Item {
@@ -118,6 +155,7 @@ pub fn entries(context: Context) -> Vec<Entry> {
             action: Some(Action::CloseFamiliar),
             enabled: true,
             checked: false,
+            tooltip: None,
         },
         Entry::Separator,
         Entry::Item {
@@ -125,9 +163,129 @@ pub fn entries(context: Context) -> Vec<Entry> {
             action: Some(Action::QuitNumen),
             enabled: true,
             checked: false,
+            tooltip: None,
         },
     ]);
     entries
+}
+
+fn unsafe_menu_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn short_label(value: &str, limit: usize) -> String {
+    let clean: String = value
+        .chars()
+        .map(|c| if unsafe_menu_char(c) { ' ' } else { c })
+        .collect();
+    let clean = clean.trim();
+    let mut label: String = clean.chars().take(limit).collect();
+    if clean.chars().count() > limit {
+        label.push_str("...");
+    }
+    label
+}
+
+fn target_details(target: &FocusTarget) -> String {
+    // Escaping (rather than removing) controls keeps the exact tuple recoverable.
+    fn exact(value: &str) -> String {
+        value
+            .chars()
+            .flat_map(|c| {
+                if unsafe_menu_char(c) || matches!(c, '\\' | '"') {
+                    c.escape_default().collect::<Vec<_>>()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect()
+    }
+    format!(
+        "source=\"{}\"\ninstance=\"{}\"\nactivity=\"{}\"",
+        exact(&target.source),
+        exact(&target.instance),
+        exact(&target.activity)
+    )
+}
+
+fn attachment_entries(context: AttachmentContext) -> Entry {
+    let mut rows = Vec::new();
+    let disabled = |label: &str, tooltip| Entry::Item {
+        label: label.into(),
+        action: None,
+        enabled: false,
+        checked: false,
+        tooltip,
+    };
+    if !context.available {
+        rows.push(disabled("Chat list updating—reopen menu", None));
+    } else {
+        if let Some(current) = &context.current
+            && !context
+                .choices
+                .iter()
+                .any(|choice| &choice.target == current)
+        {
+            rows.push(disabled(
+                "Current chat unavailable",
+                Some(target_details(current)),
+            ));
+        }
+        if context.choices.is_empty() {
+            rows.push(disabled("No compatible live chats", None));
+        }
+        let choices: Vec<_> = context
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let target = &choice.target;
+                let title = choice
+                    .summary
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("Chat");
+                Entry::Item {
+                    label: format!(
+                        "{} | {}/{}/{} #{}",
+                        short_label(title, 32),
+                        short_label(&target.source, 12),
+                        short_label(&target.activity, 12),
+                        short_label(&target.instance, 12),
+                        index + 1
+                    ),
+                    action: Some(Action::Attach(index)),
+                    enabled: true,
+                    checked: context.current.as_ref() == Some(target),
+                    tooltip: Some(target_details(target)),
+                }
+            })
+            .collect();
+        if choices.len() <= 16 {
+            rows.extend(choices);
+        } else {
+            // Keep original indices in each page; tags never depend on later memo order.
+            rows.extend(
+                choices
+                    .chunks(16)
+                    .enumerate()
+                    .map(|(page, choices)| Entry::Submenu {
+                        label: format!("Chats {}-{}", page * 16 + 1, page * 16 + choices.len()),
+                        entries: choices.to_vec(),
+                    }),
+            );
+        }
+    }
+    Entry::Submenu {
+        label: if context.current.is_some() {
+            "Change chat"
+        } else {
+            "Attach to chat"
+        }
+        .into(),
+        entries: rows,
+    }
 }
 
 pub fn supported() -> bool {
@@ -398,7 +556,7 @@ mod native {
             let menu = NSMenu::initWithTitle(mtm.alloc(), ns_string!(""));
             menu.setAutoenablesItems(false);
             for entry in catalog {
-                let (label, action, enabled, checked, children) = match entry {
+                let (label, action, enabled, checked, tooltip, children) = match entry {
                     Entry::Separator => {
                         menu.addItem(&NSMenuItem::separatorItem(mtm));
                         continue;
@@ -408,8 +566,11 @@ mod native {
                         action,
                         enabled,
                         checked,
-                    } => (label, *action, *enabled, *checked, None),
-                    Entry::Submenu { label, entries } => (label, None, true, false, Some(entries)),
+                        tooltip,
+                    } => (label, *action, *enabled, *checked, tooltip.as_deref(), None),
+                    Entry::Submenu { label, entries } => {
+                        (label, None, true, false, None, Some(entries))
+                    }
                 };
                 let item = NSMenuItem::initWithTitle_action_keyEquivalent(
                     mtm.alloc(),
@@ -418,6 +579,9 @@ mod native {
                     ns_string!(""),
                 );
                 item.setEnabled(enabled);
+                if let Some(tooltip) = tooltip {
+                    item.setToolTip(Some(&NSString::from_str(tooltip)));
+                }
                 item.setState(if checked {
                     NSControlStateValueOn
                 } else {
@@ -528,7 +692,202 @@ mod tests {
             bubbles: true,
             navigation: true,
             settings,
+            preferences: false,
+            attachments: None,
         }
+    }
+
+    fn chat(index: usize) -> ChatChoice {
+        ChatChoice {
+            target: FocusTarget {
+                source: "same-source".into(),
+                instance: format!("instance-{index}"),
+                activity: "same-activity".into(),
+            },
+            incarnation: index as u64 + 1,
+            summary: Some("Duplicate title".into()),
+        }
+    }
+
+    #[test]
+    fn chat_pages_reach_all_512_choices_with_bounded_unique_rows_and_exact_details() {
+        let choices: Vec<_> = (0..512).map(chat).collect();
+        let catalog = attachment_entries(AttachmentContext {
+            current: Some(choices[511].target.clone()),
+            available: true,
+            choices: choices.clone(),
+        });
+        let Entry::Submenu {
+            label,
+            entries: pages,
+        } = catalog
+        else {
+            panic!()
+        };
+        assert_eq!(label, "Change chat");
+        assert_eq!(pages.len(), 32);
+        let mut labels = std::collections::BTreeSet::new();
+        let mut indices = Vec::new();
+        for page in pages {
+            let Entry::Submenu { entries: rows, .. } = page else {
+                panic!()
+            };
+            assert_eq!(rows.len(), 16);
+            for row in rows {
+                let Entry::Item {
+                    label,
+                    action: Some(Action::Attach(index)),
+                    enabled,
+                    checked,
+                    tooltip,
+                } = row
+                else {
+                    panic!()
+                };
+                assert!(enabled);
+                assert_eq!(checked, index == 511);
+                assert!(label.chars().count() < 100);
+                assert!(labels.insert(label));
+                assert_eq!(tooltip, Some(target_details(&choices[index].target)));
+                assert!(tooltip.unwrap().contains(&choices[index].target.instance));
+                indices.push(index);
+            }
+        }
+        assert_eq!(indices, (0..512).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn attachment_gates_empty_current_unavailable_and_current_reselect() {
+        for available in [false, true] {
+            let catalog = attachment_entries(AttachmentContext {
+                current: Some(chat(0).target),
+                available,
+                choices: Vec::new(),
+            });
+            let Entry::Submenu { entries: rows, .. } = catalog else {
+                panic!()
+            };
+            assert!(rows.iter().all(|row| matches!(
+                row,
+                Entry::Item {
+                    enabled: false,
+                    action: None,
+                    ..
+                }
+            )));
+            assert!(rows.iter().any(|row| matches!(row, Entry::Item { label, .. } if label == if available { "No compatible live chats" } else { "Chat list updating—reopen menu" })));
+        }
+        for count in [1, 16, 17] {
+            let choices: Vec<_> = (0..count).map(chat).collect();
+            let catalog = attachment_entries(AttachmentContext {
+                current: Some(choices[0].target.clone()),
+                available: true,
+                choices,
+            });
+            let Entry::Submenu { entries: rows, .. } = catalog else {
+                panic!()
+            };
+            if count <= 16 {
+                assert_eq!(rows.len(), count);
+                assert!(matches!(
+                    rows[0],
+                    Entry::Item {
+                        enabled: true,
+                        checked: true,
+                        action: Some(Action::Attach(0)),
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(rows.len(), 2);
+            }
+        }
+        let mut context = context(None);
+        context.attachments = Some(AttachmentContext {
+            current: None,
+            available: true,
+            choices: vec![chat(0)],
+        });
+        let catalog = entries(context);
+        assert!(
+            catalog.iter().any(
+                |row| matches!(row, Entry::Submenu { label, .. } if label == "Attach to chat")
+            )
+        );
+        assert!(!catalog.iter().any(|row| matches!(
+            row,
+            Entry::Item {
+                action: Some(Action::ForgetPreferences),
+                ..
+            }
+        )));
+        assert!(
+            !entries(self::context(None)).iter().any(
+                |row| matches!(row, Entry::Submenu { label, .. } if label == "Attach to chat")
+            )
+        );
+    }
+
+    #[test]
+    fn chat_labels_sanitize_controls_and_bidi_without_changing_payload() {
+        let hostile = "x\n\r\t\u{061c}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}";
+        let mut choice = chat(0);
+        choice.summary = Some(format!("{hostile}{}", "long".repeat(100)));
+        choice.target.instance = hostile.into();
+        let original = choice.clone();
+        let catalog = attachment_entries(AttachmentContext {
+            current: None,
+            available: true,
+            choices: vec![choice.clone()],
+        });
+        let Entry::Submenu { entries, .. } = catalog else {
+            panic!()
+        };
+        let Entry::Item {
+            label,
+            tooltip: Some(tooltip),
+            ..
+        } = &entries[0]
+        else {
+            panic!()
+        };
+        assert!(!label.chars().any(unsafe_menu_char));
+        assert!(label.chars().count() < 100);
+        assert!(tooltip.contains("\\u{61c}"));
+        assert!(tooltip.contains("\\n\\r\\t"));
+        assert_eq!(choice, original);
+        assert_eq!(
+            action_for_tag(&[Some(Action::Attach(511))], 1),
+            Some(Action::Attach(511))
+        );
+        assert_eq!(action_for_tag(&[Some(Action::Attach(511))], 2), None);
+    }
+
+    #[test]
+    fn forget_preferences_is_only_offered_for_writable_binding() {
+        for writable in [false, true] {
+            let mut context = context(None);
+            context.preferences = writable;
+            let catalog = entries(context);
+            let forget: Vec<_> = catalog
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        Entry::Item {
+                            action: Some(Action::ForgetPreferences),
+                            ..
+                        }
+                    )
+                })
+                .collect();
+            assert_eq!(forget.len(), usize::from(writable));
+            if writable {
+                assert!(matches!(forget[0], Entry::Item { label, enabled: true, .. }
+                    if label == "Forget saved preferences"));
+            }
+        }
+        assert!(!Action::ForgetPreferences.is_service());
     }
 
     #[test]
@@ -538,6 +897,8 @@ mod tests {
             bubbles: false,
             navigation: false,
             settings: None,
+            preferences: false,
+            attachments: None,
         });
         assert!(matches!(
             &catalog[0],
@@ -649,7 +1010,7 @@ mod tests {
                     .all(|entry| matches!(entry, Entry::Item { checked: false, .. }))
             );
             assert!(
-                matches!(&entries[4], Entry::Item { label, action: None, checked: true, enabled: false } if label == &format!("Custom ({value})"))
+                matches!(&entries[4], Entry::Item { label, action: None, checked: true, enabled: false, .. } if label == &format!("Custom ({value})"))
             );
         }
         for value in [f64::NAN, f64::INFINITY, -1.0, 99.0] {

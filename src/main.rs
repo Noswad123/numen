@@ -13,6 +13,7 @@ mod ipc;
 mod menu;
 mod motion;
 mod pointer;
+mod preferences;
 mod protocol;
 mod typography;
 mod visibility;
@@ -72,6 +73,11 @@ enum Command {
     GoToMouse(CloseOptions),
     /// Atomically update presentation settings for explicitly selected familiars.
     Settings(SettingsOptions),
+    /// Manage remembered appearance and manual placement without changing live attachments.
+    Preferences {
+        #[command(subcommand)]
+        command: PreferenceCommand,
+    },
     /// Familiar-first terminal menu for Wisp or an interactive terminal.
     Menu(menu::MenuOptions),
     /// Print a Wisp launcher action, or install it explicitly with a backup.
@@ -112,6 +118,12 @@ pub struct RunOptions {
     /// Do not register macOS system-wide Option+I or Option+M shortcuts (local controls remain).
     #[arg(long)]
     no_hotkey: bool,
+    /// Disable all saved-preference reads and writes; keep runtime settings available.
+    #[arg(long, conflicts_with = "preferences_file")]
+    no_preferences: bool,
+    /// Use an absolute preferences file instead of the XDG/HOME default (live mode only).
+    #[arg(long, value_parser = parse_preferences_path)]
+    preferences_file: Option<PathBuf>,
     /// Installed Regular font family; defaults to SauceCodePro Nerd Font when available.
     #[arg(long, conflicts_with = "font_file", value_parser = parse_font_family)]
     font_family: Option<String>,
@@ -197,9 +209,15 @@ struct CloseOptions {
     familiar: Vec<String>,
 }
 
+#[derive(Subcommand)]
+enum PreferenceCommand {
+    /// Forget saved appearance/placement for selected chats; leave current views unchanged.
+    Forget(CloseOptions),
+}
+
 #[derive(Args)]
 #[command(
-    after_help = "Supply one or more setting flags. Unspecified settings and unselected familiars stay unchanged. Values are runtime-only."
+    after_help = "Supply one or more setting flags. Unspecified settings and unselected familiars stay unchanged. With remembering enabled, edits are saved asynchronously for the attached chat."
 )]
 #[command(group(ArgGroup::new("patch").required(true).multiple(true)
     .args(["sprite_scale", "font_size", "bubble_duration"])))]
@@ -231,6 +249,14 @@ impl SettingsOptions {
         protocol::Request::parse(&serde_json::to_vec(&request)?)?;
         Ok(request)
     }
+}
+
+fn parse_preferences_path(value: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err("preferences file must be an absolute file path".into());
+    }
+    Ok(path)
 }
 
 #[derive(Args)]
@@ -662,6 +688,26 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&data)?);
             Ok(())
         }
+        Command::Preferences { command } => match command {
+            PreferenceCommand::Forget(options) => {
+                protocol::validate_ids(&options.familiar)?;
+                let request = serde_json::json!({"version":1,"type":"familiar.preferences.forget","ids":options.familiar});
+                protocol::Request::parse(&serde_json::to_vec(&request)?)?;
+                let data = ipc::control(&socket_path(cli.socket)?, request)?;
+                let forgotten: Vec<String> = serde_json::from_value(data["forgotten"].clone())
+                    .context("accepted forget omitted familiar IDs")?;
+                let expected: std::collections::BTreeSet<_> = options.familiar.iter().collect();
+                let returned: std::collections::BTreeSet<_> = forgotten.iter().collect();
+                anyhow::ensure!(
+                    forgotten.len() == options.familiar.len()
+                        && returned.len() == forgotten.len()
+                        && returned == expected,
+                    "accepted forget returned unexpected familiar IDs"
+                );
+                println!("{}", serde_json::to_string_pretty(&data)?);
+                Ok(())
+            }
+        },
         Command::FontLicense => {
             print!("{}", typography::FALLBACK_FONT_LICENSE);
             Ok(())

@@ -12,7 +12,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
@@ -25,8 +25,12 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    activity::{FamiliarPresentation, Presentation, SourceId, Store},
+    activity::{
+        AttachmentBinding, FamiliarPresentation, FocusTarget, LiveTarget, PreferenceBinding,
+        Presentation, SourceId, Store,
+    },
     diagnostics::RuntimeDiagnostics,
+    preferences::{self, Placement},
     protocol::{
         self, Activity, ActivityState, Event, FamiliarSettings, MAX_LINE, MAX_SOURCES, Request,
         SettingsPatch,
@@ -50,6 +54,8 @@ struct TargetedControls {
 }
 
 struct WorkerConfig {
+    target_memo: TargetCache,
+    preferences: Option<(preferences::Document, preferences::Writer)>,
     diagnostics: RuntimeDiagnostics,
     settings_support: bool,
     defaults: FamiliarSettings,
@@ -324,10 +330,70 @@ pub struct Server {
 #[derive(Clone)]
 pub struct FocusControl {
     sender: SyncSender<FamiliarCommand>,
+    target_memo: TargetCache,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeBinding {
+    pub service_instance: String,
+    pub attachment: AttachmentBinding,
+}
+
+#[derive(Clone, Debug)]
+pub struct FamiliarTargetSnapshot {
+    pub binding: RuntimeBinding,
+    pub targets: Arc<[LiveTarget]>,
+}
+
+#[derive(PartialEq, Eq)]
+struct TargetMemo {
+    service_instance: String,
+    bindings: Vec<(String, AttachmentBinding)>,
+    targets: Arc<[LiveTarget]>,
+}
+
+type TargetCache = Arc<Mutex<Option<Arc<TargetMemo>>>>;
+
+fn publish_target_memo(
+    store: &Store,
+    service_instance: &str,
+    cache: &TargetCache,
+    previous: &mut Option<Arc<TargetMemo>>,
+) {
+    let memo = Arc::new(TargetMemo {
+        service_instance: service_instance.into(),
+        bindings: store.list_binding_snapshot(),
+        targets: store.live_targets().into(),
+    });
+    if previous.as_ref() == Some(&memo) {
+        return;
+    }
+    let old = {
+        let mut slot = cache.lock().unwrap_or_else(|e| e.into_inner());
+        slot.replace(memo.clone())
+    };
+    drop(old);
+    *previous = Some(memo);
 }
 
 #[derive(Debug)]
 enum FamiliarCommand {
+    Attach {
+        id: String,
+        expected: RuntimeBinding,
+        target: FocusTarget,
+        incarnation: u64,
+    },
+    ForgetPreferences {
+        id: String,
+        binding: PreferenceBinding,
+    },
+    Placement {
+        id: String,
+        binding: PreferenceBinding,
+        sequence: u64,
+        placement: Placement,
+    },
     Next(String),
     Close(String),
     Settings {
@@ -339,9 +405,96 @@ enum FamiliarCommand {
 #[derive(Clone)]
 pub struct FamiliarControl {
     sender: SyncSender<FamiliarCommand>,
+    target_memo: TargetCache,
 }
 
 impl FamiliarControl {
+    pub fn target_snapshot(&self, id: &str) -> Result<FamiliarTargetSnapshot> {
+        protocol::validate_id(id)?;
+        let memo = {
+            let slot = self
+                .target_memo
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("target snapshot busy"))?;
+            slot.clone().context("target snapshot not ready")?
+        };
+        let attachment = memo
+            .bindings
+            .iter()
+            .find(|(key, _)| key == id)
+            .map(|(_, binding)| binding.clone())
+            .context("unknown familiar")?;
+        Ok(FamiliarTargetSnapshot {
+            binding: RuntimeBinding {
+                service_instance: memo.service_instance.clone(),
+                attachment,
+            },
+            targets: memo.targets.clone(),
+        })
+    }
+
+    /// Success means queue acceptance only. The worker revalidates before commit.
+    pub fn attach(
+        &self,
+        id: &str,
+        expected: &RuntimeBinding,
+        target: &FocusTarget,
+        incarnation: u64,
+    ) -> Result<()> {
+        validate_attach(id, expected, target, incarnation)?;
+        self.sender
+            .try_send(FamiliarCommand::Attach {
+                id: id.into(),
+                expected: expected.clone(),
+                target: target.clone(),
+                incarnation,
+            })
+            .context("queue familiar attach")
+    }
+
+    pub fn forget_preferences(&self, id: &str, binding: &PreferenceBinding) -> Result<()> {
+        protocol::validate_id(id)?;
+        protocol::validate_id(&binding.target.source)?;
+        protocol::validate_id(&binding.target.instance)?;
+        protocol::validate_id(&binding.target.activity)?;
+        ensure!(
+            binding.generation > 0,
+            "binding generation must be positive"
+        );
+        self.sender
+            .try_send(FamiliarCommand::ForgetPreferences {
+                id: id.into(),
+                binding: binding.clone(),
+            })
+            .context("queue forget preferences")
+    }
+
+    pub fn placement(
+        &self,
+        id: &str,
+        binding: &PreferenceBinding,
+        sequence: u64,
+        placement: Placement,
+    ) -> Result<()> {
+        protocol::validate_id(id)?;
+        protocol::validate_id(&binding.target.source)?;
+        protocol::validate_id(&binding.target.instance)?;
+        protocol::validate_id(&binding.target.activity)?;
+        ensure!(
+            binding.generation > 0 && sequence > 0,
+            "binding generation and placement sequence must be positive"
+        );
+        placement.validate()?;
+        self.sender
+            .try_send(FamiliarCommand::Placement {
+                id: id.into(),
+                binding: binding.clone(),
+                sequence,
+                placement,
+            })
+            .context("queue familiar placement")
+    }
+
     pub fn next(&self, id: &str) -> Result<()> {
         protocol::validate_id(id)?;
         self.sender
@@ -372,6 +525,27 @@ impl FamiliarControl {
     }
 }
 
+fn validate_attach(
+    id: &str,
+    expected: &RuntimeBinding,
+    target: &FocusTarget,
+    incarnation: u64,
+) -> Result<()> {
+    protocol::validate_id(id)?;
+    protocol::validate_id(&expected.service_instance)?;
+    ensure!(
+        expected.attachment.generation > 0,
+        "attachment generation must be positive"
+    );
+    ensure!(incarnation > 0, "source incarnation must be positive");
+    for target in std::iter::once(target).chain(expected.attachment.target.iter()) {
+        protocol::validate_id(&target.source)?;
+        protocol::validate_id(&target.instance)?;
+        protocol::validate_id(&target.activity)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl FocusControl {
     pub fn next(&self) -> Result<()> {
@@ -389,6 +563,7 @@ impl Server {
     pub fn familiar_control(&self) -> FamiliarControl {
         FamiliarControl {
             sender: self.focus.sender.clone(),
+            target_memo: self.focus.target_memo.clone(),
         }
     }
     #[cfg(test)]
@@ -524,6 +699,7 @@ impl Server {
     }
 
     /// Enables live per-familiar settings with immutable defaults for future opens.
+    #[cfg(test)]
     pub fn start_graphical_with_settings(
         path: &Path,
         on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
@@ -576,6 +752,63 @@ impl Server {
         bootstrap_main: bool,
         settings: Option<FamiliarSettings>,
     ) -> Result<Self> {
+        Self::start_inner_with_preferences(
+            path,
+            on_change,
+            on_reveal,
+            on_views,
+            targeted,
+            bootstrap_main,
+            settings,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_graphical_with_preferences(
+        path: &Path,
+        on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
+        on_reveal: impl Fn(Option<Vec<String>>) + Send + 'static,
+        on_go_to_mouse: Option<Box<GoToMouse>>,
+        on_quit: impl Fn() + Send + 'static,
+        bootstrap_main: bool,
+        settings: FamiliarSettings,
+        preferences_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let disabled = preferences_path.is_none();
+        let server = Self::start_inner_with_preferences(
+            path,
+            |_| {},
+            None,
+            Some(Box::new(on_views)),
+            TargetedControls {
+                reveal: Some(Box::new(on_reveal)),
+                go_to_mouse: on_go_to_mouse,
+                quit: Some(Box::new(on_quit)),
+            },
+            bootstrap_main,
+            Some(settings),
+            preferences_path,
+        )?;
+        if disabled {
+            server
+                .diagnostics
+                .set_preferences_status(preferences::Status::disabled());
+        }
+        Ok(server)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner_with_preferences(
+        path: &Path,
+        on_change: impl Fn(Presentation) + Send + 'static,
+        on_reveal: Option<Box<dyn Fn() + Send>>,
+        on_views: Option<Box<dyn Fn(Vec<FamiliarPresentation>) + Send>>,
+        targeted: TargetedControls,
+        bootstrap_main: bool,
+        settings: Option<FamiliarSettings>,
+        preferences_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let defaults = settings.unwrap_or_default();
         defaults.validate()?;
         private_parent(path, true)?;
@@ -611,7 +844,17 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let (sender, receiver) = mpsc::sync_channel(32);
+        let target_memo = TargetCache::default();
+        let worker_memo = target_memo.clone();
         let diagnostics = RuntimeDiagnostics::new(on_views.is_some());
+        let preferences = preferences_path.map(|path| {
+            let status_diagnostics = diagnostics.clone();
+            let loaded = preferences::start(path, move |status| {
+                status_diagnostics.set_preferences_status(status)
+            });
+            diagnostics.set_preferences_status(loaded.1.status());
+            loaded
+        });
         let worker_diagnostics = diagnostics.clone();
         let worker = thread::Builder::new()
             .name("numen-ipc".into())
@@ -624,6 +867,8 @@ impl Server {
                     on_reveal,
                     on_views,
                     WorkerConfig {
+                        target_memo: worker_memo,
+                        preferences,
                         diagnostics: worker_diagnostics,
                         settings_support: settings.is_some(),
                         defaults,
@@ -638,7 +883,10 @@ impl Server {
             stop,
             worker: Some(worker),
             _socket: owner,
-            focus: FocusControl { sender },
+            focus: FocusControl {
+                sender,
+                target_memo,
+            },
         })
     }
 }
@@ -779,6 +1027,7 @@ impl Client {
                             "lifecycle": multi,
                             "navigation": targeted.go_to_mouse.is_some(),
                             "settings": multi && controls.settings_support,
+                            "preferences": multi && store.preferences_writable(),
                             "familiar_count": store.familiar_count(),
                             "source_count": store.source_count(),
                             "diagnostics": controls.diagnostics.snapshot(),
@@ -845,6 +1094,9 @@ impl Client {
                                     if controls.settings_support {
                                         caps.push(json!("settings"));
                                     }
+                                    if store.preferences_writable() {
+                                        caps.push(json!("preferences"));
+                                    }
                                 }
                             }
                         }
@@ -867,6 +1119,10 @@ impl Client {
                             "settings requires live graphical settings support"
                         );
                         return Ok(Some(json!({"updated":store.settings(&ids, patch)?})));
+                    }
+                    Event::ForgetPreferences { ids } => {
+                        ensure!(multi, "no graphical familiar");
+                        return Ok(Some(json!({"forgotten":store.forget_preferences(&ids)?})));
                     }
                     Event::Targets { offset, familiar } => {
                         return Ok(Some(store.targets(offset, familiar.as_deref())?));
@@ -961,6 +1217,8 @@ fn run(
     config: WorkerConfig,
 ) {
     let WorkerConfig {
+        target_memo,
+        preferences,
         diagnostics,
         settings_support,
         defaults,
@@ -976,13 +1234,31 @@ fn run(
         service_instance,
     };
     let mut store = Store::with_settings(bootstrap_main, defaults);
+    let writer = preferences.map(|(document, writer)| {
+        store.enable_preferences(document, writer.can_write());
+        writer
+    });
+    let mut submitted_revision = 0;
     let mut previous = Presentation::default();
     on_change(previous.clone());
     let mut previous_views = store.presentations(Instant::now());
+    let mut previous_memo = None;
+    publish_target_memo(
+        &store,
+        &controls.service_instance,
+        &target_memo,
+        &mut previous_memo,
+    );
     if let Some(callback) = &on_views {
         callback(previous_views.clone());
     }
     let mut changed = |store: &mut Store, now| {
+        publish_target_memo(
+            store,
+            &controls.service_instance,
+            &target_memo,
+            &mut previous_memo,
+        );
         let view = store.presentation(now);
         if view != previous {
             previous = view.clone();
@@ -1000,6 +1276,9 @@ fn run(
     let mut quit_requested = false;
     while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
+        if let Some(writer) = &writer {
+            store.set_preferences_writable(writer.can_write());
+        }
         let expired = store.expire(now);
         let mut quit_ready = false;
         clients.retain(|c| {
@@ -1011,25 +1290,7 @@ fn run(
             let Ok(command) = focus.try_recv() else {
                 break;
             };
-            let result = match command {
-                FamiliarCommand::Next(id) => store.cycle_for(&id),
-                FamiliarCommand::Close(id) => {
-                    if on_views.is_some() {
-                        store.close(&[id]).map(|_| ())
-                    } else {
-                        Err(anyhow::anyhow!("no graphical familiar"))
-                    }
-                }
-                FamiliarCommand::Settings { id, patch } => {
-                    if controls.multi && controls.settings_support {
-                        store.settings(&[id], patch).map(|_| ())
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "settings requires live graphical settings support"
-                        ))
-                    }
-                }
-            };
+            let result = apply_familiar_command(&mut store, command, &controls);
             if let Err(error) = result {
                 eprintln!("numen familiar control: {error}");
             }
@@ -1082,7 +1343,139 @@ fn run(
                 quit();
             }
         }
+        if let Some(writer) = &writer {
+            if store.preference_revision() != submitted_revision
+                && let Some((revision, document)) = store.preference_document()
+                && writer.submit(document, revision)
+            {
+                submitted_revision = revision;
+            }
+            if store.preference_revision() == submitted_revision
+                && store.preference_capacity_pending()
+            {
+                writer.note_capacity();
+                if writer.status().reason == Some(preferences::Reason::CapacityReached) {
+                    store.take_preference_capacity();
+                }
+            }
+        }
         thread::park_timeout(TICK);
+    }
+    // The GUI queue is bounded at 32; drain only the commands accepted before stop.
+    for _ in 0..32 {
+        let Ok(command) = focus.try_recv() else {
+            break;
+        };
+        let _ = apply_familiar_command(&mut store, command, &controls);
+    }
+    if let Some(writer) = writer {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let capacity = store.take_preference_capacity();
+        let final_document = store
+            .preference_document()
+            .filter(|(revision, _)| *revision != submitted_revision);
+        let (finished, completion) = mpsc::sync_channel(1);
+        // Writer drop has its own bounded cleanup. Keep that separate from the
+        // root worker's single shutdown budget, including a blocked filesystem.
+        let _ = thread::Builder::new()
+            .name("numen-preferences-stop".into())
+            .spawn(move || {
+                let mut published = final_document.is_none();
+                if let Some((revision, document)) = final_document {
+                    while Instant::now() < deadline {
+                        if writer.submit(document.clone(), revision) {
+                            published = true;
+                            break;
+                        }
+                        if !writer.can_write() {
+                            break;
+                        }
+                        thread::yield_now();
+                    }
+                }
+                if capacity && published {
+                    writer.note_capacity();
+                }
+                writer.flush(deadline.saturating_duration_since(Instant::now()));
+                drop(writer);
+                let _ = finished.try_send(());
+            });
+        let _ = completion.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+}
+
+fn apply_familiar_command(
+    store: &mut Store,
+    command: FamiliarCommand,
+    controls: &ControlContext,
+) -> Result<()> {
+    match command {
+        FamiliarCommand::Attach {
+            id,
+            expected,
+            target,
+            incarnation,
+        } => {
+            ensure!(controls.multi, "no graphical familiar");
+            validate_attach(&id, &expected, &target, incarnation)?;
+            ensure!(
+                expected.service_instance == controls.service_instance,
+                "service instance changed"
+            );
+            ensure!(
+                store.attachment_binding(&id)? == expected.attachment,
+                "stale attachment binding"
+            );
+            let live = store
+                .live_targets()
+                .into_iter()
+                .find(|row| FocusTarget::from(&row.selection) == target)
+                .context("target no longer live")?;
+            ensure!(
+                live.incarnation == incarnation,
+                "source incarnation changed"
+            );
+            ensure!(
+                live.claimed_by.as_deref().is_none_or(|owner| owner == id),
+                "target already claimed"
+            );
+            store
+                .attach(&[protocol::AttachRequest {
+                    id,
+                    target: protocol::TargetRequest {
+                        source: target.source,
+                        instance: Some(target.instance),
+                        activity: target.activity,
+                    },
+                }])
+                .map(|_| ())
+        }
+        FamiliarCommand::Next(id) => store.cycle_for(&id),
+        FamiliarCommand::Close(id) => {
+            ensure!(controls.multi, "no graphical familiar");
+            store.close(&[id]).map(|_| ())
+        }
+        FamiliarCommand::Settings { id, patch } => {
+            ensure!(
+                controls.multi && controls.settings_support,
+                "settings requires live graphical settings support"
+            );
+            store.settings(&[id], patch).map(|_| ())
+        }
+        FamiliarCommand::ForgetPreferences { id, binding } => {
+            ensure!(controls.multi, "no graphical familiar");
+            store.require_preference_binding(&id, &binding)?;
+            store.forget_preferences(&[id]).map(|_| ())
+        }
+        FamiliarCommand::Placement {
+            id,
+            binding,
+            sequence,
+            placement,
+        } => {
+            ensure!(controls.multi, "no graphical familiar");
+            store.placement(&id, &binding, sequence, placement)
+        }
     }
 }
 
@@ -1234,6 +1627,7 @@ pub fn control(path: &Path, request: serde_json::Value) -> Result<serde_json::Va
                 | Event::Close { .. }
                 | Event::GoToMouse { .. }
                 | Event::Settings { .. }
+                | Event::ForgetPreferences { .. }
         ),
         "expected companion control request"
     );
@@ -1359,6 +1753,1004 @@ mod tests {
         (dir, path)
     }
 
+    fn picker_store() -> (Store, ControlContext) {
+        let mut store = Store::default();
+        store
+            .register(
+                ("test".into(), "one".into()),
+                ["a", "b", "c"]
+                    .into_iter()
+                    .map(|name| Activity {
+                        activity: name.into(),
+                        sequence: 1,
+                        state: ActivityState::Working,
+                        attention: false,
+                        reason: None,
+                        summary: None,
+                    })
+                    .collect(),
+                Instant::now(),
+            )
+            .unwrap();
+        (
+            store,
+            ControlContext {
+                diagnostics: RuntimeDiagnostics::new(true),
+                settings_support: true,
+                targeted: TargetedControls::default(),
+                multi: true,
+                service_instance: "test-service".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn picker_cache_is_immutable_complete_shared_and_nonblocking() {
+        let mut store = Store::default();
+        let now = Instant::now();
+        for source in 0..16 {
+            store
+                .register(
+                    (format!("source-{source:02}"), "one".into()),
+                    (0..32)
+                        .map(|activity| Activity {
+                            activity: format!("task-{activity:02}"),
+                            sequence: 1,
+                            state: ActivityState::Working,
+                            attention: false,
+                            reason: None,
+                            summary: None,
+                        })
+                        .collect(),
+                    now,
+                )
+                .unwrap();
+        }
+        let opened = store
+            .open(
+                &(1..16)
+                    .map(|index| protocol::OpenRequest {
+                        id: Some(format!("picker-{index:02}")),
+                        preset: "djinn".into(),
+                        target: protocol::TargetRequest {
+                            source: "source-00".into(),
+                            instance: Some("one".into()),
+                            activity: format!("task-{index:02}"),
+                        },
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let cache = TargetCache::default();
+        let (sender, _receiver) = mpsc::sync_channel(32);
+        let focus = FocusControl {
+            sender,
+            target_memo: cache.clone(),
+        };
+        let gui = FamiliarControl {
+            sender: focus.sender.clone(),
+            target_memo: focus.target_memo.clone(),
+        };
+        assert!(gui.target_snapshot("main").is_err());
+        let mut previous = None;
+        publish_target_memo(&store, "service", &cache, &mut previous);
+        let first = gui.target_snapshot("main").unwrap();
+        assert_eq!(first.targets.len(), 512);
+        assert_eq!(previous.as_ref().unwrap().bindings.len(), 16);
+        for id in std::iter::once("main").chain(opened.iter().map(String::as_str)) {
+            let snapshot = gui.target_snapshot(id).unwrap();
+            assert_eq!(
+                snapshot.binding.attachment,
+                store.attachment_binding(id).unwrap()
+            );
+            assert!(Arc::ptr_eq(&snapshot.targets, &first.targets));
+        }
+        assert_eq!(first.targets[0].claimed_by.as_deref(), Some("main"));
+        assert_eq!(first.targets[511].selection.activity, "task-31");
+        let cloned = gui.clone().target_snapshot("main").unwrap();
+        assert!(Arc::ptr_eq(&first.targets, &cloned.targets));
+        let held = cache.lock().unwrap();
+        let started = Instant::now();
+        assert!(gui.target_snapshot("main").is_err());
+        assert!(started.elapsed() < Duration::from_millis(50));
+        drop(held);
+        assert!(gui.target_snapshot("bad/id").is_err());
+        assert!(gui.target_snapshot("missing").is_err());
+        let views = store.presentations(now);
+        store
+            .apply(
+                &("source-15".into(), "one".into()),
+                Event::State {
+                    activity: Activity {
+                        activity: "task-31".into(),
+                        sequence: 2,
+                        state: ActivityState::Failed,
+                        attention: false,
+                        reason: Some("changed".into()),
+                        summary: Some("new".into()),
+                    },
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(store.presentations(now), views);
+        publish_target_memo(&store, "service", &cache, &mut previous);
+        let latest = gui.target_snapshot("main").unwrap();
+        assert_eq!(latest.targets.len(), 512);
+        assert_eq!(latest.targets[511].selection.state, ActivityState::Failed);
+        assert_eq!(
+            latest.targets[511].selection.summary.as_deref(),
+            Some("new")
+        );
+        assert!(first.targets[511].selection.summary.is_none());
+        assert_eq!(latest.binding, first.binding);
+        assert_eq!(
+            store.expire(now + crate::activity::SOURCE_TIMEOUT).len(),
+            16
+        );
+        publish_target_memo(&store, "service", &cache, &mut previous);
+        assert!(gui.target_snapshot("main").unwrap().targets.is_empty());
+        assert_eq!(gui.target_snapshot("main").unwrap().binding, first.binding);
+        assert_eq!(previous.as_ref().unwrap().bindings.len(), 16);
+        for id in opened {
+            let snapshot = gui.target_snapshot(&id).unwrap();
+            assert!(snapshot.targets.is_empty());
+            assert_eq!(
+                snapshot.binding.attachment,
+                store.attachment_binding(&id).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn picker_attach_queue_validates_every_binding_and_preserves_queued_close() {
+        let (store, controls) = picker_store();
+        let binding = RuntimeBinding {
+            service_instance: controls.service_instance,
+            attachment: store.attachment_binding("main").unwrap(),
+        };
+        let target = binding.attachment.target.clone().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let gui = FamiliarControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
+        assert!(gui.attach("bad/id", &binding, &target, 1).is_err());
+        assert!(gui.attach("main", &binding, &target, 0).is_err());
+        let mut invalid = binding.clone();
+        invalid.attachment.generation = 0;
+        assert!(gui.attach("main", &invalid, &target, 1).is_err());
+        invalid = binding.clone();
+        invalid.service_instance = "bad/id".into();
+        assert!(gui.attach("main", &invalid, &target, 1).is_err());
+        invalid = binding.clone();
+        invalid.attachment.target.as_mut().unwrap().instance = "bad/id".into();
+        assert!(gui.attach("main", &invalid, &target, 1).is_err());
+        let mut bad_target = target.clone();
+        bad_target.activity = "bad/id".into();
+        assert!(gui.attach("main", &binding, &bad_target, 1).is_err());
+        assert!(receiver.try_recv().is_err());
+        gui.close("main").unwrap();
+        for _ in 0..31 {
+            gui.attach("main", &binding, &target, 1).unwrap();
+        }
+        assert!(gui.attach("main", &binding, &target, 1).is_err());
+        assert!(matches!(receiver.try_recv().unwrap(), FamiliarCommand::Close(id) if id == "main"));
+        for _ in 0..31 {
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                FamiliarCommand::Attach { .. }
+            ));
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn picker_attach_revalidates_stale_choices_without_mutation() {
+        for scenario in [
+            "reconnect",
+            "aba",
+            "removed",
+            "disconnected",
+            "claimed",
+            "closed",
+            "headless",
+            "service",
+            "binding",
+            "binding-target",
+            "binding-unbound",
+            "expired",
+        ] {
+            let (mut store, mut controls) = picker_store();
+            store.enable_preferences(preferences::Document::default(), true);
+            let expected = RuntimeBinding {
+                service_instance: controls.service_instance.clone(),
+                attachment: store.attachment_binding("main").unwrap(),
+            };
+            let chosen = store.live_targets()[1].clone();
+            let target = FocusTarget::from(&chosen.selection);
+            let mut command_expected = expected.clone();
+            match scenario {
+                "reconnect" => {
+                    store.disconnect(&("test".into(), "one".into()));
+                    store
+                        .register(
+                            ("test".into(), "one".into()),
+                            vec![Activity {
+                                activity: "b".into(),
+                                sequence: 1,
+                                state: ActivityState::Working,
+                                attention: false,
+                                reason: None,
+                                summary: None,
+                            }],
+                            Instant::now(),
+                        )
+                        .unwrap();
+                }
+                "aba" => {
+                    store.focus("test", Some("one"), "c").unwrap();
+                    store.focus("test", Some("one"), "a").unwrap();
+                }
+                "removed" => {
+                    store
+                        .apply(
+                            &("test".into(), "one".into()),
+                            Event::Remove {
+                                activity: "b".into(),
+                                sequence: 2,
+                            },
+                            Instant::now(),
+                        )
+                        .unwrap();
+                }
+                "disconnected" => store.disconnect(&("test".into(), "one".into())),
+                "claimed" => {
+                    store
+                        .open(&[protocol::OpenRequest {
+                            id: Some("other".into()),
+                            preset: "djinn".into(),
+                            target: protocol::TargetRequest {
+                                source: "test".into(),
+                                instance: Some("one".into()),
+                                activity: "b".into(),
+                            },
+                        }])
+                        .unwrap();
+                }
+                "closed" => {
+                    store.close(&["main".into()]).unwrap();
+                }
+                "headless" => controls.multi = false,
+                "service" => command_expected.service_instance = "previous-service".into(),
+                "binding" => command_expected.attachment.generation += 1,
+                "binding-target" => command_expected.attachment.target = Some(target.clone()),
+                "binding-unbound" => command_expected.attachment.target = None,
+                "expired" => {
+                    store.expire(Instant::now() + crate::activity::SOURCE_TIMEOUT);
+                }
+                _ => unreachable!(),
+            }
+            let now = Instant::now();
+            let before = store.presentations(now);
+            let rows = store.live_targets();
+            let preferences = store.preference_document().unwrap().1.encode().unwrap();
+            assert!(
+                apply_familiar_command(
+                    &mut store,
+                    FamiliarCommand::Attach {
+                        id: "main".into(),
+                        expected: command_expected,
+                        target,
+                        incarnation: chosen.incarnation,
+                    },
+                    &controls
+                )
+                .is_err(),
+                "{scenario}"
+            );
+            assert_eq!(store.presentations(now), before, "{scenario}");
+            assert_eq!(store.live_targets(), rows, "{scenario}");
+            assert_eq!(
+                store.preference_document().unwrap().1.encode().unwrap(),
+                preferences,
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn picker_attach_changes_only_exact_attachment_and_never_refreshes_source_ttl() {
+        let (mut store, controls) = picker_store();
+        let now = Instant::now();
+        let destination_style = FamiliarSettings {
+            font_size: 30.0,
+            ..Default::default()
+        };
+        store.enable_preferences(
+            preferences::Document {
+                version: 1,
+                records: vec![preferences::Record {
+                    source: "test".into(),
+                    activity: "b".into(),
+                    settings: destination_style,
+                    placement: Some(Placement { x: 900.0, y: 800.0 }),
+                }],
+            },
+            true,
+        );
+        store
+            .settings(
+                &["main".into()],
+                SettingsPatch {
+                    font_size: Some(18.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = store.presentations(now).remove(0);
+        let preference = before.preference.as_ref().unwrap();
+        let placement = Placement { x: 200.0, y: 100.0 };
+        store
+            .placement("main", &preference.binding, 1, placement)
+            .unwrap();
+        let document = store.preference_document().unwrap();
+        let expected = RuntimeBinding {
+            service_instance: controls.service_instance.clone(),
+            attachment: before.runtime_binding,
+        };
+        let chosen = store.live_targets()[1].clone();
+        store
+            .apply(
+                &("test".into(), "one".into()),
+                Event::State {
+                    activity: Activity {
+                        activity: "b".into(),
+                        sequence: 2,
+                        state: ActivityState::Waiting,
+                        attention: true,
+                        reason: Some("question".into()),
+                        summary: Some("updated metadata".into()),
+                    },
+                },
+                now,
+            )
+            .unwrap();
+        // Metadata changes do not revoke the selected registration incarnation.
+        apply_familiar_command(
+            &mut store,
+            FamiliarCommand::Attach {
+                id: "main".into(),
+                expected: expected.clone(),
+                target: FocusTarget::from(&chosen.selection),
+                incarnation: chosen.incarnation,
+            },
+            &controls,
+        )
+        .unwrap();
+        let after = store.presentations(now).remove(0);
+        assert_eq!(
+            after.runtime_binding.generation,
+            expected.attachment.generation + 1
+        );
+        assert_eq!(after.runtime_binding.target.as_ref().unwrap().activity, "b");
+        assert_eq!(after.settings, before.settings);
+        assert_eq!(after.preference.unwrap().placement, Some(placement));
+        assert_eq!(store.preference_document().unwrap().0, document.0);
+        assert_eq!(
+            store.preference_document().unwrap().1.encode().unwrap(),
+            document.1.encode().unwrap()
+        );
+        assert_eq!(store.expire(now + crate::activity::SOURCE_TIMEOUT).len(), 1);
+    }
+
+    #[test]
+    fn picker_attach_accepts_self_and_forget_does_not_revoke() {
+        let (mut store, controls) = picker_store();
+        store.enable_preferences(preferences::Document::default(), true);
+        let expected = RuntimeBinding {
+            service_instance: controls.service_instance.clone(),
+            attachment: store.attachment_binding("main").unwrap(),
+        };
+        store.forget_preferences(&["main".into()]).unwrap();
+        let row = store.live_targets().remove(0);
+        let deadline = Instant::now() + crate::activity::SOURCE_TIMEOUT;
+        apply_familiar_command(
+            &mut store,
+            FamiliarCommand::Attach {
+                id: "main".into(),
+                expected: expected.clone(),
+                target: FocusTarget::from(&row.selection),
+                incarnation: row.incarnation,
+            },
+            &controls,
+        )
+        .unwrap();
+        assert_eq!(
+            store.attachment_binding("main").unwrap(),
+            expected.attachment
+        );
+        assert_eq!(store.expire(deadline).len(), 1);
+    }
+
+    #[test]
+    fn picker_queued_unbound_binding_is_revoked_by_normal_bootstrap() {
+        let (_, controls) = picker_store();
+        let mut store = Store::default();
+        let cache = TargetCache::default();
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let gui = FamiliarControl {
+            sender,
+            target_memo: cache.clone(),
+        };
+        publish_target_memo(&store, &controls.service_instance, &cache, &mut None);
+        let snapshot = gui.target_snapshot("main").unwrap();
+        assert_eq!(
+            snapshot.binding.attachment,
+            AttachmentBinding {
+                target: None,
+                generation: 1
+            }
+        );
+        assert!(snapshot.targets.is_empty());
+        let target = FocusTarget {
+            source: "test".into(),
+            instance: "one".into(),
+            activity: "b".into(),
+        };
+        gui.attach("main", &snapshot.binding, &target, 1).unwrap();
+        let now = Instant::now();
+        store
+            .register(
+                ("test".into(), "one".into()),
+                ["a", "b"]
+                    .into_iter()
+                    .map(|activity| Activity {
+                        activity: activity.into(),
+                        sequence: 1,
+                        state: ActivityState::Working,
+                        attention: false,
+                        reason: None,
+                        summary: None,
+                    })
+                    .collect(),
+                now,
+            )
+            .unwrap();
+        let before = store.presentations(now);
+        assert_eq!(before[0].runtime_binding.generation, 2);
+        assert_eq!(
+            before[0].runtime_binding.target.as_ref().unwrap().activity,
+            "a"
+        );
+        assert!(before[0].preference.is_none());
+        let rows = store.live_targets();
+        assert_eq!(rows[1].incarnation, 1);
+        assert!(rows[1].claimed_by.is_none());
+        // Registering the first live source binds main before this queued intent commits.
+        assert!(
+            apply_familiar_command(&mut store, receiver.try_recv().unwrap(), &controls).is_err()
+        );
+        assert_eq!(store.presentations(now), before);
+        assert_eq!(store.live_targets(), rows);
+        assert!(store.preference_document().is_none());
+        publish_target_memo(&store, &controls.service_instance, &cache, &mut None);
+        assert_eq!(
+            gui.target_snapshot("main").unwrap().binding.attachment,
+            before[0].runtime_binding
+        );
+        assert_eq!(store.expire(now + crate::activity::SOURCE_TIMEOUT).len(), 1);
+    }
+
+    #[test]
+    fn picker_initial_memo_is_published_before_callback_and_target_only_updates_are_visible() {
+        let (_dir, path) = fixture();
+        let (control_tx, control_rx) = mpsc::sync_channel::<FamiliarControl>(1);
+        let (result_tx, result_rx) = mpsc::channel();
+        let callback_control = std::cell::OnceCell::new();
+        let server = Server::start_with_familiars(
+            &path,
+            move |views| {
+                let gui =
+                    callback_control.get_or_init(|| control_rx.recv_timeout(IO_TIMEOUT).unwrap());
+                let snapshot = gui.target_snapshot("main").unwrap();
+                result_tx.send((views, snapshot)).unwrap();
+            },
+            |_| {},
+        )
+        .unwrap();
+        let gui = server.familiar_control();
+        control_tx.send(gui.clone()).unwrap();
+        let (initial, snapshot) = result_rx.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(initial[0].runtime_binding, snapshot.binding.attachment);
+        assert!(snapshot.binding.attachment.target.is_none());
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        producer
+            .update("a", 1, ActivityState::Working, false, None)
+            .unwrap();
+        let (bound, first) = result_rx.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(bound[0].runtime_binding, first.binding.attachment);
+        producer
+            .update("b", 1, ActivityState::Working, false, None)
+            .unwrap();
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let latest = loop {
+            if let Ok(snapshot) = gui.target_snapshot("main")
+                && snapshot.targets.len() == 2
+            {
+                break snapshot;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert_eq!(latest.targets.len(), 2);
+        assert_eq!(latest.binding, first.binding);
+        assert!(result_rx.try_recv().is_err());
+        let chosen = &latest.targets[1];
+        gui.attach(
+            "main",
+            &latest.binding,
+            &FocusTarget::from(&chosen.selection),
+            chosen.incarnation,
+        )
+        .unwrap();
+        let (attached, snapshot) = result_rx.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(attached[0].runtime_binding, snapshot.binding.attachment);
+        assert_eq!(
+            snapshot.binding.attachment.generation,
+            first.binding.attachment.generation + 1
+        );
+        assert_eq!(snapshot.targets[1].claimed_by.as_deref(), Some("main"));
+        assert!(snapshot.targets[0].claimed_by.is_none());
+        assert!(attached[0].preference.is_none());
+        drop(server);
+    }
+
+    #[test]
+    fn preferences_gui_queue_validates_bindings_and_remains_bounded() {
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let control = FamiliarControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
+        let binding = PreferenceBinding {
+            target: crate::activity::FocusTarget {
+                source: "source".into(),
+                instance: "one".into(),
+                activity: "task".into(),
+            },
+            generation: 1,
+        };
+        let placement = Placement { x: 0.0, y: 100.0 };
+        assert!(control.placement("main", &binding, 0, placement).is_err());
+        assert!(
+            control
+                .placement(
+                    "main",
+                    &binding,
+                    1,
+                    Placement {
+                        x: f64::NAN,
+                        y: 0.0
+                    }
+                )
+                .is_err()
+        );
+        let mut invalid = binding.clone();
+        invalid.target.instance = "bad/id".into();
+        assert!(control.placement("main", &invalid, 1, placement).is_err());
+        invalid = binding.clone();
+        invalid.generation = 0;
+        assert!(control.placement("main", &invalid, 1, placement).is_err());
+        assert!(receiver.try_recv().is_err());
+        for sequence in 1..=31 {
+            control
+                .placement("main", &binding, sequence, placement)
+                .unwrap();
+        }
+        control.forget_preferences("main", &binding).unwrap();
+        assert!(control.forget_preferences("main", &binding).is_err());
+        assert!(control.placement("main", &binding, 32, placement).is_err());
+        drop(receiver);
+        assert!(control.forget_preferences("main", &binding).is_err());
+    }
+
+    #[test]
+    fn queued_gui_forget_cannot_delete_a_new_attachment_and_late_pending_drag_is_revoked() {
+        let now = Instant::now();
+        let mut store = Store::with_settings(true, FamiliarSettings::default());
+        store.enable_preferences(
+            preferences::Document {
+                version: 1,
+                records: ["a", "b"]
+                    .into_iter()
+                    .map(|activity| preferences::Record {
+                        source: "test".into(),
+                        activity: activity.into(),
+                        settings: FamiliarSettings {
+                            font_size: 24.0,
+                            ..Default::default()
+                        },
+                        placement: None,
+                    })
+                    .collect(),
+            },
+            true,
+        );
+        store
+            .register(
+                ("test".into(), "one".into()),
+                ["a", "b"]
+                    .into_iter()
+                    .map(|activity| Activity {
+                        activity: activity.into(),
+                        sequence: 1,
+                        state: ActivityState::Working,
+                        attention: false,
+                        reason: None,
+                        summary: None,
+                    })
+                    .collect(),
+                now,
+            )
+            .unwrap();
+        let controls = ControlContext {
+            diagnostics: RuntimeDiagnostics::new(true),
+            settings_support: true,
+            targeted: TargetedControls::default(),
+            multi: true,
+            service_instance: "test-service".into(),
+        };
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let gui = FamiliarControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
+        let captured_a = store.presentations(now)[0]
+            .preference
+            .as_ref()
+            .unwrap()
+            .binding
+            .clone();
+        gui.forget_preferences("main", &captured_a).unwrap();
+        store.focus_for("main", "test", Some("one"), "b").unwrap();
+        let before = store.preference_document().unwrap().1.encode().unwrap();
+        let views = store.presentations(now);
+        assert!(
+            apply_familiar_command(&mut store, receiver.try_recv().unwrap(), &controls).is_err()
+        );
+        assert_eq!(
+            store.preference_document().unwrap().1.encode().unwrap(),
+            before
+        );
+        assert_eq!(store.presentations(now), views);
+
+        let captured_b = views[0].preference.as_ref().unwrap().binding.clone();
+        for _ in 0..32 {
+            gui.next("main").unwrap();
+        }
+        let pending = Placement { x: 300.0, y: 400.0 };
+        assert!(gui.placement("main", &captured_b, 1, pending).is_err());
+        // The GUI retained this intent locally while its queue was full.
+        for _ in 0..32 {
+            receiver.try_recv().unwrap();
+        }
+        gui.forget_preferences("main", &captured_b).unwrap();
+        apply_familiar_command(&mut store, receiver.try_recv().unwrap(), &controls).unwrap();
+        let forgotten = store.presentations(now);
+        assert!(
+            forgotten[0].preference.as_ref().unwrap().binding.generation > captured_b.generation
+        );
+        gui.placement("main", &captured_b, 1, pending).unwrap();
+        assert!(
+            apply_familiar_command(&mut store, receiver.try_recv().unwrap(), &controls).is_err()
+        );
+        assert_eq!(store.presentations(now), forgotten);
+        let document = store.preference_document().unwrap().1;
+        assert_eq!(document.records.len(), 1);
+        assert_eq!(document.records[0].activity, "a");
+    }
+
+    #[test]
+    fn mixed_capacity_batch_persists_existing_key_and_reports_blocked_after_save() {
+        let (dir, path) = fixture();
+        let preference_path = dir.path().join("preferences.json");
+        let document = preferences::Document {
+            version: 1,
+            records: (0..128)
+                .map(|n| preferences::Record {
+                    source: if n == 0 {
+                        "test".into()
+                    } else {
+                        format!("source-{n}")
+                    },
+                    activity: "a".into(),
+                    settings: FamiliarSettings::default(),
+                    placement: None,
+                })
+                .collect(),
+        };
+        fs::write(&preference_path, document.encode().unwrap()).unwrap();
+        fs::set_permissions(&preference_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let server = Server::start_graphical_with_preferences(
+            &path,
+            |_| {},
+            |_| {},
+            None,
+            || {},
+            false,
+            FamiliarSettings::default(),
+            Some(preference_path.clone()),
+        )
+        .unwrap();
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        for activity in ["a", "b"] {
+            producer
+                .update(activity, 1, ActivityState::Working, false, None)
+                .unwrap();
+        }
+        let opened = control(&path, json!({"version":1,"type":"familiar.open","items":[{"source":"test","activity":"a"},{"source":"test","activity":"b"}]})).unwrap();
+        let ids = &opened["opened"];
+        control(
+            &path,
+            json!({"version":1,"type":"familiar.settings","ids":ids,"patch":{"font_size":24}}),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+            let status: preferences::Status =
+                serde_json::from_value(info["diagnostics"]["preferences"].clone()).unwrap();
+            assert!(status.valid());
+            if status.durable_revision == 1
+                && status.write == preferences::WriteState::Blocked
+                && status.reason == Some(preferences::Reason::CapacityReached)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capacity status lost after mixed batch: {status:?}"
+            );
+            thread::sleep(TICK);
+        }
+        let saved = preferences::Document::decode(&fs::read(&preference_path).unwrap()).unwrap();
+        assert_eq!(saved.records.len(), 128);
+        assert_eq!(
+            saved
+                .records
+                .iter()
+                .find(|r| r.source == "test")
+                .unwrap()
+                .settings
+                .font_size,
+            24.0
+        );
+        assert!(
+            !saved
+                .records
+                .iter()
+                .any(|r| r.source == "test" && r.activity == "b")
+        );
+        for record in saved.records.iter().filter(|r| r.source != "test") {
+            assert_eq!(record.settings, FamiliarSettings::default());
+        }
+        let rows = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+        assert!(
+            rows["familiars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["settings"]["font_size"] == 24.0)
+        );
+        control(
+            &path,
+            json!({"version":1,"type":"familiar.settings","ids":[ids[0]],"patch":{"font_size":26}}),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = server.diagnostics().snapshot().preferences.unwrap();
+            if status.durable_revision == 2
+                && status.write == preferences::WriteState::Clean
+                && status.reason.is_none()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "valid edit did not clear capacity status: {status:?}"
+            );
+            thread::sleep(TICK);
+        }
+    }
+
+    #[test]
+    fn preferences_loaded_before_open_gui_and_wire_edits_share_book_and_stop_drains() {
+        let (dir, path) = fixture();
+        let preference_path = dir.path().join("preferences.json");
+        let defaults = FamiliarSettings::default();
+        let saved = FamiliarSettings {
+            font_size: 20.0,
+            ..defaults
+        };
+        let placement = Placement {
+            x: -100.0,
+            y: 200.0,
+        };
+        let document = preferences::Document {
+            version: 1,
+            records: vec![preferences::Record {
+                source: "test".into(),
+                activity: "a".into(),
+                settings: saved,
+                placement: Some(placement),
+            }],
+        };
+        fs::write(&preference_path, document.encode().unwrap()).unwrap();
+        fs::set_permissions(&preference_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (tx, views) = mpsc::channel();
+        let server = Server::start_graphical_with_preferences(
+            &path,
+            move |v| {
+                let _ = tx.send(v);
+            },
+            |_| {},
+            None,
+            || {},
+            false,
+            defaults,
+            Some(preference_path.clone()),
+        )
+        .unwrap();
+        assert!(views.recv_timeout(IO_TIMEOUT).unwrap().is_empty());
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        producer
+            .update("a", 1, ActivityState::Working, false, None)
+            .unwrap();
+        assert!(views.try_recv().is_err());
+        let opened = control(
+            &path,
+            json!({"version":1,"type":"familiar.open","items":[{"source":"test","activity":"a"}]}),
+        )
+        .unwrap();
+        let id = opened["opened"][0].as_str().unwrap();
+        let view = views.recv_timeout(IO_TIMEOUT).unwrap().remove(0);
+        assert_eq!(view.settings, saved);
+        let preference = view.preference.unwrap();
+        assert_eq!(preference.placement, Some(placement));
+        assert!(preference.writable);
+        let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+        assert!(
+            list["familiars"][0]["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("preferences"))
+        );
+        server
+            .familiar_control()
+            .settings(
+                id,
+                SettingsPatch {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            views.recv_timeout(IO_TIMEOUT).unwrap()[0]
+                .settings
+                .font_size,
+            24.0
+        );
+        control(
+            &path,
+            json!({"version":1,"type":"familiar.settings","ids":[id],"patch":{"sprite_scale":1.0}}),
+        )
+        .unwrap();
+        let view = views.recv_timeout(IO_TIMEOUT).unwrap().remove(0);
+        assert_eq!(view.settings.font_size, 24.0);
+        assert_eq!(view.settings.sprite_scale, 1.0);
+        // This accepted GUI command must be drained even if stop beats the next tick.
+        server
+            .familiar_control()
+            .placement(id, &preference.binding, 1, Placement { x: 500.0, y: 600.0 })
+            .unwrap();
+        drop(server);
+        let document = preferences::Document::decode(&fs::read(&preference_path).unwrap()).unwrap();
+        assert_eq!(document.records.len(), 1);
+        assert_eq!(document.records[0].settings, view.settings);
+        assert_eq!(
+            document.records[0].placement,
+            Some(Placement { x: 500.0, y: 600.0 })
+        );
+    }
+
+    #[test]
+    fn legacy_settings_constructor_never_enables_preferences() {
+        let (_dir, path) = fixture();
+        let server = Server::start_graphical_with_settings(
+            &path,
+            |_| {},
+            |_| {},
+            None,
+            || {},
+            true,
+            FamiliarSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            server.diagnostics().snapshot().preferences,
+            Some(preferences::Status::disabled())
+        );
+        assert!(
+            control(
+                &path,
+                json!({"version":1,"type":"familiar.preferences.forget","ids":["main"]})
+            )
+            .is_err()
+        );
+        let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+        let caps = list["familiars"][0]["capabilities"].as_array().unwrap();
+        assert!(caps.contains(&json!("settings")));
+        assert!(!caps.contains(&json!("preferences")));
+    }
+
+    #[test]
+    fn wire_forget_keeps_live_snapshot_and_heartbeat_does_not_resave() {
+        let (dir, path) = fixture();
+        let preference_path = dir.path().join("preferences.json");
+        let (tx, views) = mpsc::channel();
+        let server = Server::start_graphical_with_preferences(
+            &path,
+            move |v| {
+                let _ = tx.send(v);
+            },
+            |_| {},
+            None,
+            || {},
+            false,
+            FamiliarSettings::default(),
+            Some(preference_path.clone()),
+        )
+        .unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        producer
+            .update("a", 1, ActivityState::Working, false, None)
+            .unwrap();
+        control(
+            &path,
+            json!({"version":1,"type":"familiar.open","items":[{"source":"test","activity":"a"}]}),
+        )
+        .unwrap();
+        let opened = views.recv_timeout(IO_TIMEOUT).unwrap().remove(0);
+        control(&path, json!({"version":1,"type":"familiar.settings","ids":[opened.id],"patch":{"font_size":24}})).unwrap();
+        let live = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(
+            control(
+                &path,
+                json!({"version":1,"type":"familiar.preferences.forget","ids":[opened.id]})
+            )
+            .unwrap(),
+            json!({"forgotten":[opened.id]})
+        );
+        producer.heartbeat().unwrap();
+        let forgotten = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(forgotten[0].settings, live[0].settings);
+        assert_eq!(forgotten[0].presentation, live[0].presentation);
+        assert!(
+            forgotten[0].preference.as_ref().unwrap().binding.generation
+                > live[0].preference.as_ref().unwrap().binding.generation
+        );
+        assert!(views.try_recv().is_err());
+        let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+        assert_eq!(list["familiars"][0]["settings"], json!(live[0].settings));
+        drop(server);
+        let document = preferences::Document::decode(&fs::read(preference_path).unwrap()).unwrap();
+        assert!(document.records.is_empty());
+    }
+
     #[test]
     fn invalid_startup_settings_do_not_create_a_listener() {
         let (_dir, path) = fixture();
@@ -1383,7 +2775,10 @@ mod tests {
     #[test]
     fn settings_gui_queue_validates_before_enqueue_and_preserves_close() {
         let (sender, receiver) = mpsc::sync_channel(32);
-        let handle = FamiliarControl { sender };
+        let handle = FamiliarControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
         let patch = SettingsPatch {
             font_size: Some(24.0),
             ..Default::default()
@@ -1972,7 +3367,7 @@ mod tests {
             protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
             assert_eq!(
                 info,
-                json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"familiar_count":usize::from(bootstrap_main),"source_count":0,"diagnostics":_server.diagnostics().snapshot()})
+                json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"preferences":false,"familiar_count":usize::from(bootstrap_main),"source_count":0,"diagnostics":_server.diagnostics().snapshot()})
             );
             let mut peer = Publisher {
                 stream: connect_private(&path).unwrap(),
@@ -2284,7 +3679,7 @@ mod tests {
             let request = json!({"version":1,"type":"companion.service"});
             let info = control(&path, request.clone()).unwrap();
             protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
-            let mut expected = json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":mode >= 2,"lifecycle":mode >= 2,"navigation":mode == 3,"settings":false,"familiar_count":1,"source_count":0,"diagnostics":_server.diagnostics().snapshot()});
+            let mut expected = json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":mode >= 2,"lifecycle":mode >= 2,"navigation":mode == 3,"settings":false,"preferences":false,"familiar_count":1,"source_count":0,"diagnostics":_server.diagnostics().snapshot()});
             assert_eq!(info, expected);
             let mut peer = Publisher {
                 stream: connect_private(&path).unwrap(),
@@ -2385,9 +3780,23 @@ mod tests {
         snapshot.build.profile = "p".repeat(256);
         snapshot.hotkeys.option_i = crate::diagnostics::ShortcutStatus {
             state: crate::diagnostics::ShortcutState::Unavailable,
+            reason: Some(crate::diagnostics::ShortcutReason::RegistrationFailed),
+        };
+        snapshot.hotkeys.option_m = crate::diagnostics::ShortcutStatus {
+            state: crate::diagnostics::ShortcutState::Unavailable,
             reason: Some(crate::diagnostics::ShortcutReason::PointerInitializationFailed),
         };
-        snapshot.hotkeys.option_m = snapshot.hotkeys.option_i;
+        let mut preferences = preferences::Status::disabled();
+        preferences.mode = preferences::Mode::Writable;
+        preferences.load = preferences::LoadState::Loaded;
+        preferences.write = preferences::WriteState::Clean;
+        preferences.reason = None;
+        preferences.accepted_revision = u64::MAX;
+        preferences.durable_revision = u64::MAX;
+        preferences.records = preferences::MAX_RECORDS;
+        preferences.path = Some(format!("/{}", "\"".repeat(1023)));
+        assert!(preferences.valid());
+        snapshot.preferences = Some(preferences);
         info["diagnostics"] = json!(snapshot);
         info["service_instance"] = json!("s".repeat(96));
         info["familiar_count"] = json!(protocol::MAX_FAMILIARS);
@@ -2454,7 +3863,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&response).unwrap(),
-            json!({"version":1,"ok":true,"data":{"api_version":1,"service_instance":"test-service","pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"familiar_count":1,"source_count":1,"diagnostics":RuntimeDiagnostics::new(true).snapshot()}})
+            json!({"version":1,"ok":true,"data":{"api_version":1,"service_instance":"test-service","pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"preferences":false,"familiar_count":1,"source_count":1,"diagnostics":RuntimeDiagnostics::new(true).snapshot()}})
         );
         assert_eq!(client.source, Some(id.clone()));
         assert_eq!(store.presentations(now), before);
@@ -2707,7 +4116,10 @@ mod tests {
     #[test]
     fn focus_queue_is_bounded_and_nonblocking() {
         let (sender, _receiver) = mpsc::sync_channel(1);
-        let focus = FocusControl { sender };
+        let focus = FocusControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
         focus.next().unwrap();
         assert!(focus.clone().next().is_err());
     }
@@ -2715,7 +4127,10 @@ mod tests {
     #[test]
     fn familiar_queue_is_bounded_and_validates_ids() {
         let (sender, _receiver) = mpsc::sync_channel(32);
-        let handle = FamiliarControl { sender };
+        let handle = FamiliarControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
         assert!(handle.next("bad/id").is_err());
         for _ in 0..32 {
             handle.next("main").unwrap();
@@ -2743,6 +4158,11 @@ mod tests {
         assert_eq!(
             initial,
             vec![FamiliarPresentation {
+                runtime_binding: AttachmentBinding {
+                    target: None,
+                    generation: 1
+                },
+                preference: None,
                 settings: FamiliarSettings::default(),
                 id: "main".into(),
                 preset: "djinn".into(),

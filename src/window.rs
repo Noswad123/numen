@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -18,21 +18,23 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::RunOptions;
-use crate::activity::{FamiliarPresentation, Presentation};
+use crate::activity::{AttachmentBinding, FamiliarPresentation, FocusTarget, Presentation};
+use crate::activity::{PreferenceBinding, PreferencePresentation};
 use crate::animation::{Animation, Player};
 use crate::assets::{DEFAULT_CHARACTER_ID, DEFAULT_CHARACTER_NAME, SpriteAtlas};
 use crate::bubble;
-use crate::context_menu::{self, Action};
+use crate::context_menu::{self, Action, AttachmentContext, ChatChoice};
 use crate::diagnostics::{RuntimeDiagnostics, ShortcutReason, ShortcutState, ShortcutStatus};
 use crate::display::{LiveDisplay, Mailbox};
 use crate::hotkey::{GlobalHotkey, Shortcut};
-use crate::ipc::{FamiliarControl, Server};
+use crate::ipc::{FamiliarControl, FamiliarTargetSnapshot, RuntimeBinding, Server};
 #[cfg(test)]
 use crate::motion::{FRAME_INTERVAL, SpriteMask};
 use crate::motion::{
     Facing, MotionClock, NativeMotion, Navigator, Point, PursuitStep, RasterMask, SpriteGeometry,
 };
 use crate::pointer::{self, PointerReader};
+use crate::preferences::{self, Placement};
 use crate::protocol::FamiliarSettings;
 use crate::typography::Typeface;
 use crate::visibility::BubbleVisibility;
@@ -151,6 +153,96 @@ struct MenuRequest {
     window_id: WindowId,
     window: Arc<Window>,
     position: PhysicalPosition<f64>,
+}
+
+struct MenuAttachment {
+    binding: RuntimeBinding,
+    choices: Vec<ChatChoice>,
+}
+
+fn attachment_context(
+    id: &str,
+    applied: &AttachmentBinding,
+    snapshot: Option<FamiliarTargetSnapshot>,
+) -> (AttachmentContext, Option<MenuAttachment>) {
+    let Some(snapshot) = snapshot.filter(|s| &s.binding.attachment == applied) else {
+        return (
+            AttachmentContext {
+                current: applied.target.clone(),
+                available: false,
+                choices: Vec::new(),
+            },
+            None,
+        );
+    };
+    let choices: Vec<_> = snapshot
+        .targets
+        .iter()
+        .filter(|target| target.claimed_by.as_deref().is_none_or(|owner| owner == id))
+        .map(|target| ChatChoice {
+            target: FocusTarget::from(&target.selection),
+            incarnation: target.incarnation,
+            summary: target.selection.summary.clone(),
+        })
+        .collect();
+    (
+        AttachmentContext {
+            current: applied.target.clone(),
+            available: true,
+            choices: choices.clone(),
+        },
+        Some(MenuAttachment {
+            binding: snapshot.binding,
+            choices,
+        }),
+    )
+}
+
+impl MenuAttachment {
+    fn queue(
+        &self,
+        id: &str,
+        index: usize,
+        applied: &AttachmentBinding,
+        fresh: Option<&FamiliarTargetSnapshot>,
+        submit: impl FnOnce(&RuntimeBinding, &ChatChoice) -> Result<()>,
+    ) -> Result<()> {
+        let choice = self
+            .choice(index, applied)
+            .context("chat attachment changed")?;
+        anyhow::ensure!(
+            fresh.is_none_or(|fresh| self.still_eligible(id, choice, fresh)),
+            "selected chat is no longer available"
+        );
+        submit(&self.binding, choice)
+    }
+
+    fn choice(&self, index: usize, applied: &AttachmentBinding) -> Option<&ChatChoice> {
+        (&self.binding.attachment == applied)
+            .then(|| self.choices.get(index))
+            .flatten()
+    }
+
+    fn still_eligible(
+        &self,
+        id: &str,
+        choice: &ChatChoice,
+        fresh: &FamiliarTargetSnapshot,
+    ) -> bool {
+        fresh.binding == self.binding
+            && fresh.targets.iter().any(|target| {
+                target.incarnation == choice.incarnation
+                    && FocusTarget::from(&target.selection) == choice.target
+                    && target.claimed_by.as_deref().is_none_or(|owner| owner == id)
+            })
+    }
+}
+
+fn unbound_attachment() -> AttachmentBinding {
+    AttachmentBinding {
+        target: None,
+        generation: 1,
+    }
 }
 
 fn familiar_settings(options: &RunOptions) -> FamiliarSettings {
@@ -321,6 +413,25 @@ fn reveal_targets(
     }
 }
 
+fn resolve_preferences_path(
+    options: &RunOptions,
+    resolve: impl FnOnce() -> Result<PathBuf>,
+) -> (Option<PathBuf>, Option<preferences::Reason>) {
+    if options.no_preferences {
+        (None, None)
+    } else if let Some(path) = &options.preferences_file {
+        (Some(path.clone()), None)
+    } else {
+        match resolve() {
+            Ok(path) => (Some(path), None),
+            Err(error) => {
+                warn!(%error, "Preferences path unavailable");
+                (None, Some(preferences::error_reason(&error)))
+            }
+        }
+    }
+}
+
 pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Result<()> {
     let socket = socket.filter(|_| !options.manual && !options.demo);
     let mut builder = EventLoop::<AppEvent>::with_user_event();
@@ -371,7 +482,14 @@ pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Re
             } else {
                 None
             };
-            let server = Server::start_graphical_with_settings(
+            let (preferences_path, preferences_reason) =
+                resolve_preferences_path(&app.options, || {
+                    preferences::default_path(
+                        std::env::var_os("XDG_CONFIG_HOME"),
+                        std::env::var_os("HOME"),
+                    )
+                });
+            let server = Server::start_graphical_with_preferences(
                 path,
                 on_views,
                 on_reveal,
@@ -384,7 +502,13 @@ pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Re
                 },
                 !app.options.empty,
                 familiar_settings(&app.options),
+                preferences_path,
             )?;
+            if let Some(reason) = preferences_reason {
+                server
+                    .diagnostics()
+                    .set_preferences_status(preferences::Status::unavailable(reason));
+            }
             info!(socket = %path.display(), "Local activity listener ready");
             Ok::<_, anyhow::Error>(server)
         })
@@ -486,9 +610,288 @@ struct FamiliarView {
     menu_open: bool,
     settings: FamiliarSettings,
     deferred_settings: Option<FamiliarSettings>,
+    preference: Option<PreferencePresentation>,
+    runtime_binding: AttachmentBinding,
+    drag_binding: Option<PreferenceBinding>,
+    placement_sequence: u64,
+    pending_placement: Option<PendingPlacement>,
+    placement_retry: Option<Instant>,
+    pending_restore: Option<PendingRestore>,
+    ever_bound: bool,
+    bootstrap_unbound: bool,
+    first_binding_restore: bool,
+}
+
+#[derive(Clone)]
+struct PendingPlacement {
+    binding: PreferenceBinding,
+    sequence: u64,
+    placement: Placement,
+}
+
+struct PendingRestore {
+    placement: Placement,
+    attempts: u8,
+    feedback: Option<((u32, u32), u64)>,
+    deadline: Instant,
+    poll_at: Instant,
+}
+
+impl PendingRestore {
+    fn finished(&self, now: Instant) -> bool {
+        now >= self.deadline || self.attempts >= 5
+    }
+
+    fn correction(
+        &mut self,
+        now: Instant,
+        geometry: ((u32, u32), u64),
+        origin: Option<Point>,
+    ) -> Option<Point> {
+        if self.finished(now) || now < self.poll_at {
+            return None;
+        }
+        self.poll_at = now + Duration::from_millis(20);
+        let origin = origin?;
+        if self.feedback == Some(geometry) {
+            return None;
+        }
+        self.feedback = Some(geometry);
+        self.attempts += 1;
+        Some(origin)
+    }
 }
 
 impl FamiliarView {
+    fn validated_forget_binding<'a>(
+        &self,
+        captured: Option<&'a PreferenceBinding>,
+    ) -> Option<&'a PreferenceBinding> {
+        captured.filter(|binding| {
+            self.preference
+                .as_ref()
+                .is_some_and(|p| p.writable && &p.binding == *binding)
+        })
+    }
+
+    fn begin_initial_placement(&mut self) -> bool {
+        self.first_binding_restore = false;
+        let now = Instant::now();
+        self.pending_restore = self
+            .preference
+            .as_ref()
+            .and_then(|p| p.placement)
+            .filter(|p| valid_placement(*p))
+            .map(|placement| PendingRestore {
+                placement,
+                attempts: 0,
+                feedback: None,
+                deadline: now + Duration::from_secs(1),
+                poll_at: now,
+            });
+        self.pending_restore.is_some()
+    }
+
+    fn clear_placement_intent(&mut self) {
+        self.drag_binding = None;
+        self.pending_placement = None;
+        self.placement_retry = None;
+        self.pending_restore = None;
+        self.first_binding_restore = false;
+    }
+
+    fn cancel_restore_for_user_intent(&mut self) {
+        self.pending_restore = None;
+        self.first_binding_restore = false;
+        self.bootstrap_unbound = false;
+    }
+
+    fn set_preference(&mut self, preference: Option<PreferencePresentation>) {
+        let first_binding = !self.ever_bound && preference.is_some();
+        if self.preference.as_ref().map(|p| &p.binding) != preference.as_ref().map(|p| &p.binding) {
+            self.clear_placement_intent();
+        }
+        if !preference.as_ref().is_some_and(|p| p.writable) {
+            self.drag_binding = None;
+            self.pending_placement = None;
+            self.placement_retry = None;
+        }
+        self.preference = preference;
+        if first_binding {
+            self.ever_bound = true;
+            self.first_binding_restore = self.bootstrap_unbound
+                && self
+                    .preference
+                    .as_ref()
+                    .is_some_and(|p| p.placement.is_some());
+            self.bootstrap_unbound = false;
+        }
+    }
+
+    fn capture_placement(&mut self, now: Instant) {
+        let window = self.window.clone();
+        let show = self.bubble_visible;
+        let scale = self.options.sprite_scale;
+        self.capture_placement_with(now, || {
+            let window = window?;
+            let backing = window.scale_factor();
+            if !backing.is_finite() || backing <= 0.0 {
+                return None;
+            }
+            let origin = window.outer_position().ok()?.to_logical::<f64>(backing);
+            let size = window.inner_size();
+            placement_from_geometry(
+                Point {
+                    x: origin.x,
+                    y: origin.y,
+                },
+                (size.width, size.height),
+                backing,
+                show,
+                scale,
+            )
+        });
+    }
+
+    fn capture_placement_with(
+        &mut self,
+        now: Instant,
+        geometry: impl FnOnce() -> Option<Placement>,
+    ) {
+        if !self.gesture.held || !self.gesture.native_drag_active {
+            return;
+        }
+        let Some(binding) = self.drag_binding.take() else {
+            return;
+        };
+        if !self
+            .preference
+            .as_ref()
+            .is_some_and(|p| p.writable && p.binding == binding)
+        {
+            return;
+        }
+        let Some(placement) = geometry().filter(|p| valid_placement(*p)) else {
+            return;
+        };
+        let Some(sequence) = self.placement_sequence.checked_add(1) else {
+            return;
+        };
+        self.placement_sequence = sequence;
+        self.pending_placement = Some(PendingPlacement {
+            binding,
+            sequence,
+            placement,
+        });
+        self.placement_retry = Some(now);
+    }
+
+    fn retry_placement(&mut self, now: Instant) -> Option<Instant> {
+        self.pending_placement.as_ref()?;
+        let control = self.focus_control.clone();
+        let id = self.id.clone();
+        self.retry_placement_with(now, |pending| {
+            if let Some(control) = control {
+                control.placement(&id, &pending.binding, pending.sequence, pending.placement)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn retry_placement_with(
+        &mut self,
+        now: Instant,
+        submit: impl FnOnce(&PendingPlacement) -> Result<()>,
+    ) -> Option<Instant> {
+        if self.close_requested || self.error.is_some() {
+            self.clear_placement_intent();
+            return None;
+        }
+        let pending = self.pending_placement.as_ref()?;
+        if !self
+            .preference
+            .as_ref()
+            .is_some_and(|p| p.writable && p.binding == pending.binding)
+        {
+            self.pending_placement = None;
+            self.placement_retry = None;
+            return None;
+        }
+        let retry = self.placement_retry.unwrap_or(now);
+        if now < retry {
+            return Some(retry);
+        }
+        // Queue acceptance is not a durability acknowledgement. Never resample
+        // geometry here: navigation or layout may have moved the live window.
+        if submit(pending).is_err() {
+            let retry = now + Duration::from_millis(100);
+            self.placement_retry = Some(retry);
+            return Some(retry);
+        }
+        self.pending_placement = None;
+        self.placement_retry = None;
+        None
+    }
+
+    fn restore_placement(&mut self, now: Instant) {
+        let Some(mut restore) = self.pending_restore.take() else {
+            return;
+        };
+        if self.geometry_held()
+            || self.navigation.is_some()
+            || self.close_requested
+            || self.error.is_some()
+            || restore.finished(now)
+        {
+            return;
+        }
+        if now < restore.poll_at {
+            self.pending_restore = Some(restore);
+            return;
+        }
+        let Some(window) = &self.window else { return };
+        let size = window.inner_size();
+        let backing = window.scale_factor();
+        let geometry = ((size.width, size.height), backing.to_bits());
+        let monitors: Vec<_> = window
+            .available_monitors()
+            .filter_map(|monitor| {
+                logical_monitor(monitor.position(), monitor.size(), monitor.scale_factor())
+            })
+            .collect();
+        let origin = restored_origin(
+            restore.placement,
+            geometry.0,
+            backing,
+            self.bubble_visible,
+            self.options.sprite_scale,
+            &monitors,
+        );
+        if let Some(origin) = restore.correction(now, geometry, origin) {
+            // Only initial creation and bounded native size/DPI feedback use this.
+            // Position changes never focus, activate, or become a saved user drag.
+            window.set_outer_position(LogicalPosition::new(origin.x, origin.y));
+            self.hidden_position = if self.bubble_visible {
+                let hidden_size = layout_size(
+                    false,
+                    self.options.sprite_scale,
+                    self.options.scale * backing,
+                );
+                Some(resized_position(
+                    LogicalPosition::new(origin.x, origin.y).to_physical::<i32>(backing),
+                    (geometry.0, true, self.options.sprite_scale),
+                    (hidden_size, false, self.options.sprite_scale),
+                ))
+            } else {
+                None
+            };
+        }
+        if !restore.finished(now) {
+            self.pending_restore = Some(restore);
+        }
+    }
+
     fn new(id: String, atlas: Arc<SpriteAtlas>, options: RunOptions) -> Self {
         let now = Instant::now();
         let settings = familiar_settings(&options);
@@ -545,6 +948,16 @@ impl FamiliarView {
             menu_open: false,
             settings,
             deferred_settings: None,
+            preference: None,
+            runtime_binding: unbound_attachment(),
+            drag_binding: None,
+            placement_sequence: 0,
+            pending_placement: None,
+            placement_retry: None,
+            pending_restore: None,
+            ever_bound: false,
+            bootstrap_unbound: false,
+            first_binding_restore: false,
         }
     }
 
@@ -670,6 +1083,8 @@ impl FamiliarView {
     }
 
     fn fail(&mut self, _event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        self.cancel_restore_for_user_intent();
+        self.clear_placement_intent();
         self.gesture.clear();
         self.drag_start = None;
         self.menu_open = false;
@@ -678,6 +1093,8 @@ impl FamiliarView {
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop) {
+        self.cancel_restore_for_user_intent();
+        self.clear_placement_intent();
         info!(familiar = %self.id, "Close familiar requested");
         self.gesture.clear();
         self.drag_start = None;
@@ -787,7 +1204,8 @@ impl FamiliarView {
         }
     }
 
-    fn menu_request(&self, position: PhysicalPosition<f64>) -> Option<MenuRequest> {
+    fn menu_request(&mut self, position: PhysicalPosition<f64>) -> Option<MenuRequest> {
+        self.cancel_restore_for_user_intent();
         let window = self.window.clone()?;
         Some(MenuRequest {
             familiar: self.id.clone(),
@@ -798,6 +1216,7 @@ impl FamiliarView {
     }
 
     fn end_interaction(&mut self, now: Instant) {
+        self.drag_binding = None;
         self.gesture.finish();
         self.drag_start = None;
         self.last_tick = now;
@@ -805,6 +1224,7 @@ impl FamiliarView {
     }
 
     fn release_click(&mut self, now: Instant) -> Option<PhysicalPosition<f64>> {
+        self.capture_placement(now);
         let position = self.gesture.release();
         // Preserve the captured local coordinate across the root's snapshot drain.
         self.menu_open = position.is_some();
@@ -833,12 +1253,16 @@ impl FamiliarView {
     }
 
     fn poll_interaction(&mut self, now: Instant, button_down: bool) {
+        if self.gesture.held && !button_down && self.gesture.native_drag_active {
+            self.capture_placement(now);
+        }
         if self.gesture.poll_release(button_down) {
             self.end_interaction(now);
         }
     }
 
     fn commit_drag(&mut self) {
+        self.cancel_restore_for_user_intent();
         self.gesture.native_drag_active = true;
         self.cancel_navigation("native drag");
         self.hidden_position = None;
@@ -869,6 +1293,7 @@ impl FamiliarView {
         if self.close_requested || self.error.is_some() {
             return;
         }
+        self.cancel_restore_for_user_intent();
         let base = self.display.resume();
         self.select(base);
         self.navigation = Some(Navigation::Seeking(Navigator::new(
@@ -1306,9 +1731,15 @@ impl FamiliarView {
             } => {
                 match button {
                     MouseButton::Left => {
+                        self.cancel_restore_for_user_intent();
                         if context_menu::supported() {
                             if let Some(window) = &self.window {
                                 self.gesture.press(window.scale_factor());
+                                self.drag_binding = self
+                                    .preference
+                                    .as_ref()
+                                    .filter(|preference| preference.writable)
+                                    .map(|preference| preference.binding.clone());
                                 self.drag_start = match context_menu::capture_drag(window) {
                                     Ok(drag_start) => Some(drag_start),
                                     Err(error) => {
@@ -1333,6 +1764,7 @@ impl FamiliarView {
                         }
                     }
                     MouseButton::Right => {
+                        self.cancel_restore_for_user_intent();
                         if context_menu::supported() {
                             if self.gesture.held {
                                 return None;
@@ -1435,6 +1867,12 @@ impl FamiliarView {
             // AppKit can finish dragging without delivering a winit release.
             self.poll_interaction(now, context_menu::left_button_down());
         }
+        self.restore_placement(now);
+        let mut preference_wake = self.retry_placement(now);
+        if let Some(restore) = &self.pending_restore {
+            let deadline = restore.poll_at.min(restore.deadline);
+            preference_wake = Some(preference_wake.map_or(deadline, |wake| wake.min(deadline)));
+        }
         if self.geometry_held() {
             self.last_tick = now;
             self.resume_navigation(now);
@@ -1447,7 +1885,7 @@ impl FamiliarView {
         }
         let elapsed = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
-        let mut wake_at: Option<Instant> = None;
+        let mut wake_at: Option<Instant> = preference_wake;
         if let Some(deadline) = self.visibility.deadline() {
             wake_at = Some(wake_at.map_or(deadline, |wake| wake.min(deadline)));
         }
@@ -1619,10 +2057,12 @@ impl App {
                 view.navigation_available = self.pointer.is_some();
                 self.views.insert(id.clone(), view);
             }
-            if let Some(view) = self.views.get_mut(&id)
-                && let Err(error) = view.apply_settings(familiar.settings)
-            {
-                view.error = Some(error);
+            if let Some(view) = self.views.get_mut(&id) {
+                view.runtime_binding = familiar.runtime_binding;
+                view.set_preference(familiar.preference);
+                if let Err(error) = view.apply_settings(familiar.settings) {
+                    view.error = Some(error);
+                }
             }
             updates.push((id, familiar.presentation));
         }
@@ -1648,29 +2088,39 @@ impl App {
                     continue;
                 }
                 let created = view.window.is_none();
-                if view.window.is_none() {
-                    if let Err(error) =
+                if view.window.is_none()
+                    && let Err(error) =
                         view.initialize(event_loop, self.typeface.as_ref().map(Typeface::fork))
-                    {
-                        view.error = Some(error);
-                        continue;
-                    }
-                    if let (Some(position), Some(window)) = (cascade, &view.window) {
-                        let position = if let Some(monitor) = window.current_monitor() {
-                            let size = window.inner_size();
-                            clamp_to_monitor(
-                                position,
-                                monitor.position(),
-                                monitor.size().into(),
-                                (f64::from(size.width), f64::from(size.height)),
-                            )
-                        } else {
-                            position
-                        };
-                        window.set_outer_position(position);
-                    }
+                {
+                    view.error = Some(error);
+                    continue;
+                }
+                if created && id == "main" && !view.ever_bound {
+                    view.bootstrap_unbound = true;
+                }
+                let restore =
+                    (created || view.first_binding_restore) && view.begin_initial_placement();
+                if created
+                    && !restore
+                    && let (Some(position), Some(window)) = (cascade, &view.window)
+                {
+                    let position = if let Some(monitor) = window.current_monitor() {
+                        let size = window.inner_size();
+                        clamp_to_monitor(
+                            position,
+                            monitor.position(),
+                            monitor.size().into(),
+                            (f64::from(size.width), f64::from(size.height)),
+                        )
+                    } else {
+                        position
+                    };
+                    window.set_outer_position(position);
                 }
                 view.update(event_loop, presentation);
+                if restore {
+                    view.restore_placement(Instant::now());
+                }
                 if created {
                     cascade = view
                         .window
@@ -1776,6 +2226,28 @@ impl App {
         if let Some(snapshot) = self.mailbox.take() {
             self.reconcile(event_loop, snapshot);
         }
+        let menu_binding = self
+            .menu_target(&request.familiar, request.window_id)
+            .and_then(|view| view.preference.as_ref().filter(|p| p.writable))
+            .map(|p| p.binding.clone());
+        let (attachments, menu_attachment) = match (
+            self.control.as_ref(),
+            self.menu_target(&request.familiar, request.window_id),
+        ) {
+            (Some(control), Some(view)) => {
+                let snapshot = match control.target_snapshot(&request.familiar) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        warn!(%error, "Chat list unavailable; reopen menu to retry");
+                        None
+                    }
+                };
+                let (context, frozen) =
+                    attachment_context(&request.familiar, &view.runtime_binding, snapshot);
+                (Some(context), frozen)
+            }
+            _ => (None, None),
+        };
         let context = self
             .menu_target(&request.familiar, request.window_id)
             .map(|view| context_menu::Context {
@@ -1783,6 +2255,8 @@ impl App {
                 bubbles: !view.options.no_bubble,
                 navigation: view.navigation_available && self.pointer.is_some(),
                 settings: self.control.as_ref().map(|_| view.settings),
+                preferences: menu_binding.is_some(),
+                attachments,
             });
         let result = if let Some(context) =
             context.filter(|_| !event_loop.exiting() && !self.quit_pending.load(Ordering::Acquire))
@@ -1841,7 +2315,14 @@ impl App {
         match result {
             Ok(Some(action)) => {
                 info!(familiar = %request.familiar, ?action, "Familiar menu action selected");
-                self.dispatch_menu(event_loop, &request.familiar, request.window_id, action)
+                self.dispatch_menu(
+                    event_loop,
+                    &request.familiar,
+                    request.window_id,
+                    action,
+                    menu_binding.as_ref(),
+                    menu_attachment.as_ref(),
+                )
             }
             Ok(None) => {}
             Err(error) => warn!(%error, "Could not show familiar menu"),
@@ -1854,6 +2335,8 @@ impl App {
         id: &str,
         window_id: WindowId,
         action: Action,
+        menu_binding: Option<&PreferenceBinding>,
+        menu_attachment: Option<&MenuAttachment>,
     ) {
         let Some(action) =
             validated_menu_action(Some(action), self.menu_target(id, window_id).is_some())
@@ -1876,11 +2359,42 @@ impl App {
                 view.start_navigation(Instant::now())
             }
             Action::SetPaused(paused) => view.set_paused(paused),
+            Action::Attach(index) => {
+                let Some(frozen) = menu_attachment else {
+                    return;
+                };
+                let Some(control) = &self.control else { return };
+                // Only the canonical store's committed snapshot changes this view.
+                let fresh = control.target_snapshot(id).ok();
+                if let Err(error) = frozen.queue(
+                    id,
+                    index,
+                    &view.runtime_binding,
+                    fresh.as_ref(),
+                    |binding, choice| {
+                        control.attach(id, binding, &choice.target, choice.incarnation)
+                    },
+                ) {
+                    warn!(%id, %error, "Could not queue chat attachment; reopen menu to retry");
+                }
+            }
             Action::Settings(patch) => {
                 if let Some(control) = &self.control
                     && let Err(error) = control.settings(id, patch)
                 {
                     warn!(%id, %error, "Could not queue familiar settings");
+                }
+            }
+            Action::ForgetPreferences => {
+                let Some(binding) = view.validated_forget_binding(menu_binding) else {
+                    return;
+                };
+                view.pending_placement = None;
+                view.placement_retry = None;
+                if let Some(control) = &self.control
+                    && let Err(error) = control.forget_preferences(id, binding)
+                {
+                    warn!(%id, %error, "Could not queue forgetting familiar preferences");
                 }
             }
             Action::CloseFamiliar => view.close(event_loop),
@@ -1925,6 +2439,8 @@ impl ApplicationHandler<AppEvent> for App {
                     preset: DEFAULT_CHARACTER_ID.into(),
                     settings: familiar_settings(&self.options),
                     presentation: Presentation::default(),
+                    preference: None,
+                    runtime_binding: unbound_attachment(),
                 }],
             );
         }
@@ -2036,6 +2552,141 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 // Desktop coordinates stay in Quartz/winit logical points, including negatives.
+fn foot_offset(inner: (u32, u32), backing: f64, show: bool, scale: f32) -> Option<Point> {
+    if inner.0 == 0
+        || inner.1 == 0
+        || !backing.is_finite()
+        || backing <= 0.0
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
+        return None;
+    }
+    let (x0, _, x1, y1) = bubble::SpriteProjection::new(inner, show, scale).bounds;
+    let foot = Point {
+        x: ((x0 + x1) as f64 / 2.0).round() / backing,
+        y: y1 as f64 / backing,
+    };
+    (foot.x.is_finite() && foot.y.is_finite()).then_some(foot)
+}
+
+fn placement_from_geometry(
+    origin: Point,
+    inner: (u32, u32),
+    backing: f64,
+    show: bool,
+    scale: f32,
+) -> Option<Placement> {
+    let foot = foot_offset(inner, backing, show, scale)?;
+    let placement = Placement {
+        x: origin.x + foot.x,
+        y: origin.y + foot.y,
+    };
+    valid_placement(placement).then_some(placement)
+}
+
+fn valid_placement(placement: Placement) -> bool {
+    placement.x.is_finite()
+        && placement.y.is_finite()
+        && placement.x.abs() <= 1_000_000.0
+        && placement.y.abs() <= 1_000_000.0
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicalMonitor {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn logical_monitor(
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    backing: f64,
+) -> Option<LogicalMonitor> {
+    if !backing.is_finite() || backing <= 0.0 || size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let position = position.to_logical::<f64>(backing);
+    let size = size.to_logical::<f64>(backing);
+    let rect = LogicalMonitor {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+    [
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        rect.x + rect.width,
+        rect.y + rect.height,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+    .then_some(rect)
+}
+
+fn restored_origin(
+    placement: Placement,
+    inner: (u32, u32),
+    backing: f64,
+    show: bool,
+    scale: f32,
+    monitors: &[LogicalMonitor],
+) -> Option<Point> {
+    if !valid_placement(placement) {
+        return None;
+    }
+    let foot = foot_offset(inner, backing, show, scale)?;
+    let distance = |rect: &LogicalMonitor| {
+        let dx = placement.x - placement.x.clamp(rect.x, rect.x + rect.width);
+        let dy = placement.y - placement.y.clamp(rect.y, rect.y + rect.height);
+        dx.hypot(dy)
+    };
+    let monitor = monitors
+        .iter()
+        .filter(|rect| {
+            rect.width > 0.0
+                && rect.height > 0.0
+                && [
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    rect.x + rect.width,
+                    rect.y + rect.height,
+                ]
+                .iter()
+                .all(|v| v.is_finite())
+        })
+        .min_by(|a, b| {
+            distance(a)
+                .total_cmp(&distance(b))
+                .then(a.x.total_cmp(&b.x))
+                .then(a.y.total_cmp(&b.y))
+                .then(a.width.total_cmp(&b.width))
+                .then(a.height.total_cmp(&b.height))
+        })?;
+    let width = inner.0 as f64 / backing;
+    let height = inner.1 as f64 / backing;
+    if !width.is_finite() || !height.is_finite() {
+        return None;
+    }
+    Some(Point {
+        x: (placement.x - foot.x).clamp(
+            monitor.x,
+            (monitor.x + monitor.width - width).max(monitor.x),
+        ),
+        y: (placement.y - foot.y).clamp(
+            monitor.y,
+            (monitor.y + monitor.height - height).max(monitor.y),
+        ),
+    })
+}
+
 fn sprite_geometry(
     origin: Point,
     inner: (u32, u32),
@@ -2190,6 +2841,567 @@ fn clamp_to_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_resolution_is_lazy_and_preserves_unavailable_reason() {
+        let mut options = options();
+        options.no_preferences = true;
+        options.preferences_file = Some(PathBuf::from("/unused/preferences.json"));
+        assert_eq!(
+            resolve_preferences_path(&options, || panic!("disabled resolver")),
+            (None, None)
+        );
+        options.no_preferences = false;
+        assert_eq!(
+            resolve_preferences_path(&options, || panic!("override resolver")),
+            (options.preferences_file.clone(), None)
+        );
+        options.preferences_file = None;
+        for (config, home, reason) in [
+            (None, None, preferences::Reason::NoHome),
+            (
+                Some("relative"),
+                Some("/unused"),
+                preferences::Reason::RelativePath,
+            ),
+            (None, Some("relative"), preferences::Reason::RelativePath),
+        ] {
+            let (path, failure) = resolve_preferences_path(&options, || {
+                preferences::default_path(config.map(Into::into), home.map(Into::into))
+            });
+            assert!(path.is_none());
+            assert_eq!(failure, Some(reason));
+            let status = preferences::Status::unavailable(failure.unwrap());
+            assert_eq!(status.reason, Some(reason));
+            assert!(status.valid());
+        }
+    }
+
+    #[test]
+    fn forget_menu_freezes_catalog_binding_across_same_view_reattachment() {
+        let mut view = test_view();
+        let a = preference(1);
+        view.set_preference(Some(a.clone()));
+        let frozen = view.preference.as_ref().unwrap().binding.clone();
+        assert!(view.validated_forget_binding(Some(&frozen)).is_some());
+        let mut b = preference(2);
+        b.binding.target.activity = "B".into();
+        // Same FamiliarView/native identity, but Attach changes its binding.
+        view.set_preference(Some(b));
+        assert!(view.validated_forget_binding(Some(&frozen)).is_none());
+        assert!(view.validated_forget_binding(None).is_none());
+        let mut a_again = a;
+        a_again.binding.generation = 3;
+        view.set_preference(Some(a_again));
+        assert!(view.validated_forget_binding(Some(&frozen)).is_none());
+    }
+
+    #[test]
+    fn forget_epoch_snapshot_clears_all_shared_view_intent_without_resampling() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let mut a = familiar("a");
+        let mut b = familiar("b");
+        a.preference = Some(preference(1));
+        let mut other_instance = preference(1);
+        other_instance.binding.target.instance = "other-instance".into();
+        b.preference = Some(other_instance);
+        app.stage_snapshot(vec![a.clone(), b.clone()]);
+        let now = Instant::now();
+        for view in app.views.values_mut() {
+            view.gesture.press(1.0);
+            view.drag_binding = Some(view.preference.as_ref().unwrap().binding.clone());
+            view.commit_drag();
+            view.capture_placement_with(now, || Some(Placement { x: 10.0, y: 20.0 }));
+            // A fresh in-progress drag must be invalidated as well as the queued one.
+            view.drag_binding = Some(view.preference.as_ref().unwrap().binding.clone());
+        }
+        for snapshot in [&mut a, &mut b] {
+            let p = snapshot.preference.as_mut().unwrap();
+            p.binding.generation += 1;
+            p.placement = None;
+        }
+        app.stage_snapshot(vec![a, b]);
+        for view in app.views.values_mut() {
+            assert!(view.pending_placement.is_none());
+            assert!(view.drag_binding.is_none());
+            assert!(view.pending_restore.is_none());
+            view.capture_placement_with(now, || panic!("forgotten gesture must not resample"));
+            view.retry_placement_with(now, |_| panic!("forgotten record must not resurrect"));
+        }
+    }
+
+    #[test]
+    fn restore_feedback_duplicates_and_zero_geometry_do_not_spend_corrections() {
+        let now = Instant::now();
+        let mut restore = PendingRestore {
+            placement: Placement { x: 100.0, y: 200.0 },
+            attempts: 0,
+            feedback: None,
+            deadline: now + Duration::from_secs(1),
+            poll_at: now,
+        };
+        let first = ((200, 300), 1.0_f64.to_bits());
+        let dpi = ((400, 600), 2.0_f64.to_bits());
+        let origin = Some(Point { x: 50.0, y: 70.0 });
+        assert_eq!(restore.correction(now, ((0, 0), first.1), None), None);
+        assert_eq!(restore.attempts, 0);
+        assert_eq!(
+            restore.correction(now + Duration::from_millis(20), first, origin),
+            origin
+        );
+        for i in 0..100 {
+            assert!(
+                restore
+                    .correction(now + Duration::from_millis(21 + i * 4), first, origin)
+                    .is_none()
+            );
+        }
+        assert_eq!(restore.attempts, 1);
+        assert_eq!(
+            restore.correction(now + Duration::from_millis(500), dpi, origin),
+            origin
+        );
+        assert_eq!(restore.attempts, 2);
+        assert!(
+            restore
+                .correction(now + Duration::from_secs(1), first, origin)
+                .is_none()
+        );
+        assert!(restore.finished(now + Duration::from_secs(1)));
+        let mut view = test_view();
+        view.pending_restore = Some(restore);
+        view.restore_placement(now + Duration::from_secs(1));
+        assert!(view.pending_restore.is_none());
+        assert!(!view.geometry_held());
+    }
+
+    #[test]
+    fn restore_correction_budget_counts_only_fresh_valid_repositions() {
+        let now = Instant::now();
+        let mut restore = PendingRestore {
+            placement: Placement { x: 100.0, y: 200.0 },
+            attempts: 0,
+            feedback: None,
+            deadline: now + Duration::from_secs(1),
+            poll_at: now,
+        };
+        for i in 0..5 {
+            assert!(
+                restore
+                    .correction(
+                        now + Duration::from_millis(i * 20),
+                        ((200 + i as u32, 300), 1.0_f64.to_bits()),
+                        Some(Point::default())
+                    )
+                    .is_some()
+            );
+        }
+        assert!(restore.finished(now + Duration::from_millis(100)));
+        assert!(
+            restore
+                .correction(
+                    now + Duration::from_millis(100),
+                    ((500, 300), 1.0_f64.to_bits()),
+                    Some(Point::default())
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn initial_restore_cancels_on_interaction_navigation_rebind_and_close() {
+        for cancellation in 0..4 {
+            let mut view = test_view();
+            view.set_preference(Some(preference(1)));
+            assert!(view.begin_initial_placement());
+            let now = Instant::now();
+            match cancellation {
+                0 => view.gesture.press(1.0),
+                1 => view.start_navigation(now),
+                2 => view.set_preference(Some(preference(2))),
+                _ => view.close_requested = true,
+            }
+            view.restore_placement(now);
+            assert!(view.pending_restore.is_none());
+            assert!(view.pending_placement.is_none());
+            if cancellation == 1 {
+                assert!(view.seeking());
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_main_first_binding_restores_once_then_attach_preserves_location() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        app.stage_snapshot(vec![familiar("main")]);
+        // Native creation marks an unbound bootstrap main as eligible.
+        app.views.get_mut("main").unwrap().bootstrap_unbound = true;
+        let mut snapshot = familiar("main");
+        snapshot.preference = Some(preference(1));
+        app.stage_snapshot(vec![snapshot.clone()]);
+        let view = app.views.get_mut("main").unwrap();
+        assert!(view.first_binding_restore);
+        assert!(view.begin_initial_placement());
+        assert!(view.pending_restore.is_some());
+        view.pending_restore = None;
+        for p in [Some(preference(2)), None, Some(preference(3))] {
+            snapshot.preference = p;
+            app.stage_snapshot(vec![snapshot.clone()]);
+            let view = &app.views["main"];
+            assert!(view.ever_bound);
+            assert!(!view.first_binding_restore);
+            assert!(view.pending_restore.is_none());
+        }
+        let mut other = test_view();
+        other.set_preference(Some(preference(1)));
+        assert!(!other.first_binding_restore);
+    }
+
+    #[test]
+    fn unbound_main_user_intent_revokes_future_first_binding_restore() {
+        for intent in ["drag", "navigation", "menu"] {
+            let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+            app.stage_snapshot(vec![familiar("main")]);
+            let now = Instant::now();
+            let view = app.views.get_mut("main").unwrap();
+            view.bootstrap_unbound = true;
+            match intent {
+                "drag" => {
+                    view.gesture.press(1.0);
+                    view.commit_drag();
+                    view.release_click(now);
+                }
+                "navigation" => {
+                    view.start_navigation(now);
+                    view.cancel_navigation("completed before first producer");
+                }
+                "menu" => {
+                    view.menu_open = true;
+                    view.menu_request(PhysicalPosition::new(10.0, 10.0));
+                    view.finish_menu(now).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(!view.bootstrap_unbound, "{intent}");
+            assert!(!view.ever_bound, "user intent must not fabricate a binding");
+            assert!(!view.geometry_held());
+            assert!(view.navigation.is_none());
+            let mut snapshot = familiar("main");
+            snapshot.preference = Some(preference(1));
+            app.stage_snapshot(vec![snapshot.clone()]);
+            let view = &app.views["main"];
+            assert!(view.ever_bound);
+            assert!(!view.first_binding_restore, "{intent}");
+            assert!(view.pending_restore.is_none(), "{intent}");
+            snapshot.preference = Some(preference(2));
+            app.stage_snapshot(vec![snapshot]);
+            assert!(!app.views["main"].first_binding_restore);
+            assert!(app.views["main"].pending_restore.is_none());
+        }
+    }
+
+    #[test]
+    fn quick_menu_dismissal_cancels_late_restore_feedback_only_for_clicked_view() {
+        let mut clicked = test_view();
+        let mut other = test_view();
+        for view in [&mut clicked, &mut other] {
+            view.set_preference(Some(preference(1)));
+            assert!(view.begin_initial_placement());
+        }
+        let now = Instant::now();
+        clicked.first_binding_restore = true;
+        clicked.menu_open = true;
+        clicked.menu_request(PhysicalPosition::new(10.0, 10.0));
+        // No tick occurs during native tracking or before dismissal.
+        clicked.finish_menu(now).unwrap();
+        assert!(!clicked.first_binding_restore);
+        assert!(clicked.pending_restore.is_none());
+        clicked.restore_placement(now + Duration::from_millis(100));
+        assert!(clicked.pending_restore.is_none());
+        assert!(clicked.pending_placement.is_none());
+        let feedback = other.pending_restore.as_mut().unwrap();
+        assert!(
+            feedback
+                .correction(
+                    now + Duration::from_millis(100),
+                    ((400, 600), 2.0_f64.to_bits()),
+                    Some(Point::default()),
+                )
+                .is_some()
+        );
+    }
+
+    fn preference(generation: u64) -> PreferencePresentation {
+        PreferencePresentation {
+            binding: PreferenceBinding {
+                target: crate::activity::FocusTarget {
+                    source: "source".into(),
+                    instance: "instance".into(),
+                    activity: "activity".into(),
+                },
+                generation,
+            },
+            placement: Some(Placement {
+                x: -350.0,
+                y: 240.0,
+            }),
+            writable: true,
+        }
+    }
+
+    #[test]
+    fn saved_foot_uses_actual_raster_geometry_and_round_trips() {
+        let monitor = LogicalMonitor {
+            x: -2000.0,
+            y: -2000.0,
+            width: 4000.0,
+            height: 4000.0,
+        };
+        for show in [false, true] {
+            for backing in [1.0, 1.5, 2.0, 3.0] {
+                for scale in [0.25, 0.500000001_f64 as f32, 1.0, 2.0] {
+                    for inner in [
+                        (157, 231),
+                        (321, 687),
+                        layout_size(show, scale, 2.5 * backing),
+                    ] {
+                        let origin = Point {
+                            x: -700.0,
+                            y: -600.0,
+                        };
+                        let saved =
+                            placement_from_geometry(origin, inner, backing, show, scale).unwrap();
+                        let (x0, _, x1, y1) =
+                            bubble::SpriteProjection::new(inner, show, scale).bounds;
+                        assert_eq!(
+                            saved.x,
+                            origin.x + ((x0 + x1) as f64 / 2.0).round() / backing
+                        );
+                        assert_eq!(saved.y, origin.y + y1 as f64 / backing);
+                        let restored =
+                            restored_origin(saved, inner, backing, show, scale, &[monitor])
+                                .unwrap();
+                        assert!((restored.x - origin.x).abs() < 1e-9);
+                        assert!((restored.y - origin.y).abs() < 1e-9);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restore_uses_each_monitor_scale_and_deterministic_nearest_fallback() {
+        let left = logical_monitor(
+            PhysicalPosition::new(-2400, -400),
+            PhysicalSize::new(2400, 1800),
+            2.0,
+        )
+        .unwrap();
+        let right = logical_monitor(
+            PhysicalPosition::new(0, 0),
+            PhysicalSize::new(1920, 1080),
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(
+            (left.x, left.y, left.width, left.height),
+            (-1200.0, -200.0, 1200.0, 900.0)
+        );
+        let saved = Placement {
+            x: -800.0,
+            y: 300.0,
+        };
+        let restored = restored_origin(saved, (200, 200), 2.0, false, 0.5, &[right, left]).unwrap();
+        assert!(restored.x >= left.x && restored.x < 0.0);
+        let removed = restored_origin(saved, (200, 200), 2.0, false, 0.5, &[right]).unwrap();
+        assert_eq!(removed.x, 0.0);
+        let offscreen = Placement {
+            x: 900_000.0,
+            y: -900_000.0,
+        };
+        let a = restored_origin(offscreen, (200, 200), 2.0, true, 0.5, &[right, left]).unwrap();
+        let b = restored_origin(offscreen, (200, 200), 2.0, true, 0.5, &[left, right]).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.x, 1820.0);
+        assert_eq!(a.y, 0.0);
+        let oversize = restored_origin(saved, (10000, 10000), 1.0, true, 0.5, &[left]).unwrap();
+        assert_eq!(
+            oversize,
+            Point {
+                x: left.x,
+                y: left.y
+            }
+        );
+        assert!(restored_origin(saved, (0, 200), 2.0, false, 0.5, &[left]).is_none());
+        assert!(restored_origin(saved, (200, 200), 2.0, false, 0.5, &[]).is_none());
+        for backing in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                logical_monitor(
+                    PhysicalPosition::new(0, 0),
+                    PhysicalSize::new(100, 100),
+                    backing
+                )
+                .is_none()
+            );
+            assert!(restored_origin(saved, (200, 200), backing, false, 0.5, &[left]).is_none());
+        }
+        for x in [f64::NAN, f64::INFINITY, 2_000_000.0, -2_000_000.0] {
+            assert!(
+                placement_from_geometry(Point { x, y: 0.0 }, (200, 200), 2.0, false, 0.5).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn drag_capture_is_once_and_retries_frozen_intent_without_resampling() {
+        let mut view = test_view();
+        let now = Instant::now();
+        let pref = preference(1);
+        view.set_preference(Some(pref.clone()));
+        view.drag_binding = Some(pref.binding.clone());
+        view.gesture.press(2.0);
+        view.commit_drag();
+        let saved = Placement {
+            x: -123.0,
+            y: 456.0,
+        };
+        view.capture_placement_with(now, || Some(saved));
+        view.capture_placement_with(now, || panic!("second release must not sample geometry"));
+        view.poll_interaction(now, false);
+        view.release_click(now);
+        assert_eq!(view.placement_sequence, 1);
+        assert_eq!(view.pending_placement.as_ref().unwrap().placement, saved);
+        let retry = view
+            .retry_placement_with(now, |p| {
+                assert_eq!(p.sequence, 1);
+                assert_eq!(p.placement, saved);
+                anyhow::bail!("queue full")
+            })
+            .unwrap();
+        assert_eq!(retry, now + Duration::from_millis(100));
+        view.start_navigation(now);
+        view.apply_settings(FamiliarSettings {
+            sprite_scale: 2.0,
+            ..view.settings
+        })
+        .unwrap();
+        view.retry_placement_with(now, |_| panic!("retry must respect bounded wake"));
+        assert!(
+            view.retry_placement_with(retry, |p| {
+                assert_eq!(p.placement, saved);
+                assert_eq!(p.binding, pref.binding);
+                Ok(())
+            })
+            .is_none()
+        );
+        assert!(view.pending_placement.is_none());
+        view.retry_placement_with(retry, |_| panic!("accepted placement must not repeat"));
+    }
+
+    #[test]
+    fn clicks_failed_drags_and_binding_changes_never_save() {
+        for native_drag in [false, true] {
+            let mut view = test_view();
+            let pref = preference(1);
+            view.set_preference(Some(pref.clone()));
+            view.drag_binding = Some(pref.binding.clone());
+            view.gesture.press(1.0);
+            view.gesture.native_drag_active = native_drag;
+            if native_drag {
+                view.set_preference(Some(preference(2)));
+            }
+            view.capture_placement_with(Instant::now(), || {
+                panic!("unsavable gesture sampled geometry")
+            });
+            assert!(view.pending_placement.is_none());
+        }
+        for change in 0..4 {
+            let mut view = test_view();
+            let pref = preference(1);
+            view.set_preference(Some(pref.clone()));
+            view.drag_binding = Some(pref.binding.clone());
+            view.gesture.press(1.0);
+            view.commit_drag();
+            view.capture_placement_with(Instant::now(), || pref.placement);
+            let mut changed = pref.clone();
+            match change {
+                0 => changed.binding.target.source = "other".into(),
+                1 => changed.binding.target.instance = "other".into(),
+                2 => changed.binding.target.activity = "other".into(),
+                _ => changed.binding.generation += 1,
+            }
+            view.set_preference(Some(changed));
+            assert!(view.pending_placement.is_none());
+            assert!(view.drag_binding.is_none());
+        }
+    }
+
+    #[test]
+    fn snapshot_echoes_and_attach_never_schedule_a_restore_or_save() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let mut snapshot = familiar("main");
+        snapshot.preference = Some(preference(1));
+        app.stage_snapshot(vec![snapshot.clone()]);
+        for generation in [1, 1, 2, 2] {
+            snapshot.preference = Some(preference(generation));
+            app.stage_snapshot(vec![snapshot.clone()]);
+            let view = &app.views["main"];
+            assert!(view.pending_restore.is_none());
+            assert!(view.pending_placement.is_none());
+            assert_eq!(view.placement_sequence, 0);
+        }
+    }
+
+    #[test]
+    fn loaded_initial_placement_wins_cascade_even_when_read_only() {
+        let mut view = test_view();
+        assert!(!view.begin_initial_placement());
+        let mut pref = preference(1);
+        pref.writable = false;
+        view.set_preference(Some(pref.clone()));
+        // This decision is used only by the newly-created native-window branch,
+        // before it can choose cascade. Read-only loading still restores.
+        assert!(view.begin_initial_placement());
+        assert_eq!(
+            view.pending_restore.as_ref().unwrap().placement,
+            pref.placement.unwrap()
+        );
+        assert_eq!(view.pending_restore.as_ref().unwrap().attempts, 0);
+        view.pending_restore = None;
+        view.set_preference(Some(pref));
+        assert!(view.pending_restore.is_none());
+        assert!(view.pending_placement.is_none());
+    }
+
+    #[test]
+    fn latest_completed_drag_replaces_pending_and_binding_revocation_discards_it() {
+        let mut view = test_view();
+        let now = Instant::now();
+        let pref = preference(1);
+        view.set_preference(Some(pref.clone()));
+        for (sequence, x) in [(1, 10.0), (2, 20.0)] {
+            view.gesture.press(1.0);
+            view.drag_binding = Some(pref.binding.clone());
+            view.commit_drag();
+            view.capture_placement_with(now, || Some(Placement { x, y: 30.0 }));
+            view.end_interaction(now);
+            assert_eq!(view.pending_placement.as_ref().unwrap().sequence, sequence);
+            assert_eq!(view.pending_placement.as_ref().unwrap().placement.x, x);
+        }
+        view.retry_placement_with(now, |pending| {
+            assert_eq!(pending.sequence, 2);
+            assert_eq!(pending.placement.x, 20.0);
+            anyhow::bail!("queue full")
+        });
+        let mut readonly = pref;
+        readonly.writable = false;
+        view.set_preference(Some(readonly));
+        assert!(view.pending_placement.is_none());
+        assert!(view.placement_retry.is_none());
+        view.retry_placement_with(now + Duration::from_secs(1), |_| {
+            panic!("revoked intent must not submit")
+        });
+    }
 
     #[test]
     fn click_release_slop_and_drag_are_dpi_independent() {
@@ -2402,6 +3614,8 @@ mod tests {
                 bubbles: true,
                 navigation: false,
                 settings: Some(view.settings),
+                preferences: false,
+                attachments: None,
             });
             let context_menu::Entry::Submenu {
                 entries: fields, ..
@@ -2440,6 +3654,7 @@ mod tests {
             let valid = menu_target_valid(current, window, closing, failed);
             assert!(!valid);
             for action in [
+                Action::Attach(0),
                 Action::CloseFamiliar,
                 Action::RevealStatus,
                 Action::GoToMouse,
@@ -2462,6 +3677,312 @@ mod tests {
             Some(Action::CloseFamiliar)
         );
         assert_eq!(validated_menu_action(None, true), None);
+    }
+
+    fn target_snapshot(binding: AttachmentBinding) -> FamiliarTargetSnapshot {
+        FamiliarTargetSnapshot {
+            binding: RuntimeBinding {
+                service_instance: "service-1".into(),
+                attachment: binding,
+            },
+            targets: (0..3)
+                .map(|index| crate::activity::LiveTarget {
+                    selection: crate::activity::Selection {
+                        source: "source".into(),
+                        instance: format!("instance-{index}"),
+                        activity: "chat".into(),
+                        state: crate::protocol::ActivityState::Working,
+                        attention: false,
+                        reason: None,
+                        summary: Some("Same title".into()),
+                    },
+                    claimed_by: match index {
+                        0 => None,
+                        1 => Some("main".into()),
+                        _ => Some("other".into()),
+                    },
+                    incarnation: index + 1,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+
+    #[test]
+    fn chat_snapshot_requires_applied_binding_filters_ownership_and_freezes_indices() {
+        let applied = unbound_attachment();
+        let snapshot = target_snapshot(applied.clone());
+        let (context, frozen) = attachment_context("main", &applied, Some(snapshot.clone()));
+        assert!(context.available);
+        assert_eq!(context.choices.len(), 2);
+        assert_eq!(context.choices[0].target.instance, "instance-0");
+        assert_eq!(context.choices[1].target.instance, "instance-1");
+        let frozen = frozen.unwrap();
+        let chosen = frozen.choice(0, &applied).unwrap();
+        let mut reordered = snapshot.clone();
+        let mut targets = reordered.targets.to_vec();
+        targets.reverse();
+        reordered.targets = targets.into();
+        assert!(frozen.still_eligible("main", chosen, &reordered));
+        assert_eq!(
+            frozen.choice(0, &applied).unwrap().target.instance,
+            "instance-0"
+        );
+        assert!(frozen.choice(usize::MAX, &applied).is_none());
+        assert!(frozen.choice(2, &applied).is_none());
+        let changed = AttachmentBinding {
+            generation: 3,
+            ..applied.clone()
+        };
+        assert!(frozen.choice(0, &changed).is_none());
+        let (unavailable, frozen) = attachment_context("main", &changed, Some(snapshot));
+        assert!(!unavailable.available);
+        assert!(unavailable.choices.is_empty());
+        assert!(frozen.is_none());
+        let (busy, frozen) = attachment_context("main", &applied, None);
+        assert!(!busy.available);
+        assert!(frozen.is_none());
+    }
+
+    #[test]
+    fn post_popup_validation_rejects_reconnect_claim_disappear_service_and_generation_changes() {
+        let applied = unbound_attachment();
+        let snapshot = target_snapshot(applied.clone());
+        let (_, frozen) = attachment_context("main", &applied, Some(snapshot.clone()));
+        let frozen = frozen.unwrap();
+        let chosen = frozen.choice(0, &applied).unwrap();
+        for change in 0..5 {
+            let mut fresh = snapshot.clone();
+            let mut targets = fresh.targets.to_vec();
+            match change {
+                0 => targets[0].incarnation += 1,
+                1 => targets[0].claimed_by = Some("other".into()),
+                2 => {
+                    targets.remove(0);
+                }
+                3 => fresh.binding.service_instance = "restarted".into(),
+                _ => fresh.binding.attachment.generation += 1,
+            }
+            fresh.targets = targets.into();
+            assert!(!frozen.still_eligible("main", chosen, &fresh));
+        }
+        assert!(frozen.still_eligible("main", chosen, &snapshot));
+        // A current/self-owned chat remains selectable.
+        assert!(frozen.still_eligible("main", frozen.choice(1, &applied).unwrap(), &snapshot));
+    }
+
+    #[test]
+    fn attachment_queue_uses_frozen_payload_without_optimistic_view_changes() {
+        let mut view = test_view();
+        view.paused = true;
+        view.display.manual(Animation::Waving);
+        view.select(Animation::Waving);
+        view.navigation = Some(Navigation::Celebrating);
+        view.hidden_position = Some(PhysicalPosition::new(321, 654));
+        let settings = view.settings;
+        let binding = view.runtime_binding.clone();
+        let snapshot = target_snapshot(binding.clone());
+        let (_, frozen) = attachment_context("main", &binding, Some(snapshot.clone()));
+        let frozen = frozen.unwrap();
+        for rejected in [false, true] {
+            let mut queued = None;
+            let result = frozen.queue(
+                "main",
+                1,
+                &view.runtime_binding,
+                None,
+                |expected, choice| {
+                    queued = Some((expected.clone(), choice.clone()));
+                    if rejected {
+                        anyhow::bail!("queue full")
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(result.is_err(), rejected);
+            let (expected, choice) = queued.unwrap();
+            assert_eq!(expected, snapshot.binding);
+            assert_eq!(choice.target.instance, "instance-1");
+            assert_eq!(choice.incarnation, 2);
+            assert_eq!(view.runtime_binding, binding);
+            assert_eq!(view.settings, settings);
+            assert!(view.paused);
+            assert_eq!(view.player.animation(), Animation::Waving);
+            assert!(matches!(view.navigation, Some(Navigation::Celebrating)));
+            assert_eq!(view.hidden_position, Some(PhysicalPosition::new(321, 654)));
+        }
+        for index in [2, usize::MAX] {
+            assert!(
+                frozen
+                    .queue("main", index, &binding, None, |_, _| panic!(
+                        "invalid index queued"
+                    ))
+                    .is_err()
+            );
+        }
+        let stale = AttachmentBinding {
+            generation: binding.generation + 2,
+            ..binding
+        };
+        assert!(
+            frozen
+                .queue("main", 0, &stale, None, |_, _| panic!(
+                    "stale binding queued"
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn committed_retarget_updates_source_without_resetting_manual_navigation_or_appearance() {
+        use crate::protocol::{Activity, ActivityState, AttachRequest, TargetRequest};
+
+        for manual in [false, true] {
+            for navigating in [false, true] {
+                let now = Instant::now();
+                let settings = FamiliarSettings {
+                    sprite_scale: 0.75,
+                    font_size: 19.0,
+                    bubble_duration: 7.0,
+                };
+                let mut store = crate::activity::Store::with_settings(true, settings);
+                for (instance, state) in [
+                    ("actor-a", ActivityState::Working),
+                    ("actor-b", ActivityState::Waiting),
+                ] {
+                    store
+                        .register(
+                            ("source".into(), instance.into()),
+                            vec![Activity {
+                                activity: "chat".into(),
+                                sequence: 1,
+                                state,
+                                attention: state == ActivityState::Waiting,
+                                reason: None,
+                                summary: Some("Same title".into()),
+                            }],
+                            now,
+                        )
+                        .unwrap();
+                }
+                let attach = |instance: &str| AttachRequest {
+                    id: "main".into(),
+                    target: TargetRequest {
+                        source: "source".into(),
+                        instance: Some(instance.into()),
+                        activity: "chat".into(),
+                    },
+                };
+                store.attach(&[attach("actor-a")]).unwrap();
+                let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+                for (id, presentation) in app.stage_snapshot(store.presentations(now)) {
+                    let view = app.views.get_mut(&id).unwrap();
+                    view.latest_view = presentation.clone();
+                    view.source_animation(presentation);
+                }
+                let view = app.views.get_mut("main").unwrap();
+                assert_eq!(view.player.animation(), Animation::Working);
+                let previous_binding = view.runtime_binding.clone();
+                if navigating {
+                    view.start_navigation(now);
+                    view.select(Animation::RunningLeft);
+                }
+                if manual {
+                    view.display.manual(Animation::Waving);
+                    view.select(Animation::Waving);
+                }
+                view.player.advance(Duration::from_millis(175), &view.atlas);
+                view.paused = true;
+                view.hidden_position = Some(PhysicalPosition::new(123, 456));
+                let animation = view.player.animation();
+                let frame = view.player.frame_index();
+                let remaining = view.player.until_next_frame(&view.atlas);
+                let motion = view.motion_clock.deadline();
+                let tick = view.last_tick;
+                let demo = view.next_demo;
+
+                store.attach(&[attach("actor-b")]).unwrap();
+                let committed = store.presentations(now);
+                assert_eq!(committed.len(), 1);
+                let expected = committed[0].clone();
+                for (id, presentation) in app.stage_snapshot(committed) {
+                    let view = app.views.get_mut(&id).unwrap();
+                    view.latest_view = presentation.clone();
+                    view.source_animation(presentation);
+                }
+                let view = app.views.get_mut("main").unwrap();
+                assert_eq!(view.runtime_binding, expected.runtime_binding);
+                assert!(view.runtime_binding.generation > previous_binding.generation);
+                let target = view.runtime_binding.target.as_ref().unwrap();
+                assert_eq!(
+                    (&*target.source, &*target.instance, &*target.activity),
+                    ("source", "actor-b", "chat")
+                );
+                assert_eq!(view.latest_view, expected.presentation);
+                assert_eq!(
+                    FocusTarget::from(view.latest_view.base.as_ref().unwrap()),
+                    *target
+                );
+                assert!(view.latest_view.cue.is_none());
+                assert!(view.paused);
+                assert_eq!(view.display.is_manual(), manual);
+                assert_eq!(view.seeking(), navigating);
+                assert_eq!(view.motion_clock.deadline(), motion);
+                assert_eq!(view.settings, settings);
+                assert_eq!(familiar_settings(&view.options), settings);
+                assert_eq!(view.hidden_position, Some(PhysicalPosition::new(123, 456)));
+                if manual || navigating {
+                    assert_eq!(view.next_demo, demo);
+                    assert_eq!(view.player.animation(), animation);
+                    assert_eq!(view.player.frame_index(), frame);
+                    assert_eq!(view.player.until_next_frame(&view.atlas), remaining);
+                    assert_eq!(view.last_tick, tick);
+                } else {
+                    assert_eq!(view.player.animation(), Animation::Waiting);
+                }
+                // Both overrides must retain the newly committed live source for resume.
+                assert_eq!(view.display.resume(), Animation::Waiting);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_binding_is_independent_of_preferences_and_does_not_reset_view_state() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let mut snapshot = familiar("main");
+        app.stage_snapshot(vec![snapshot.clone()]);
+        let view = app.views.get_mut("main").unwrap();
+        view.paused = true;
+        view.display.manual(Animation::Waving);
+        view.select(Animation::Waving);
+        view.hidden_position = Some(PhysicalPosition::new(123, 456));
+        view.navigation = Some(Navigation::Celebrating);
+        let settings = view.settings;
+        let frozen = target_snapshot(view.runtime_binding.clone());
+        snapshot.runtime_binding = AttachmentBinding {
+            target: Some(FocusTarget {
+                source: "source".into(),
+                instance: "instance-0".into(),
+                activity: "chat".into(),
+            }),
+            generation: 2,
+        };
+        app.stage_snapshot(vec![snapshot.clone()]);
+        let view = &app.views["main"];
+        assert_eq!(view.runtime_binding, snapshot.runtime_binding);
+        assert!(view.preference.is_none());
+        assert!(view.paused);
+        assert_eq!(view.settings, settings);
+        assert_eq!(view.player.animation(), Animation::Waving);
+        assert_eq!(view.hidden_position, Some(PhysicalPosition::new(123, 456)));
+        assert!(matches!(view.navigation, Some(Navigation::Celebrating)));
+        assert_ne!(view.runtime_binding, frozen.binding.attachment);
+        snapshot.preference = Some(preference(9));
+        app.stage_snapshot(vec![snapshot.clone()]);
+        assert_eq!(app.views["main"].runtime_binding, snapshot.runtime_binding);
+        snapshot.preference = None;
+        app.stage_snapshot(vec![snapshot.clone()]);
+        assert_eq!(app.views["main"].runtime_binding, snapshot.runtime_binding);
     }
 
     #[test]
@@ -3497,6 +5018,8 @@ mod tests {
             preset: DEFAULT_CHARACTER_ID.into(),
             settings: FamiliarSettings::default(),
             presentation: Presentation::default(),
+            preference: None,
+            runtime_binding: unbound_attachment(),
         }
     }
 

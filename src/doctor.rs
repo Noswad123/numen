@@ -108,6 +108,15 @@ fn parse_service(mut data: Value) -> Result<(Service, ServiceState)> {
         ensure!(safe_text(path, 1024), "invalid service executable metadata");
     }
     validate_build(&snapshot.build)?;
+    if let Some(preferences) = &snapshot.preferences {
+        ensure!(
+            preferences.valid(),
+            "invalid preferences diagnostics metadata"
+        );
+        if let Some(path) = &preferences.path {
+            ensure!(safe_text(path, 1024), "invalid preferences path metadata");
+        }
+    }
     ensure!(
         snapshot
             .hotkeys
@@ -226,10 +235,35 @@ pub fn run(path: &Path, json: bool) -> Result<()> {
                         .unwrap_or_else(|| "none".into())
                 );
             }
+            if let Some(preferences) = snapshot.preferences {
+                println!(
+                    "  Preferences: {} (load: {}, write: {}, reason: {})",
+                    label(&preferences.mode),
+                    label(&preferences.load),
+                    label(&preferences.write),
+                    preferences
+                        .reason
+                        .as_ref()
+                        .map(label)
+                        .unwrap_or_else(|| "none".into())
+                );
+                println!(
+                    "    Revision: accepted {}, durable {}; remembered chats: {}",
+                    preferences.accepted_revision,
+                    preferences.durable_revision,
+                    preferences.records
+                );
+                if let Some(path) = preferences.path {
+                    println!("    Path: {}", path.escape_debug());
+                }
+            } else {
+                println!("  Preferences: unknown (reason: not_reported)");
+            }
         } else {
             println!("  Path/build: unknown");
             println!("  Option+I: unknown (reason: not_reported)");
             println!("  Option+M: unknown (reason: not_reported)");
+            println!("  Preferences: unknown (reason: not_reported)");
         }
         println!("  Navigation: {}", service.navigation);
         println!(
@@ -257,6 +291,7 @@ pub fn run(path: &Path, json: bool) -> Result<()> {
         println!("  PID/path/build: unknown");
         println!("  Option+I: unknown (reason: not_reported)");
         println!("  Option+M: unknown (reason: not_reported)");
+        println!("  Preferences: unknown (reason: not_reported)");
         println!("  Navigation/settings: unknown");
         println!("  Familiars/sources: unknown");
     }

@@ -19,6 +19,37 @@ On a navigation-capable live macOS service, **Option+M (Alt+M)** sends all curre
 
 For example, a source reports `waiting` with the reason `permission_required`, not `play-sad-genie-animation`. Different personalities and rendering surfaces can express the same activity differently.
 
+### Saved preferences (live GUI)
+
+Production live `run` (including menu-bootstrapped `run --empty`) now remembers explicit appearance edits and completed manual drags. The default file is **`$XDG_CONFIG_HOME/numen/preferences.json`** when XDG_CONFIG_HOME is nonempty and absolute, otherwise **`$HOME/.config/numen/preferences.json`** with an absolute HOME. A relative configured root is rejected, not silently redirected. The normal user configuration ancestor must exist; missing ancestors are not recursively created. Only the private leaf directory may be created. Ancestor HOME/config/dotfile symlinks are allowed; the leaf directory must be owned, non-symlink and 0700, and the file an owned, non-symlink, single-link regular file with mode 0600. Unsafe existing nodes are not repaired or overwritten.
+
+`run --no-preferences` bypasses **all** preference path resolution, reads and writes while retaining runtime Settings. `run --preferences-file /absolute/private/preferences.json` overrides the default and conflicts with `--no-preferences`. Manual, demo and headless modes do no preference I/O.
+
+The remembered key is **only `(source, activity)`**, never producer instance or familiar ID. **Assumption:** a source keeps activity IDs stable for the same logical chat across producer restarts. Stored data is the three settings (`sprite_scale`, `font_size`, `bubble_duration`) plus optional manually chosen foot-center `{x,y}` in desktop logical points. No titles/prompts, runtime pins, open-window list, autostart, cues, pause or navigation state is saved. Named profiles and character selection remain future work.
+
+- Explicit Open uses remembered style/placement when present, otherwise the **original startup defaults**; saved style takes precedence over startup fallback flags. Attach, focus and next keep the live appearance and location and associate future explicit edits with the new key.
+- Bootstrap Main's existing first-selection policy is unchanged and may load saved style. Its first-binding placement applies only if the user has not already moved/interacted with it. Sources/reconnects never create or retarget views because preferences exist.
+- Distinct instances sharing one logical key keep independent live views. The last accepted explicit edit updates the corresponding remembered data; it never automatically reapplies to other views.
+- Only explicit Settings edits and **actual completed manual drags** save. Go to Mouse, programmatic movement, bubble layout, resize, clamp, close and source events do not.
+- Placement allows finite negative coordinates within ±1,000,000. Each new native view restores once, with bounded native-size/DPI feedback (one second, at most five real corrections, 20 ms polling), clamped against all available monitors in logical coordinates using each monitor's own backing scale. Restore does not focus the view or save the clamped/resized result.
+
+**Forget:** the native click menu offers **Forget saved preferences** for a writable bound view. CLI `numen preferences forget --familiar main build-pet` (1–16 unique existing IDs) removes both saved style and placement for those logical chats, leaving **current** settings/location unchanged. The entire batch validates before mutation. Native Forget freezes/rechecks the original binding; stale actions after rebinding are rejected. Forget revokes pending drags for every view sharing the key, even if no record exists, preventing queued resurrection. Close keeps the record. Forget does not immediately resave; a **new** explicit style edit or completed drag can remember again. Backup copies are not securely erased.
+
+```sh
+numen run --no-preferences # Runtime Settings still works; no preference resolution/I/O
+numen run --preferences-file /absolute/private/numen/preferences.json
+# With an updated live service and attached familiar:
+numen settings --familiar main --font-size 16
+numen preferences forget --familiar main
+numen doctor --json # Cached service status only, never opens the preferences file
+```
+
+Storage is strict version-1 JSON, at most 128 records / 256 KiB. Missing JSON is not created until the first remembered edit (the private directory/lock may be created at startup). Malformed/future/oversized/unsafe files retain their bytes and disable saving; current defaults/settings still work. Unknown/duplicate object fields and duplicate logical keys reject loading. A second writer uses read-only mode under `flock`; there is no merge/reload, and detected external edits stop saving. Capacity declines only a new remembered key, not its runtime edit, and never evicts records. A partial-subset durability warning remains visible rather than claiming every edit saved.
+
+Background I/O keeps one pending plus one in-flight document, with at most 200 ms startup wait (late loads disabled), 250 ms debounce / two-second maximum dirty delay and a 500 ms shutdown budget. GUI/source IPC hot paths do no file I/O. Settings/Forget ACKs and drag queue acceptance are **not durable-save acknowledgments**. Doctor reports cached load/write/mode/reason, session-local accepted/durable revisions, record count and safe path; see [exact status fields](PROTOCOL.md#saved-preferences) and [preservation/recovery limits](ARCHITECTURE.md#saved-preferences-storage-and-recovery).
+
+**Delivery and validation:** main-agent confirmation is **367 passed (323 unit + 7 build-fingerprint + 37 CLI), one existing visual-preview test ignored**, with formatting, strict all-target Clippy and offline locked tests/build green. A private Apple Metal GUI harness passed five service cycles covering seeded placement/style restore, asynchronous durability, cross-instance restart/Open, Forget, fallback, corrupt-file preservation and full opt-out; [details and limits below](#saved-preferences-validation-status). No physical OS drag was performed: end-to-end drag saving, mixed-DPI restoration and focus remain manual. The prior USER-REPORTED working click/menu/settings/hotkey workflow is separate evidence. **Latest saved-preferences build installation into `~/.local/bin/numen` is confirmed**, including installed-command help checks for the new flags; see below. This docs edit performs no installation, commands, Rust edits, commits, home configuration changes or user-service control. Loading the new code in an older running service still requires **one explicit user-chosen Numen restart**, not a Djinn restart.
+
 ## Product principles
 
 - Independent of Djinn; Djinn is the first integration, not the owner.
@@ -166,7 +197,7 @@ Commands are the capability intersection of **all** selected rows: presets suppo
 
 Merely entering the menu or discovering sources never spawns a service or writes files. Choosing Open while offline starts the current executable as detached `run --empty`, unless `--no-start` requests a visible error instead. It creates no unattached `main`; source updates alone keep the registry empty. Startup uses a private 0600 `service.log` beside the socket and a five-second control-readiness wait, not GPU readiness. Concurrent starts reuse the winning graphical listener. Existing headless, outdated or unsafe services are never replaced or killed: stop an old foreground service manually once or choose another `--socket`. **Direct CLI `open` still requires an already-running graphical service.**
 
-`service-info` queries `{api_version, pid, service_instance, graphical, lifecycle, navigation}` plus additive `settings`, `familiar_count`, `source_count` and `diagnostics` in current services. The menu pins `service_instance` and seals each RPC with it: a restart rejects stale selections before dispatch, rather than acting on reused familiar IDs. Close/reopen the menu after a service restart. `quit` sends `companion.quit`: `{"quitting":true}` means scheduled, not completed. Current graphical services exit their event loop, release all views/hotkey and clean up their owned socket; headless/legacy handlers without a shutdown callback reject it. No source applications are terminated and no reported PID is signaled. Closing the last view retains the service; `quit` stops it globally. Cancelling Open after bootstrap may leave an empty resident service: use `quit` when desired.
+`service-info` queries `{api_version, pid, service_instance, graphical, lifecycle, navigation}` plus additive `settings`, `preferences`, `familiar_count`, `source_count` and `diagnostics` in current services. The menu pins `service_instance` and seals each RPC with it: a restart rejects stale selections before dispatch, rather than acting on reused familiar IDs. Close/reopen the menu after a service restart. `quit` sends `companion.quit`: `{"quitting":true}` means scheduled, not completed. Current graphical services exit their event loop, release all views/hotkey and clean up their owned socket; headless/legacy handlers without a shutdown callback reject it. No source applications are terminated and no reported PID is signaled. Closing the last view retains the service; `quit` stops it globally. Cancelling Open after bootstrap may leave an empty resident service: use `quit` when desired.
 
 ```sh
 ~/Projects/numen/target/debug/numen menu
@@ -185,7 +216,9 @@ Global `--socket PATH` works before or after the subcommand. Default: nonempty `
 
 | `run` option | Behavior |
 | --- | --- |
-| `--manual` | Disables the socket; use with `--animation` for a fixed diagnostic selection. |
+| `--no-preferences` | Bypasses all preference resolution/read/write; runtime Settings remains available. |
+| `--preferences-file ABS` | Absolute live-GUI preference-file override; conflicts with `--no-preferences`. |
+| `--manual` | Disables the socket and preference I/O; use with `--animation` for a fixed diagnostic selection. |
 | `--empty` | Starts a graphical service with zero familiars and no `main`; conflicts with `--manual` and `--demo`. |
 | `--animation NAME` | Initial expression, replaceable by live input; default `idle`. Names, in keyboard order: `idle`, `working`, `waiting`, `succeeded`, `failed`, `review`, `waving`, `running-left`, `running-right`. |
 | `--scale NUMBER` | Finite 0.5–4, default 1.5; scales the whole scene, including bubble and font. Default canvas is 96 × 104 hidden, 384 × 248 revealed. |
@@ -223,12 +256,36 @@ Both guards share one main-thread Carbon manager and a process-global capture-fr
 
 A normal **left-click release** opens an AppKit `NSMenu`; **right-click** opens the same menu instead of cycling Preview. Number keys **1–9** are unchanged. This GUI menu is separate from `numen menu`: the existing terminal/fzf/Wisp flow remains available. Source updates never open this menu and grant no source-execution authority.
 
+#### Change chat / Attach to chat
+
+**Feature done; automated/native input-free verification confirmed; physical selection pending.** A live familiar offers **Change chat** when bound, or **Attach to chat** when unbound. Choose a connected protocol activity directly; there is no mandatory process drill-down. Only eligible live exact `(source, instance, activity)` targets appear. Another familiar's claims are excluded, including disconnected reserved pins; your own live current target remains enabled and checked.
+
+Up to 16 choices appear directly; larger lists use pages of 16, covering the full 512-target service bound. Labels are bounded and sanitized, include shortened title/identity plus a unique ordinal, and have full-tuple tooltips to disambiguate duplicate titles and instances. An unavailable current pin is disabled context, not a selectable live target. An empty eligible list shows disabled **No compatible live chats**. A busy/unready cache or mismatch with the view's applied binding shows disabled **Chat list updating—reopen menu**; reopen to refresh.
+
+The popup freezes its choices: selecting an item refers to the same owned choice vector after tracking, never a newly reordered list. Familiar ID/native WindowId and the **applied** attachment target/generation must still match; a fresh cached snapshot is rechecked when available. The worker authoritatively rechecks service instance, current attachment generation, exact target tuple, source-registration incarnation, liveness and ownership at commit. A → B → A rebinding is stale, as is disconnect/re-register of the same full tuple. Ordinary metadata updates need not retain an activity sequence. Failure leaves the attachment unchanged and warns to reopen/retry. Queue acceptance is not commit; no optimistic checkmark, binding or view update occurs.
+
+Retargeting preserves the existing view's appearance, location, pause, Preview/manual override and navigation. It clears the old cue just like existing Attach. Destination saved preferences are **not loaded** into this existing familiar (explicit Open loads them); later explicit Settings edits/completed manual drags remember the new logical `(source, activity)` key. Live bindings are never persisted. Picker generations are independent of preference/Forget epochs: Forget does not invalidate a chat choice. This works with preferences enabled or disabled, not only `--no-preferences`.
+
+**Example:** left-click release → Change chat → select an eligible chat (or its numbered page). Wait for the committed snapshot before expecting the bubble/attachment to change. If the list is updating or the choice becomes stale, reopen the menu. This never launches, resumes or cancels a source, opens another familiar, or invokes terminal/fzf, socket or file I/O on the GUI thread. Manual/demo have no chat-attachment control; other action gates are unchanged.
+
+**Confirmed final main-agent validation:** **386 passed (342 unit + 7 build-fingerprint + 37 CLI), one existing visual-preview test ignored**. Formatting, strict all-target Clippy, offline `--locked` tests/build and diff checks passed with the command-scoped macOS SDK 26.5 workaround. Pure/IPC coverage includes the combined 512-target/16-binding memo, target-only publication, worker bootstrap/unbound-generation staleness, injected canonical-unbound successful Attach, and the retarget → source-animation pipeline preserving manual override, navigation, pause, appearance and position. Runtime reviewers reported no bugs after the test fixture's invalid failed-state `attention: true` was corrected to `false`.
+
+**NativePopupInputFree passed:** the production `context_menu.rs` adapter showed and automatically cancelled three fixtures: **4 choices / 393 ms**, **512 choices / 374 ms**, and **unavailable current with 0 choices / 378 ms**. Elapsed time was measured at `show` return, **before joining the canceller**, with a required minimum of 250 ms: this observes actual tracking cancellation, not a delay from waiting for the helper thread. Native construction, submenu pagination/tooltips and repeated cancellation cleanup/retention passed; exit 0, no errors. The fixture used a stub `FocusTarget` and the exact preset table, not an actual service/root Store; pure/IPC tests cover the full service contract. No actual OS input, item selection, drag, hotkeys or user-app controls were used. Actual physical selection of a new chat item (**NativeChoiceSelected**) remains manual, separate from the user's reported working older workflow and historical popup evidence below.
+
+The current wiring is complete: the App has one service/control lifetime, compares the applied attachment binding against the memo, and the worker guards service instance authoritatively. No root GUI snapshot service-stamp rewrite or remaining integration workaround is needed.
+
+**Final local installation confirmed:** the main agent successfully ran `cargo install --path . --debug --locked --offline --root ~/.local --force` with the command-scoped SDKROOT 26.5 workaround. `command -v numen` resolved to `~/.local/bin/numen`; `numen doctor --json` reported the new client build and default service `not_running`, without automatic startup or restart. This is an observation at verification time, not a permanent service-state guarantee. Installed-binary Djinn interoperability also passed: `NUMEN_TEST_BINARY=~/.local/bin/numen` with Bun `test/numen/interoperability.test.ts`, **1 passed / 46 assertions**. No current user service was controlled and no home preferences/configuration were modified. Installation does not upgrade an already-running process: an older running Numen still needs one explicit user-chosen restart to load this picker; **do not restart Djinn**. Physical **NativeChoiceSelected** remains pending, not established by the older USER-REPORTED workflow. This docs-only update runs no tests, shell commands, Rust edits, commits, OS input or app controls.
+
+See [internal interfaces/data flow](PROTOCOL.md#native-chat-picker-internal-interface) and [memo/commit boundaries](ARCHITECTURE.md#native-chat-picker-snapshot-and-commit).
+
 | Action | Scope / availability |
 | --- | --- |
 | Show status | Timed reveal of the clicked view; disabled by `--no-bubble`. |
 | Go to mouse | Clicked view only, with live navigation and an available pointer reader; preserves pause. |
 | Pause / Resume | Only the clicked view's animation/motion pause state. |
 | Settings | Three existing fields and preset sets below; one field per selection, live service only. |
+| Change chat / Attach to chat | Existing live view only; eligible connected exact targets, with frozen choices and authoritative commit checks above. |
+| Forget saved preferences | Writable bound view only; removes remembered style/placement, leaving the current view unchanged. |
 | Close familiar | Only the clicked familiar, using the existing bounded close/retry path; last Close keeps the service. |
 | Quit Numen (all familiars) | Normal root shutdown of the entire Numen service, never Djinn or another source app. |
 
@@ -269,9 +326,9 @@ Actual startup `run` options seed Main and immutable defaults for future Opens, 
 ~/Projects/numen/target/debug/numen menu
 ```
 
-Then choose Djinn preset → Open to reattach the existing chat. **No Djinn restart is needed** for this Numen update; the adapter reconnects. A legacy service without quit support must be stopped manually. Numen never auto-quits/replaces it. Once updated, runtime edits need **no restart**. There is no persistence, character/variant picker, placement control or autostart setting; existing native dragging remains available, not a new positioning feature.
+Then choose Djinn preset → Open to reattach the existing chat. **No Djinn restart is needed** for this Numen update; the adapter reconnects. A legacy service without quit support must be stopped manually. Numen never auto-quits/replaces it. Once updated, runtime edits need **no restart**. Saved preferences now remember explicit edits/manual placement as described above; character/variant selection, named profiles and autostart remain future work.
 
-The same one-time explicit Numen restart enables Option+M and the native click menu in an older running service; rebuilding alone leaves it unchanged. Use the rebuilt full path above: an older Homebrew `numen` may not be current. Restart only when explicitly chosen by the user, never automatically. This update adds no persisted settings and requires no Djinn restart or Wisp/home changes. The existing live user process was left untouched.
+The same one-time explicit Numen restart enables Option+M, the native click menu and saved preferences in an older running service; rebuilding alone leaves it unchanged. Use the rebuilt full path above: an older Homebrew `numen` may not be current. Restart only when explicitly chosen by the user, never automatically. No Djinn restart or Wisp reinstallation is required. Production live startup now uses the preference path above; development must leave the existing user process/home untouched.
 
 ### Familiar discovery and lifecycle
 
@@ -280,7 +337,7 @@ One service supports **16 familiars**. Bindings are exclusive exact `(source, in
 | Command | Contract |
 | --- | --- |
 | `presets` | Offline JSON: `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]}`. |
-| `familiars --offset N` | Four records/page: `id`, `preset`, `attachment`, `available`, optional `summary`, `capabilities`, complete `settings`. GUI capabilities: `info`, `attach`, `close`, plus `settings` with live settings support and `go-to-mouse` with navigation; headless/legacy handlers: `[]`. |
+| `familiars --offset N` | Four records/page: `id`, `preset`, `attachment`, `available`, optional `summary`, `capabilities`, complete `settings`. GUI capabilities: `info`, `attach`, `close`, plus `settings`, `go-to-mouse`, and writable-bound `preferences` independently; headless/legacy handlers: `[]`. |
 | `targets --offset N [--familiar ID]` | Four connected protocol-advertised activities/page with `claimed_by` and `eligible`; an owner may reselect its own target. The menu filters eligible entries; supported Djinn chats publish here by default unless opted out, without OS scanning. |
 | `open --source NAME --activity A [--instance I] [--id ID] [--preset djinn]` | Opens an attached view in an already-running graphical service; no auto-bootstrap. |
 | `attach --familiar ID --source NAME --activity A [--instance I]` | Retargets an existing familiar, never executes/stops the source. |
@@ -348,11 +405,33 @@ Graphical startup validates the embedded `assets/djinn/` PNG/manifest through th
 - Completion is not idle or disconnect. Only new success/failure transitions of the focused conversation can cue; repeated terminal states, snapshots and selection of historical terminal records do not replay outcomes. Focused attention clears/drops cues rather than queuing them. Background attention, failure and success never take over.
 - Movement commits the hidden sprite anchor so bubble expiry does not snap back to the pre-command position. Pointer reading is read-only: fresh macOS `CGEvent` snapshots from `CombinedSessionState`, no cursor warp, event posting, event tap, permission request or OS process scan. Other platforms currently advertise no navigation capability.
 - Menu labels/summaries are sanitized and never shell-interpolated. fzf default-options/options-file/default-command environment variables are removed; unoffered or duplicate output identities are rejected, with a 64 KiB output cap.
-- Next: broader adapter coverage and an unrelated runner. Other [mode choices](MODES.md), app-signaled following, different per-view characters/additional options, persistent preferences, general installation/autostart, packaging, gaze and roaming remain future work.
+- Next: broader adapter coverage and an unrelated runner. Other [mode choices](MODES.md), app-signaled following, different per-view characters/additional options, named profiles, general installation/autostart, packaging, gaze and roaming remain future work. General saved appearance/manual-placement preferences are delivered.
 
 ## Validation
 
-### Current user report and doctor validation status
+### Saved-preferences validation status
+
+**Confirmed final main-agent results: 367 passed — 323 unit + 7 build-fingerprint integration + 37 CLI; one existing visual-preview test ignored.** Formatting, strict all-target Clippy, offline locked tests and build are green, retaining the command-scoped SDK workaround above. These are reported main-agent results, not commands rerun by this documentation edit.
+
+The private GUI harness (evidence root **`np-rFEeeD/evidence.json`**) exercised native Apple Metal windows across **five service cycles**, observing geometry through read-only `CGWindowBounds`. All five services quit cleanly with exit 0 and removed their sockets:
+
+| Check | Confirmed result |
+| --- | --- |
+| Seeded version-1 restore | Saved sprite scale 0.75 / font size 16 / duration 1 and manual foot-center `(900,700)` loaded on explicit Open; native hidden bounds were 216 × 234 with the same foot-center. |
+| Explicit style edit | Sprite scale 1 / font size 18 became asynchronously durable while preserving saved placement. |
+| Restart, source instance A → B | Source registration alone created no views. Explicit Open restored saved style, native hidden bounds 288 × 312 and foot-center `(900,700)`. |
+| Forget | ACK was followed by a durable document with zero records; current style and native position stayed **unchanged**. |
+| Open after the next restart | Startup fallback 0.5 / font size 14 / duration 2 applied; Open did not write the preferences file. |
+| Corrupt JSON | Bytes remained unchanged, status was read-only/rejected, and runtime font-size editing to 20 still worked. |
+| `--no-preferences` | Mode was disabled with null path; absent XDG config root was skipped, runtime font size 17 worked and the bad file stayed unchanged. |
+
+Placement was **preseeded**, not saved by an actual OS drag. Pure tests cover drag capture/delivery, release polling, stale bindings and queue-full handling; they do not establish physical drag-save end-to-end acceptance. That, mixed-DPI restoration and focus remain manual. This smoke used **no OS input or hotkey registrations**, and changed neither the default user service nor home preferences. Prior USER-REPORTED desktop workflow success and the historical feature results below retain their separate scope.
+
+**Latest local installation confirmed:** the main agent successfully ran `cargo install --path . --debug --locked --offline --root ~/.local --force` with the command-scoped macOS 26.5 SDK workaround. Installed `numen preferences forget --help` and `numen run --help` verified the new command/flags. This user-authorized debug workflow updated only the installed binary and Cargo installation metadata; no running user service was restarted and no home preference files were touched during development. Installation does not upgrade a running process: one explicit user-chosen Numen restart is still required, with no Djinn restart. This documentation edit did not rerun installation or commands.
+
+Confirmed publication-race fixes include private-quarantine/inode-verified backup retirement preserving externally changed backups, no-clobber rollback for prepublication bad nodes, revision-targeted flush and sticky capacity warnings. Preservation remains **not atomic CAS**, arbitrary malicious same-UID protection or indefinite old-open-FD retention; see [recovery limits](ARCHITECTURE.md#saved-preferences-storage-and-recovery).
+
+### Current user report and historical doctor validation status
 
 **USER-REPORTED current desktop familiar workflow working:** “I verified everything working fine.” This includes the relevant click/menu/settings/hotkey workflow; it is hands-on user feedback, not a new automated run or a claim that every checklist scenario below was exercised. Mixed-DPI/monitor crossings, real OS collision/failure cases, Wisp palette → Kitty/external handoff and other untested cases remain pending. Earlier statements below about manual acceptance describe the scope of those historical test runs, not a rejection of this current user report.
 
@@ -371,7 +450,7 @@ The installed debug binary passed the live private-socket harness:
 
 All test-owned services exited 0 and cleaned up their sockets. At validation time, `numen doctor` against the default user socket returned `not_running` and started nothing; this is an observation, not a permanent machine-state guarantee. Installation and bare-command resolution are confirmed above. No hotkey presses or synthetic OS input were used; these checks add no actual native-input verification claim and do not expand the USER-REPORTED workflow acceptance.
 
-These are confirmed main-agent results, not commands rerun by this documentation edit. This edit ran no commands/tests, install, app controls, restart or commits. The **278 menu, 255 hotkey and 246 settings totals below are historical**, separate from the current 307-test result.
+These are historical doctor-delivery main-agent results, not commands rerun by this documentation edit or saved-preferences validation. This edit ran no commands/tests, install, app controls, restart or commits. The **278 menu, 255 hotkey and 246 settings totals below are historical**, separate from that doctor result.
 
 ### Native click-menu validation
 
@@ -437,6 +516,7 @@ Tests cover CLI validation, atlas integrity, animation timing, protocol/store li
 
 ## Related files
 
+- [`src/preferences.rs`](src/preferences.rs): strict saved document, path policy, bounded background writer and recovery; [`src/activity.rs`](src/activity.rs): logical-key records and binding epochs.
 - [`src/doctor.rs`](src/doctor.rs), [`src/diagnostics.rs`](src/diagnostics.rs), [`src/build_info.rs`](src/build_info.rs): report, live process facts and recorded comparison; [`build.rs`](build.rs), [`build_support.rs`](build_support.rs): embedded fingerprint inputs and limitations.
 - [Roadmap](ROADMAP.md): delivered menu/bootstrap foundation and remaining adapter coverage.
 - [Djinn adapter guide](../djinn/docs/numen.md): optional sibling integration, not a Numen dependency.

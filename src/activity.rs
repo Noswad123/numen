@@ -3,8 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::preferences;
 use anyhow::{Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
     Activity, ActivityState, Event, FamiliarSettings, MAX_ACTIVITIES, MAX_SOURCES, SettingsPatch,
@@ -16,11 +17,37 @@ const CUE_DURATION: Duration = Duration::from_millis(1500);
 const MAX_EXPLICIT_FAMILIAR_IDS: usize = 256;
 pub(crate) type SourceId = (String, String);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FocusTarget {
     pub source: String,
     pub instance: String,
     pub activity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentBinding {
+    pub target: Option<FocusTarget>,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveTarget {
+    pub selection: Selection,
+    pub claimed_by: Option<String>,
+    pub incarnation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PreferenceBinding {
+    pub target: FocusTarget,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PreferencePresentation {
+    pub binding: PreferenceBinding,
+    pub placement: Option<preferences::Placement>,
+    pub writable: bool,
 }
 
 impl From<&Selection> for FocusTarget {
@@ -85,9 +112,12 @@ pub struct Presentation {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FamiliarPresentation {
     pub id: String,
+    pub runtime_binding: AttachmentBinding,
     pub preset: String,
     pub presentation: Presentation,
     pub settings: FamiliarSettings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preference: Option<PreferencePresentation>,
 }
 
 #[derive(Clone)]
@@ -96,9 +126,11 @@ struct Record {
     value: Option<Activity>,
 }
 
+#[derive(Clone)]
 struct Source {
     seen: Instant,
     records: BTreeMap<String, Record>,
+    incarnation: u64,
 }
 
 pub(crate) struct Store {
@@ -107,7 +139,12 @@ pub(crate) struct Store {
     // Only explicit IDs and main need history; generated IDs use the counter.
     used_ids: std::collections::BTreeSet<String>,
     next_familiar: u64,
+    source_epoch: u64,
     defaults: FamiliarSettings,
+    preferences: Option<preferences::Document>,
+    preferences_writable: bool,
+    preference_revision: u64,
+    preference_capacity: bool,
 }
 
 #[derive(Default)]
@@ -117,6 +154,10 @@ struct Familiar {
     next_cue: u64,
     focus: Option<FocusTarget>,
     focus_summary: Option<String>,
+    generation: u64,
+    attachment_generation: u64,
+    drag_sequence: u64,
+    placement: Option<preferences::Placement>,
 }
 
 impl Default for Store {
@@ -126,6 +167,193 @@ impl Default for Store {
 }
 
 impl Store {
+    pub(crate) fn enable_preferences(&mut self, document: preferences::Document, writable: bool) {
+        self.preferences = Some(document);
+        self.preferences_writable = writable;
+    }
+
+    pub(crate) fn set_preferences_writable(&mut self, writable: bool) {
+        self.preferences_writable = self.preferences.is_some() && writable;
+    }
+
+    pub(crate) fn preferences_writable(&self) -> bool {
+        self.preferences_writable
+    }
+
+    pub(crate) fn preference_revision(&self) -> u64 {
+        self.preference_revision
+    }
+
+    pub(crate) fn preference_document(&self) -> Option<(u64, preferences::Document)> {
+        self.preferences
+            .as_ref()
+            .map(|d| (self.preference_revision, d.clone()))
+    }
+
+    pub(crate) fn take_preference_capacity(&mut self) -> bool {
+        std::mem::take(&mut self.preference_capacity)
+    }
+
+    pub(crate) fn preference_capacity_pending(&self) -> bool {
+        self.preference_capacity
+    }
+
+    fn saved(&self, target: &FocusTarget) -> Option<&preferences::Record> {
+        self.preferences
+            .as_ref()?
+            .records
+            .iter()
+            .find(|r| r.source == target.source && r.activity == target.activity)
+    }
+
+    fn remember(&mut self, id: &str, placement: Option<preferences::Placement>) {
+        if !self.preferences_writable {
+            return;
+        }
+        let f = &self.familiars[id];
+        let Some(target) = &f.focus else {
+            return;
+        };
+        let document = self.preferences.as_mut().unwrap();
+        let index = document
+            .records
+            .iter()
+            .position(|r| r.source == target.source && r.activity == target.activity);
+        let mut record = if let Some(index) = index {
+            document.records[index].clone()
+        } else {
+            if document.records.len() >= 128 {
+                self.preference_capacity = true;
+                return;
+            }
+            preferences::Record {
+                source: target.source.clone(),
+                activity: target.activity.clone(),
+                settings: f.settings,
+                placement: None,
+            }
+        };
+        if let Some(placement) = placement {
+            record.placement = Some(placement);
+        } else {
+            record.settings = f.settings;
+        }
+        if index.is_some_and(|i| {
+            let old = &document.records[i];
+            old.source == record.source
+                && old.activity == record.activity
+                && old.settings == record.settings
+                && old.placement == record.placement
+        }) {
+            return;
+        }
+        let Some(revision) = self.preference_revision.checked_add(1) else {
+            return;
+        };
+        if let Some(index) = index {
+            document.records[index] = record;
+        } else {
+            document.records.push(record);
+        }
+        self.preference_revision = revision;
+    }
+
+    pub(crate) fn placement(
+        &mut self,
+        id: &str,
+        binding: &PreferenceBinding,
+        sequence: u64,
+        placement: preferences::Placement,
+    ) -> Result<()> {
+        placement.validate()?;
+        self.require_familiar(id)?;
+        ensure!(self.preferences_writable, "preferences are not writable");
+        let f = self.familiars.get_mut(id).unwrap();
+        ensure!(
+            f.focus.as_ref() == Some(&binding.target) && f.generation == binding.generation,
+            "stale preference binding"
+        );
+        ensure!(
+            sequence > 0 && sequence > f.drag_sequence,
+            "stale placement sequence"
+        );
+        f.drag_sequence = sequence;
+        f.placement = Some(placement);
+        self.remember(id, Some(placement));
+        Ok(())
+    }
+
+    pub(crate) fn forget_preferences(&mut self, ids: &[String]) -> Result<Vec<String>> {
+        crate::protocol::validate_ids(ids)?;
+        ensure!(self.preferences_writable, "preferences are not writable");
+        for id in ids {
+            self.require_familiar(id)?;
+        }
+        let keys: std::collections::BTreeSet<_> = ids
+            .iter()
+            .filter_map(|id| {
+                self.familiars[id]
+                    .focus
+                    .as_ref()
+                    .map(|t| (t.source.clone(), t.activity.clone()))
+            })
+            .collect();
+        let affected: Vec<_> = self
+            .familiars
+            .iter()
+            .filter(|(_, f)| {
+                f.focus
+                    .as_ref()
+                    .is_some_and(|t| keys.contains(&(t.source.clone(), t.activity.clone())))
+            })
+            .map(|(id, f)| {
+                f.generation
+                    .checked_add(1)
+                    .map(|generation| (id.clone(), generation))
+                    .ok_or_else(|| anyhow::anyhow!("binding generation exhausted"))
+            })
+            .collect::<Result<_>>()?;
+        let document = self.preferences.as_mut().unwrap();
+        let changed = document
+            .records
+            .iter()
+            .any(|r| keys.contains(&(r.source.clone(), r.activity.clone())));
+        let revision = if changed {
+            self.preference_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("preference revision exhausted"))?
+        } else {
+            self.preference_revision
+        };
+        document
+            .records
+            .retain(|r| !keys.contains(&(r.source.clone(), r.activity.clone())));
+        self.preference_revision = revision;
+        // Forget also revokes captured drag intents, even when no record exists.
+        // Native positions are not changed by this snapshot metadata reset.
+        for (id, generation) in affected {
+            let f = self.familiars.get_mut(&id).unwrap();
+            f.generation = generation;
+            f.drag_sequence = 0;
+            f.placement = None;
+        }
+        Ok(ids.to_vec())
+    }
+
+    pub(crate) fn require_preference_binding(
+        &self,
+        id: &str,
+        binding: &PreferenceBinding,
+    ) -> Result<()> {
+        self.require_familiar(id)?;
+        let f = &self.familiars[id];
+        ensure!(
+            f.focus.as_ref() == Some(&binding.target) && f.generation == binding.generation,
+            "stale preference binding"
+        );
+        Ok(())
+    }
+
     pub(crate) fn familiar_count(&self) -> usize {
         self.familiars.len()
     }
@@ -142,6 +370,7 @@ impl Store {
                     "main".into(),
                     Familiar {
                         settings: defaults,
+                        attachment_generation: 1,
                         ..Familiar::default()
                     },
                 )])
@@ -150,7 +379,12 @@ impl Store {
             },
             used_ids: std::collections::BTreeSet::from(["main".into()]),
             next_familiar: 1,
+            source_epoch: 0,
             defaults,
+            preferences: None,
+            preferences_writable: false,
+            preference_revision: 0,
+            preference_capacity: false,
         }
     }
 }
@@ -188,6 +422,68 @@ impl Store {
             .collect()
     }
 
+    pub fn attachment_binding(&self, id: &str) -> Result<AttachmentBinding> {
+        self.require_familiar(id)?;
+        let f = &self.familiars[id];
+        Ok(AttachmentBinding {
+            target: f.focus.clone(),
+            generation: f.attachment_generation,
+        })
+    }
+
+    pub(crate) fn list_binding_snapshot(&self) -> Vec<(String, AttachmentBinding)> {
+        self.familiars
+            .keys()
+            .map(|id| {
+                (
+                    id.clone(),
+                    self.attachment_binding(id).expect("known familiar"),
+                )
+            })
+            .collect()
+    }
+
+    pub fn live_targets(&self) -> Vec<LiveTarget> {
+        self.visible()
+            .into_iter()
+            .map(|selection| LiveTarget {
+                claimed_by: self
+                    .owner(&FocusTarget::from(&selection))
+                    .map(str::to_owned),
+                incarnation: self.sources[&(selection.source.clone(), selection.instance.clone())]
+                    .incarnation,
+                selection,
+            })
+            .collect()
+    }
+
+    fn next_generations(f: &Familiar) -> Result<(u64, u64)> {
+        Ok((
+            f.generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("preference binding generation exhausted"))?,
+            f.attachment_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("attachment binding generation exhausted"))?,
+        ))
+    }
+
+    fn validate_initial(&self, id: &SourceId, records: &BTreeMap<String, Record>) -> Result<()> {
+        if let Some(main) = self.familiars.get("main")
+            && main.focus.is_none()
+            && (self.visible().iter().any(|s| {
+                (&s.source, &s.instance) != (&id.0, &id.1)
+                    && self.owner(&FocusTarget::from(s)).is_none()
+            }) || records
+                .values()
+                .filter_map(|r| r.value.as_ref())
+                .any(|a| self.owner(&FocusTarget::from(&selection(id, a))).is_none()))
+        {
+            Self::next_generations(main)?;
+        }
+        Ok(())
+    }
+
     fn focused(&self, familiar: &str) -> Option<Selection> {
         let f = self.familiars.get(familiar)?.focus.as_ref()?;
         let id = (f.source.clone(), f.instance.clone());
@@ -211,8 +507,17 @@ impl Store {
                 .into_iter()
                 .find(|s| self.owner(&FocusTarget::from(s)).is_none());
             if let Some(first) = first {
+                let saved = self.saved(&FocusTarget::from(&first)).cloned();
                 let main = self.familiars.get_mut("main").unwrap();
+                let (generation, attachment_generation) =
+                    Self::next_generations(main).expect("initial binding generations prevalidated");
                 main.focus = Some(FocusTarget::from(&first));
+                main.generation = generation;
+                main.attachment_generation = attachment_generation;
+                if let Some(saved) = saved {
+                    main.settings = saved.settings;
+                    main.placement = saved.placement;
+                }
                 main.focus_summary = first.summary;
             }
         }
@@ -250,6 +555,12 @@ impl Store {
             "target already claimed"
         );
         let f = self.familiars.get_mut(familiar).unwrap();
+        if f.focus.as_ref() != Some(&target) {
+            let (generation, attachment_generation) = Self::next_generations(f)?;
+            f.generation = generation;
+            f.attachment_generation = attachment_generation;
+            f.drag_sequence = 0;
+        }
         f.focus = Some(target);
         f.focus_summary = selected.summary;
         f.cue = None;
@@ -299,7 +610,14 @@ impl Store {
             .position(|s| Some(FocusTarget::from(s)) == self.familiars[familiar].focus)
             .map_or(0, |i| (i + 1) % visible.len());
         let f = self.familiars.get_mut(familiar).unwrap();
-        f.focus = Some(FocusTarget::from(&visible[next]));
+        let target = FocusTarget::from(&visible[next]);
+        if f.focus.as_ref() != Some(&target) {
+            let (generation, attachment_generation) = Self::next_generations(f)?;
+            f.generation = generation;
+            f.attachment_generation = attachment_generation;
+            f.drag_sequence = 0;
+        }
+        f.focus = Some(target);
         f.focus_summary = visible[next].summary.clone();
         f.cue = None;
         Ok(())
@@ -350,7 +668,20 @@ impl Store {
         );
         ensure!(self.sources.len() < MAX_SOURCES, "source limit reached");
         let records = Self::snapshot(&BTreeMap::new(), activities)?;
-        self.sources.insert(id, Source { seen: now, records });
+        let incarnation = self
+            .source_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("source incarnation exhausted"))?;
+        self.validate_initial(&id, &records)?;
+        self.source_epoch = incarnation;
+        self.sources.insert(
+            id,
+            Source {
+                seen: now,
+                records,
+                incarnation,
+            },
+        );
         self.choose_initial();
         self.presentations(now);
         Ok(())
@@ -396,8 +727,9 @@ impl Store {
     pub fn apply(&mut self, id: &SourceId, event: Event, now: Instant) -> Result<()> {
         let source = self
             .sources
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| anyhow::anyhow!("source expired; reconnect and register"))?;
+        let mut source = source.clone();
         let mut completed = None;
         match event {
             Event::Register { .. } => bail!("source already registered"),
@@ -413,6 +745,7 @@ impl Store {
             | Event::Attach { .. }
             | Event::GoToMouse { .. }
             | Event::Settings { .. }
+            | Event::ForgetPreferences { .. }
             | Event::Close { .. } => {
                 bail!("control is not a producer event")
             }
@@ -464,6 +797,8 @@ impl Store {
             }
         }
         source.seen = now;
+        self.validate_initial(id, &source.records)?;
+        self.sources.insert(id.clone(), source);
         self.choose_initial();
         let owner = completed
             .as_ref()
@@ -532,6 +867,18 @@ impl Store {
         let ids: Vec<_> = self.familiars.keys().cloned().collect();
         ids.into_iter()
             .map(|id| FamiliarPresentation {
+                runtime_binding: self.attachment_binding(&id).expect("known familiar"),
+                preference: self.preferences.as_ref().and_then(|_| {
+                    let f = &self.familiars[&id];
+                    Some(PreferencePresentation {
+                        binding: PreferenceBinding {
+                            target: f.focus.clone()?,
+                            generation: f.generation,
+                        },
+                        placement: f.placement,
+                        writable: self.preferences_writable,
+                    })
+                }),
                 settings: self.familiars[&id].settings,
                 presentation: self.presentation_for(&id, now),
                 id,
@@ -629,10 +976,14 @@ impl Store {
                     }
                 }
             };
+            let saved = self.saved(&target);
             pending.insert(
                 id.clone(),
                 Familiar {
-                    settings: self.defaults,
+                    settings: saved.map_or(self.defaults, |r| r.settings),
+                    placement: saved.and_then(|r| r.placement),
+                    generation: 1,
+                    attachment_generation: 1,
                     focus: Some(target),
                     focus_summary: selected.summary,
                     ..Familiar::default()
@@ -666,10 +1017,21 @@ impl Store {
                 "target already claimed"
             );
             targets.push(target.clone());
-            pending.push((item.id.clone(), target, selected.summary));
+            let f = &self.familiars[&item.id];
+            let generations = if f.focus.as_ref() != Some(&target) {
+                Some(Self::next_generations(f)?)
+            } else {
+                None
+            };
+            pending.push((item.id.clone(), target, selected.summary, generations));
         }
-        for (id, target, summary) in pending {
+        for (id, target, summary, generations) in pending {
             let f = self.familiars.get_mut(&id).unwrap();
+            if let Some((generation, attachment_generation)) = generations {
+                f.generation = generation;
+                f.attachment_generation = attachment_generation;
+                f.drag_sequence = 0;
+            }
             f.focus = Some(target);
             f.focus_summary = summary;
             f.cue = None;
@@ -697,6 +1059,9 @@ impl Store {
         for id in ids {
             let familiar = self.familiars.get_mut(id).unwrap();
             familiar.settings = patch.apply(familiar.settings);
+        }
+        for id in ids {
+            self.remember(id, None);
         }
         Ok(ids.to_vec())
     }
@@ -749,6 +1114,639 @@ impl Store {
 mod tests {
     use super::*;
     use crate::protocol::{AttachRequest, OpenRequest, TargetRequest};
+
+    fn preference_store() -> Store {
+        let mut store = Store::with_settings(false, FamiliarSettings::default());
+        store.enable_preferences(preferences::Document::default(), true);
+        store
+    }
+
+    #[test]
+    fn attach_from_canonical_unbound_state_commits_without_preferences() {
+        let now = Instant::now();
+        let mut store = Store::empty();
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        // Inject the canonical unbound state directly: normal bootstrap would
+        // already have selected this target when its source registered.
+        store.familiars.insert(
+            "main".into(),
+            Familiar {
+                attachment_generation: 1,
+                ..Familiar::default()
+            },
+        );
+        let unbound = store.attachment_binding("main").unwrap();
+        assert_eq!(
+            unbound,
+            AttachmentBinding {
+                target: None,
+                generation: 1
+            }
+        );
+        let rows = store.live_targets();
+        assert!(rows[0].claimed_by.is_none());
+        assert_eq!(
+            store
+                .attach(&[AttachRequest {
+                    id: "main".into(),
+                    target: target("a")
+                }])
+                .unwrap(),
+            vec!["main"]
+        );
+        let bound = store.presentations(now).remove(0);
+        assert_eq!(
+            bound.runtime_binding,
+            AttachmentBinding {
+                target: Some(FocusTarget::from(&rows[0].selection)),
+                generation: unbound.generation + 1,
+            }
+        );
+        assert!(bound.preference.is_none());
+        assert!(store.preference_document().is_none());
+        assert_eq!(store.live_targets()[0].claimed_by.as_deref(), Some("main"));
+        assert_eq!(store.expire(now + SOURCE_TIMEOUT), vec![id("a")]);
+    }
+
+    #[test]
+    fn runtime_binding_is_positive_and_independent_of_preferences_and_metadata() {
+        let now = Instant::now();
+        let mut store = Store::default();
+        let unbound = store.presentations(now).remove(0);
+        assert_eq!(
+            unbound.runtime_binding,
+            AttachmentBinding {
+                target: None,
+                generation: 1
+            }
+        );
+        assert!(unbound.preference.is_none());
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let first = store.attachment_binding("main").unwrap();
+        assert_eq!(first.generation, 2);
+        store.enable_preferences(preferences::Document::default(), true);
+        store.forget_preferences(&["main".into()]).unwrap();
+        store
+            .settings(
+                &["main".into()],
+                SettingsPatch {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        update(&mut store, "a", a(2, ActivityState::Failed), now).unwrap();
+        store.focus("a", None, "task").unwrap();
+        store.cycle().unwrap();
+        store
+            .attach(&[AttachRequest {
+                id: "main".into(),
+                target: target("a"),
+            }])
+            .unwrap();
+        assert_eq!(store.attachment_binding("main").unwrap(), first);
+        store
+            .register(id("b"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        store.focus("b", None, "task").unwrap();
+        assert_eq!(
+            store.attachment_binding("main").unwrap().generation,
+            first.generation + 1
+        );
+        store.cycle().unwrap();
+        let returned = store.attachment_binding("main").unwrap();
+        assert_eq!(returned.target, first.target);
+        assert_eq!(returned.generation, first.generation + 2);
+        store.disconnect(&id("a"));
+        assert_eq!(store.attachment_binding("main").unwrap(), returned);
+    }
+
+    #[test]
+    fn live_targets_keep_exact_claims_and_registration_incarnations() {
+        let now = Instant::now();
+        let mut store = Store::empty();
+        for source in ["b", "a"] {
+            store
+                .register(id(source), vec![a(1, ActivityState::Working)], now)
+                .unwrap();
+        }
+        let opened = store.open(&[open_request("a")]).unwrap();
+        let rows = store.live_targets();
+        assert_eq!(rows[0].selection.source, "a");
+        assert_eq!(rows[0].claimed_by.as_deref(), Some(opened[0].as_str()));
+        assert!(rows[0].incarnation > rows[1].incarnation);
+        assert!(rows[1].claimed_by.is_none());
+        update(&mut store, "a", a(2, ActivityState::Failed), now).unwrap();
+        assert_eq!(store.live_targets()[0].incarnation, rows[0].incarnation);
+        store.disconnect(&id("a"));
+        assert_eq!(store.live_targets().len(), 1);
+        assert_eq!(
+            store.owner(&FocusTarget::from(&rows[0].selection)),
+            Some(opened[0].as_str())
+        );
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let reconnected = store.live_targets();
+        assert!(reconnected[0].incarnation > rows[0].incarnation);
+        assert_eq!(reconnected[0].claimed_by, rows[0].claimed_by);
+        store.expire(now + SOURCE_TIMEOUT);
+        store
+            .register(
+                id("a"),
+                vec![a(1, ActivityState::Working)],
+                now + SOURCE_TIMEOUT,
+            )
+            .unwrap();
+        assert!(store.live_targets()[0].incarnation > reconnected[0].incarnation);
+    }
+
+    #[test]
+    fn attachment_and_registration_overflow_fail_before_any_mutation() {
+        let now = Instant::now();
+        let mut store = Store::empty();
+        for source in ["a", "b", "c", "d"] {
+            store
+                .register(id(source), vec![a(1, ActivityState::Working)], now)
+                .unwrap();
+        }
+        let ids = store.open(&[open_request("a"), open_request("b")]).unwrap();
+        assert!(
+            store
+                .presentations(now)
+                .iter()
+                .all(|v| v.runtime_binding.generation == 1)
+        );
+        for preference_overflow in [false, true] {
+            let f = store.familiars.get_mut(&ids[1]).unwrap();
+            f.generation = if preference_overflow { u64::MAX } else { 1 };
+            f.attachment_generation = if preference_overflow { 1 } else { u64::MAX };
+            let before = store.presentations(now);
+            assert!(
+                store
+                    .attach(&[
+                        AttachRequest {
+                            id: ids[0].clone(),
+                            target: target("c")
+                        },
+                        AttachRequest {
+                            id: ids[1].clone(),
+                            target: target("d")
+                        },
+                    ])
+                    .is_err()
+            );
+            assert!(store.focus_for(&ids[1], "d", None, "task").is_err());
+            assert!(store.cycle_for(&ids[1]).is_err());
+            assert_eq!(store.presentations(now), before);
+        }
+        store.source_epoch = u64::MAX;
+        let rows = store.live_targets();
+        assert!(
+            store
+                .register(id("e"), vec![a(1, ActivityState::Working)], now)
+                .is_err()
+        );
+        assert_eq!(store.live_targets(), rows);
+
+        let mut bootstrap = Store::default();
+        bootstrap
+            .familiars
+            .get_mut("main")
+            .unwrap()
+            .attachment_generation = u64::MAX;
+        assert!(
+            bootstrap
+                .register(id("a"), vec![a(1, ActivityState::Working)], now)
+                .is_err()
+        );
+        assert_eq!(bootstrap.source_count(), 0);
+        assert_eq!(bootstrap.source_epoch, 0);
+        bootstrap.register(id("a"), vec![], now).unwrap();
+        assert!(update(&mut bootstrap, "a", a(1, ActivityState::Working), now).is_err());
+        assert!(bootstrap.live_targets().is_empty());
+        assert_eq!(bootstrap.sources[&id("a")].seen, now);
+    }
+
+    #[test]
+    fn bootstrap_loads_once_and_producer_reconnect_never_reloads_or_rebinds() {
+        let now = Instant::now();
+        let saved = FamiliarSettings {
+            font_size: 26.0,
+            ..Default::default()
+        };
+        let mut store = Store::default();
+        store.enable_preferences(
+            preferences::Document {
+                version: 1,
+                records: vec![preferences::Record {
+                    source: "a".into(),
+                    activity: "task".into(),
+                    settings: saved,
+                    placement: None,
+                }],
+            },
+            true,
+        );
+        assert!(store.presentations(now)[0].preference.is_none());
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let initial = store.presentations(now).remove(0);
+        assert_eq!(initial.settings, saved);
+        let binding = initial.preference.unwrap().binding;
+        store
+            .settings(
+                &["main".into()],
+                SettingsPatch {
+                    font_size: Some(18.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let revision = store.preference_revision();
+        store
+            .settings(
+                &["main".into()],
+                SettingsPatch {
+                    font_size: Some(18.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.preference_revision(), revision);
+        store.disconnect(&id("a"));
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let view = store.presentations(now).remove(0);
+        assert_eq!(view.settings.font_size, 18.0);
+        assert_eq!(view.preference.unwrap().binding, binding);
+        assert_eq!(store.preference_revision(), revision);
+        store.set_preferences_writable(false);
+        store
+            .settings(
+                &["main".into()],
+                SettingsPatch {
+                    font_size: Some(22.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.presentations(now)[0].settings.font_size, 22.0);
+        assert_eq!(store.preference_revision(), revision);
+    }
+
+    #[test]
+    fn preferences_restore_only_explicit_opens_across_instances_and_restarts() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        assert!(store.presentations(now).is_empty());
+        let ids = store.open(&[open_request("a")]).unwrap();
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let binding = store.presentations(now)[0]
+            .preference
+            .clone()
+            .unwrap()
+            .binding;
+        let placement = preferences::Placement {
+            x: -500.0,
+            y: 300.0,
+        };
+        store.placement(&ids[0], &binding, 1, placement).unwrap();
+        let (revision, document) = store.preference_document().unwrap();
+        store.close(&ids).unwrap();
+        assert_eq!(store.preference_revision(), revision);
+        let mut restarted = Store::with_settings(false, FamiliarSettings::default());
+        restarted.enable_preferences(document, false);
+        restarted
+            .register(
+                ("a".into(), "new-instance".into()),
+                vec![a(1, ActivityState::Working)],
+                now,
+            )
+            .unwrap();
+        assert!(restarted.presentations(now).is_empty());
+        assert_eq!(restarted.preference_revision(), 0);
+        restarted.open(&[open_request("a")]).unwrap();
+        let view = restarted.presentations(now).remove(0);
+        assert_eq!(view.settings.font_size, 24.0);
+        let preference = view.preference.unwrap();
+        assert_eq!(preference.placement, Some(placement));
+        assert!(!preference.writable);
+        assert_eq!(preference.binding.target.instance, "new-instance");
+        assert!(restarted.forget_preferences(&[view.id]).is_err());
+    }
+
+    #[test]
+    fn retarget_preserves_live_style_and_placement_and_rejects_stale_drags() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        for source in ["a", "b"] {
+            store
+                .register(id(source), vec![a(1, ActivityState::Working)], now)
+                .unwrap();
+        }
+        let ids = store.open(&[open_request("a")]).unwrap();
+        let id = &ids[0];
+        let first = store.presentations(now)[0]
+            .preference
+            .clone()
+            .unwrap()
+            .binding;
+        let placement = preferences::Placement { x: 100.0, y: 200.0 };
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(22.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.placement(id, &first, 2, placement).unwrap();
+        assert!(store.placement(id, &first, 2, placement).is_err());
+        assert!(store.placement(id, &first, 1, placement).is_err());
+        store
+            .attach(&[AttachRequest {
+                id: id.clone(),
+                target: target("b"),
+            }])
+            .unwrap();
+        let view = store.presentations(now).remove(0);
+        assert_eq!(view.settings.font_size, 22.0);
+        assert_eq!(view.preference.as_ref().unwrap().placement, Some(placement));
+        assert!(store.placement(id, &first, 3, placement).is_err());
+        store
+            .attach(&[AttachRequest {
+                id: id.clone(),
+                target: target("a"),
+            }])
+            .unwrap();
+        assert!(store.placement(id, &first, 4, placement).is_err());
+        let binding = store.presentations(now)[0]
+            .preference
+            .clone()
+            .unwrap()
+            .binding;
+        let revision = store.preference_revision();
+        update(&mut store, "a", a(2, ActivityState::Working), now).unwrap();
+        assert_eq!(
+            store.presentations(now)[0]
+                .preference
+                .as_ref()
+                .unwrap()
+                .binding,
+            binding
+        );
+        assert_eq!(store.preference_revision(), revision);
+        store.placement(id, &binding, 1, placement).unwrap();
+        assert_eq!(store.preferences.as_ref().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn shared_logical_key_last_edit_wins_and_forget_never_changes_live_views() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        for instance in ["one", "two"] {
+            store
+                .register(
+                    ("a".into(), instance.into()),
+                    vec![a(1, ActivityState::Working)],
+                    now,
+                )
+                .unwrap();
+        }
+        let requests: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|instance| {
+                let mut request = open_request("a");
+                request.target.instance = Some(instance.into());
+                request
+            })
+            .collect();
+        let ids = store.open(&requests).unwrap();
+        store
+            .settings(
+                &ids[..1],
+                SettingsPatch {
+                    font_size: Some(18.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .settings(
+                &ids[1..],
+                SettingsPatch {
+                    font_size: Some(28.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.preferences.as_ref().unwrap().records.len(), 1);
+        assert_eq!(
+            store.preferences.as_ref().unwrap().records[0]
+                .settings
+                .font_size,
+            28.0
+        );
+        let before = store.presentations(now);
+        assert_eq!(before[0].settings.font_size, 18.0);
+        assert!(
+            store
+                .forget_preferences(&[ids[0].clone(), "missing".into()])
+                .is_err()
+        );
+        store.forget_preferences(&ids).unwrap();
+        let revision = store.preference_revision();
+        let after = store.presentations(now);
+        for (before, after) in before.iter().zip(&after) {
+            assert_eq!(before.runtime_binding, after.runtime_binding);
+            assert_eq!(before.settings, after.settings);
+            assert_eq!(before.presentation, after.presentation);
+            assert_eq!(
+                after.preference.as_ref().unwrap().binding.generation,
+                before.preference.as_ref().unwrap().binding.generation + 1
+            );
+        }
+        store
+            .apply(&("a".into(), "one".into()), Event::Heartbeat, now)
+            .unwrap();
+        assert!(store.preferences.as_ref().unwrap().records.is_empty());
+        assert_eq!(store.preference_revision(), revision);
+        store
+            .settings(
+                &ids[..1],
+                SettingsPatch {
+                    font_size: Some(18.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.preferences.as_ref().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn preference_capacity_declines_only_memory_and_existing_keys_remain_editable() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        store.preferences.as_mut().unwrap().records = (0..128)
+            .map(|n| preferences::Record {
+                source: format!("source-{n}"),
+                activity: "task".into(),
+                settings: FamiliarSettings::default(),
+                placement: None,
+            })
+            .collect();
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let ids = store.open(&[open_request("a")]).unwrap();
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.presentations(now)[0].settings.font_size, 24.0);
+        assert_eq!(store.preference_revision(), 0);
+        assert!(store.take_preference_capacity());
+        store
+            .register(id("source-0"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        store.focus_for(&ids[0], "source-0", None, "task").unwrap();
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(26.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.preference_revision(), 1);
+        assert_eq!(store.preferences.as_ref().unwrap().records.len(), 128);
+    }
+
+    #[test]
+    fn forget_revokes_every_shared_key_binding_even_without_a_saved_record() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        for (source, instance) in [("a", "one"), ("a", "two"), ("b", "one")] {
+            store
+                .register(
+                    (source.into(), instance.into()),
+                    vec![a(1, ActivityState::Working)],
+                    now,
+                )
+                .unwrap();
+        }
+        let requests: Vec<_> = [("a", "one"), ("a", "two"), ("b", "one")]
+            .into_iter()
+            .map(|(source, instance)| {
+                let mut request = open_request(source);
+                request.target.instance = Some(instance.into());
+                request
+            })
+            .collect();
+        let ids = store.open(&requests).unwrap();
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let placement = preferences::Placement { x: 100.0, y: 200.0 };
+        let bindings: Vec<_> = store
+            .presentations(now)
+            .iter()
+            .map(|v| v.preference.as_ref().unwrap().binding.clone())
+            .collect();
+        for (id, binding) in ids.iter().zip(&bindings) {
+            store.placement(id, binding, 5, placement).unwrap();
+        }
+        for absent in [false, true] {
+            let before = store.presentations(now);
+            let revision = store.preference_revision();
+            store.forget_preferences(&ids[..1]).unwrap();
+            let after = store.presentations(now);
+            for index in 0..2 {
+                assert_eq!(after[index].settings, before[index].settings);
+                assert_eq!(after[index].presentation, before[index].presentation);
+                let old = &before[index].preference.as_ref().unwrap().binding;
+                let new = after[index].preference.as_ref().unwrap();
+                assert_eq!(new.binding.target, old.target);
+                assert_eq!(new.binding.generation, old.generation + 1);
+                assert_eq!(new.placement, None);
+                assert_eq!(store.familiars[&ids[index]].drag_sequence, 0);
+                assert!(store.placement(&ids[index], old, 6, placement).is_err());
+            }
+            assert_eq!(after[2], before[2]);
+            assert_eq!(store.preference_revision(), revision + u64::from(!absent));
+            let records = &store.preferences.as_ref().unwrap().records;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].source, "b");
+            assert_eq!(records[0].placement, Some(placement));
+        }
+    }
+
+    #[test]
+    fn forget_prevalidates_all_epoch_and_revision_overflows_before_mutation() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        for source in ["a", "b"] {
+            store
+                .register(id(source), vec![a(1, ActivityState::Working)], now)
+                .unwrap();
+        }
+        let ids = store.open(&[open_request("a"), open_request("b")]).unwrap();
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for revision_overflow in [false, true] {
+            store.familiars.get_mut(&ids[1]).unwrap().generation =
+                if revision_overflow { 1 } else { u64::MAX };
+            store.preference_revision = if revision_overflow { u64::MAX } else { 1 };
+            let before = store.presentations(now);
+            let document = store.preferences.as_ref().unwrap().encode().unwrap();
+            let revision = store.preference_revision();
+            assert!(store.forget_preferences(&ids).is_err());
+            assert_eq!(store.presentations(now), before);
+            assert_eq!(
+                store.preferences.as_ref().unwrap().encode().unwrap(),
+                document
+            );
+            assert_eq!(store.preference_revision(), revision);
+        }
+    }
 
     #[test]
     fn immutable_counts_include_unavailable_familiars_and_empty_registered_sources() {
@@ -902,6 +1900,7 @@ mod tests {
             serde_json::json!({"type":"familiar.close","ids":["main"]}),
             serde_json::json!({"type":"familiar.go-to-mouse","ids":["main"]}),
             serde_json::json!({"type":"familiar.settings","ids":["main"],"patch":{"font_size":16}}),
+            serde_json::json!({"type":"familiar.preferences.forget","ids":["main"]}),
         ] {
             let mut packet = kind;
             packet["version"] = 1.into();
@@ -1259,6 +2258,7 @@ mod tests {
     fn capacity_and_four_row_pages_fit_worst_case_acknowledgments() {
         let now = Instant::now();
         let mut s = Store::default();
+        s.enable_preferences(preferences::Document::default(), true);
         let source = "s".repeat(96);
         let instance = "i".repeat(96);
         let activities: Vec<_> = (0..17)
@@ -1317,7 +2317,8 @@ mod tests {
                             "attach",
                             "close",
                             "go-to-mouse",
-                            "settings"
+                            "settings",
+                            "preferences"
                         ]);
                     }
                 }

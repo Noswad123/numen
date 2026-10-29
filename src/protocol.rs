@@ -323,6 +323,8 @@ pub enum Event {
         ids: Vec<String>,
         patch: SettingsPatch,
     },
+    #[serde(rename = "familiar.preferences.forget")]
+    ForgetPreferences { ids: Vec<String> },
 }
 
 impl Request {
@@ -371,7 +373,9 @@ impl Request {
                 validate_ids(ids)?;
                 patch.validate()?;
             }
-            Event::Close { ids } | Event::GoToMouse { ids } => validate_ids(ids)?,
+            Event::Close { ids } | Event::GoToMouse { ids } | Event::ForgetPreferences { ids } => {
+                validate_ids(ids)?
+            }
             Event::Open { items } => {
                 ensure!(
                     (1..=MAX_FAMILIARS).contains(&items.len()),
@@ -429,6 +433,34 @@ fn validate_snapshot(activities: &[Activity]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forget_preferences_validates_unique_bounded_ids() {
+        for ids in [
+            serde_json::json!(["main"]),
+            serde_json::json!((0..16).map(|n| format!("f{n}")).collect::<Vec<_>>()),
+        ] {
+            let packet =
+                serde_json::json!({"version":1,"type":"familiar.preferences.forget","ids":ids});
+            assert!(matches!(
+                Request::parse(&serde_json::to_vec(&packet).unwrap())
+                    .unwrap()
+                    .event,
+                Event::ForgetPreferences { .. }
+            ));
+        }
+        for ids in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(["main", "main"]),
+            serde_json::json!(["bad/id"]),
+            serde_json::json!((0..17).map(|n| format!("f{n}")).collect::<Vec<_>>()),
+        ] {
+            let packet =
+                serde_json::json!({"version":1,"type":"familiar.preferences.forget","ids":ids});
+            assert!(Request::parse(&serde_json::to_vec(&packet).unwrap()).is_err());
+        }
+    }
 
     #[test]
     fn settings_patch_rejects_null_unknown_empty_and_invalid_bounds() {

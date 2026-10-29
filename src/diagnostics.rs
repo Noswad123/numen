@@ -22,6 +22,8 @@ pub struct Snapshot {
     pub executable: Option<String>,
     pub build: BuildInfo,
     pub hotkeys: Hotkeys,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferences: Option<crate::preferences::Status>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,11 +109,19 @@ impl Snapshot {
                 option_i: status,
                 option_m: status,
             },
+            preferences: Some(crate::preferences::Status::disabled()),
         }
     }
 }
 
 impl RuntimeDiagnostics {
+    pub fn set_preferences_status(&self, status: crate::preferences::Status) {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .preferences = Some(status);
+    }
+
     pub fn new(graphical: bool) -> Self {
         Self {
             snapshot: Arc::new(Mutex::new(Snapshot::new(graphical))),

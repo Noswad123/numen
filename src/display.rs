@@ -182,6 +182,11 @@ mod tests {
             id: "main".into(),
             preset: "djinn".into(),
             settings: crate::protocol::FamiliarSettings::default(),
+            runtime_binding: crate::activity::AttachmentBinding {
+                target: None,
+                generation: 1,
+            },
+            preference: None,
             presentation: Presentation::default(),
         }]));
         assert!(!mailbox.post(vec![]));
@@ -197,6 +202,11 @@ mod tests {
             id: "new".into(),
             preset: "djinn".into(),
             settings: FamiliarSettings::default(),
+            runtime_binding: crate::activity::AttachmentBinding {
+                target: None,
+                generation: 1,
+            },
+            preference: None,
             presentation: Presentation::default(),
         };
         assert!(mailbox.post(vec![view.clone()]));
