@@ -27,13 +27,14 @@ pub enum Action {
     Settings(SettingsPatch),
     ForgetPreferences,
     Attach(usize),
+    OpenFamiliar,
     CloseFamiliar,
     QuitNumen,
 }
 
 impl Action {
     pub fn is_service(self) -> bool {
-        matches!(self, Self::QuitNumen)
+        matches!(self, Self::OpenFamiliar | Self::QuitNumen)
     }
 }
 
@@ -44,6 +45,7 @@ pub struct Context {
     pub settings: Option<FamiliarSettings>,
     pub preferences: bool,
     pub attachments: Option<AttachmentContext>,
+    pub open_familiar: Option<bool>,
 }
 
 /// The only menu catalog: add future controls here, not in the native renderer.
@@ -147,6 +149,15 @@ pub fn entries(context: Context) -> Vec<Entry> {
     }
     if let Some(attachments) = context.attachments {
         entries.push(attachment_entries(attachments));
+    }
+    if let Some(enabled) = context.open_familiar {
+        entries.push(Entry::Item {
+            label: "Open another familiar".into(),
+            action: Some(Action::OpenFamiliar),
+            enabled,
+            checked: false,
+            tooltip: None,
+        });
     }
     entries.extend([
         Entry::Separator,
@@ -279,9 +290,9 @@ fn attachment_entries(context: AttachmentContext) -> Entry {
     }
     Entry::Submenu {
         label: if context.current.is_some() {
-            "Change chat"
+            "Change attachment"
         } else {
-            "Attach to chat"
+            "Attach to app / chat"
         }
         .into(),
         entries: rows,
@@ -694,6 +705,7 @@ mod tests {
             settings,
             preferences: false,
             attachments: None,
+            open_familiar: None,
         }
     }
 
@@ -724,7 +736,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(label, "Change chat");
+        assert_eq!(label, "Change attachment");
         assert_eq!(pages.len(), 32);
         let mut labels = std::collections::BTreeSet::new();
         let mut indices = Vec::new();
@@ -809,11 +821,9 @@ mod tests {
             choices: vec![chat(0)],
         });
         let catalog = entries(context);
-        assert!(
-            catalog.iter().any(
-                |row| matches!(row, Entry::Submenu { label, .. } if label == "Attach to chat")
-            )
-        );
+        assert!(catalog.iter().any(
+            |row| matches!(row, Entry::Submenu { label, .. } if label == "Attach to app / chat")
+        ));
         assert!(!catalog.iter().any(|row| matches!(
             row,
             Entry::Item {
@@ -821,11 +831,9 @@ mod tests {
                 ..
             }
         )));
-        assert!(
-            !entries(self::context(None)).iter().any(
-                |row| matches!(row, Entry::Submenu { label, .. } if label == "Attach to chat")
-            )
-        );
+        assert!(!entries(self::context(None)).iter().any(
+            |row| matches!(row, Entry::Submenu { label, .. } if label == "Attach to app / chat")
+        ));
     }
 
     #[test]
@@ -891,6 +899,49 @@ mod tests {
     }
 
     #[test]
+    fn open_familiar_is_optional_capacity_gated_and_separate_from_quit() {
+        for available in [None, Some(false), Some(true)] {
+            let mut context = context(None);
+            context.open_familiar = available;
+            let catalog = entries(context);
+            let open = catalog.iter().position(|entry| {
+                matches!(
+                    entry,
+                    Entry::Item {
+                        action: Some(Action::OpenFamiliar),
+                        ..
+                    }
+                )
+            });
+            match available {
+                None => assert!(open.is_none()),
+                Some(enabled) => {
+                    let index = open.unwrap();
+                    assert!(matches!(&catalog[index], Entry::Item {
+                        label, enabled: actual, checked: false, ..
+                    } if label == "Open another familiar" && *actual == enabled));
+                    assert_eq!(catalog[index + 1], Entry::Separator);
+                    // Native rendering must not assign a selector to the full-capacity row.
+                    assert_eq!(
+                        action_for_tag(&[Some(Action::OpenFamiliar).filter(|_| enabled)], 1),
+                        enabled.then_some(Action::OpenFamiliar)
+                    );
+                }
+            }
+            assert!(matches!(
+                catalog.last(),
+                Some(Entry::Item {
+                    action: Some(Action::QuitNumen),
+                    enabled: true,
+                    ..
+                })
+            ));
+        }
+        assert!(Action::OpenFamiliar.is_service());
+        assert_ne!(Action::OpenFamiliar, Action::QuitNumen);
+    }
+
+    #[test]
     fn catalog_capabilities_pause_and_distinct_scopes() {
         let catalog = entries(Context {
             paused: true,
@@ -899,6 +950,7 @@ mod tests {
             settings: None,
             preferences: false,
             attachments: None,
+            open_familiar: None,
         });
         assert!(matches!(
             &catalog[0],
@@ -928,6 +980,7 @@ mod tests {
             matches!(&catalog[6], Entry::Item { label, action: Some(Action::QuitNumen), .. } if label == "Quit Numen (all familiars)")
         );
         assert!(Action::QuitNumen.is_service());
+        assert!(Action::OpenFamiliar.is_service());
         for action in [
             Action::CloseFamiliar,
             Action::RevealStatus,

@@ -28,6 +28,8 @@ pub struct ServiceInfo {
     pub graphical: bool,
     pub lifecycle: bool,
     pub navigation: bool,
+    #[serde(default)]
+    pub unattached_open: bool,
 }
 
 fn absent(error: &anyhow::Error) -> bool {
@@ -269,9 +271,34 @@ mod tests {
             assert_eq!(ready.pid, 123);
             assert_eq!(ready.service_instance, "test-service-1");
             assert_eq!(ready.navigation, navigation);
+            assert!(!ready.unattached_open);
             server.join().unwrap();
             assert!(!socket.with_file_name("service.log").exists());
         }
+    }
+
+    #[test]
+    fn offline_bootstrap_uses_fake_owned_child_and_private_fixture() {
+        let (dir, socket) = fixture();
+        let executable = dir.path().join("fake-numen");
+        fs::write(&executable, b"#!/bin/sh\nexec /bin/sleep 0.3\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let service_path = socket.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !service_path.with_file_name("service.log").exists() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            let mut data = metadata();
+            data["unattached_open"] = true.into();
+            mock(&service_path, data).join().unwrap();
+        });
+        let info = ensure_with(&socket, || Ok(executable), Duration::from_secs(2)).unwrap();
+        assert!(info.unattached_open);
+        assert_eq!(info.service_instance, "test-service-1");
+        server.join().unwrap();
+        assert!(dir.path().join("service.log").exists());
     }
 
     #[test]

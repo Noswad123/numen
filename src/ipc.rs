@@ -61,6 +61,7 @@ struct WorkerConfig {
     defaults: FamiliarSettings,
     targeted: TargetedControls,
     bootstrap_main: bool,
+    auto_select_main: bool,
     service_instance: String,
 }
 
@@ -378,6 +379,9 @@ fn publish_target_memo(
 
 #[derive(Debug)]
 enum FamiliarCommand {
+    OpenUnattached {
+        preset: String,
+    },
     Attach {
         id: String,
         expected: RuntimeBinding,
@@ -409,6 +413,17 @@ pub struct FamiliarControl {
 }
 
 impl FamiliarControl {
+    /// Queue acceptance only; registry snapshots report committed opens.
+    pub fn open_unattached(&self, preset: &str) -> Result<()> {
+        protocol::validate_id(preset)?;
+        ensure!(preset == "djinn", "unknown preset");
+        self.sender
+            .try_send(FamiliarCommand::OpenUnattached {
+                preset: preset.into(),
+            })
+            .context("queue unattached familiar open")
+    }
+
     pub fn target_snapshot(&self, id: &str) -> Result<FamiliarTargetSnapshot> {
         protocol::validate_id(id)?;
         let memo = {
@@ -761,6 +776,7 @@ impl Server {
             bootstrap_main,
             settings,
             None,
+            true,
         )
     }
 
@@ -776,6 +792,8 @@ impl Server {
         preferences_path: Option<PathBuf>,
     ) -> Result<Self> {
         let disabled = preferences_path.is_none();
+        // Production graphical windows attach only through an explicit choice,
+        // including when preference persistence is disabled.
         let server = Self::start_inner_with_preferences(
             path,
             |_| {},
@@ -789,6 +807,7 @@ impl Server {
             bootstrap_main,
             Some(settings),
             preferences_path,
+            false,
         )?;
         if disabled {
             server
@@ -808,6 +827,7 @@ impl Server {
         bootstrap_main: bool,
         settings: Option<FamiliarSettings>,
         preferences_path: Option<PathBuf>,
+        auto_select_main: bool,
     ) -> Result<Self> {
         let defaults = settings.unwrap_or_default();
         defaults.validate()?;
@@ -874,6 +894,7 @@ impl Server {
                         defaults,
                         targeted,
                         bootstrap_main,
+                        auto_select_main,
                         service_instance,
                     },
                 )
@@ -1025,6 +1046,7 @@ impl Client {
                             "pid": std::process::id(),
                             "graphical": multi,
                             "lifecycle": multi,
+                            "unattached_open": multi,
                             "navigation": targeted.go_to_mouse.is_some(),
                             "settings": multi && controls.settings_support,
                             "preferences": multi && store.preferences_writable(),
@@ -1224,6 +1246,7 @@ fn run(
         defaults,
         targeted,
         bootstrap_main,
+        auto_select_main,
         service_instance,
     } = config;
     let controls = ControlContext {
@@ -1234,6 +1257,7 @@ fn run(
         service_instance,
     };
     let mut store = Store::with_settings(bootstrap_main, defaults);
+    store.set_auto_select_main(auto_select_main);
     let writer = preferences.map(|(document, writer)| {
         store.enable_preferences(document, writer.can_write());
         writer
@@ -1410,6 +1434,16 @@ fn apply_familiar_command(
     controls: &ControlContext,
 ) -> Result<()> {
     match command {
+        FamiliarCommand::OpenUnattached { preset } => {
+            ensure!(controls.multi, "no graphical familiar");
+            store
+                .open(&[protocol::OpenRequest {
+                    id: None,
+                    preset,
+                    target: None,
+                }])
+                .map(|_| ())
+        }
         FamiliarCommand::Attach {
             id,
             expected,
@@ -1587,10 +1621,15 @@ impl<'de> Deserialize<'de> for UniqueValue {
     }
 }
 
+pub(crate) fn parse_unique_json(bytes: &[u8]) -> Result<serde_json::Value> {
+    ensure!(bytes.len() <= MAX_LINE, "JSON exceeds 8 KiB");
+    let UniqueValue(value) = serde_json::from_slice(bytes)?;
+    Ok(value)
+}
+
 fn parse_ack(response: &[u8]) -> Result<Ack> {
     ensure!(response.len() <= MAX_LINE, "oversized Numen acknowledgment");
-    let UniqueValue(value) =
-        serde_json::from_slice(response).context("invalid Numen acknowledgment")?;
+    let value = parse_unique_json(response).context("invalid Numen acknowledgment")?;
     serde_json::from_value(value).context("invalid Numen acknowledgment")
 }
 
@@ -1753,6 +1792,128 @@ mod tests {
         (dir, path)
     }
 
+    #[test]
+    fn unattached_queue_is_nonblocking_validated_and_preserves_close() {
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let control = FamiliarControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
+        for preset in ["", "bad/id", "unknown"] {
+            assert!(control.open_unattached(preset).is_err());
+        }
+        assert!(receiver.try_recv().is_err());
+        control.close("main").unwrap();
+        for _ in 0..31 {
+            control.open_unattached("djinn").unwrap();
+        }
+        let start = Instant::now();
+        assert!(control.open_unattached("djinn").is_err());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(matches!(receiver.try_recv().unwrap(), FamiliarCommand::Close(id) if id == "main"));
+        for _ in 0..31 {
+            assert!(
+                matches!(receiver.try_recv().unwrap(), FamiliarCommand::OpenUnattached { preset } if preset == "djinn")
+            );
+        }
+        drop(receiver);
+        assert!(control.open_unattached("djinn").is_err());
+    }
+
+    #[test]
+    fn unattached_worker_is_service_scoped_atomic_at_capacity_and_headless_rejected() {
+        let (mut store, mut controls) = picker_store();
+        let command = || FamiliarCommand::OpenUnattached {
+            preset: "djinn".into(),
+        };
+        controls.multi = false;
+        let before = store.list(0);
+        assert!(apply_familiar_command(&mut store, command(), &controls).is_err());
+        assert_eq!(store.list(0), before);
+        controls.multi = true;
+        // The window from which a menu was opened need not survive queueing.
+        store.close(&["main".into()]).unwrap();
+        for _ in 0..16 {
+            apply_familiar_command(&mut store, command(), &controls).unwrap();
+        }
+        let before = store.presentations(Instant::now());
+        assert!(apply_familiar_command(&mut store, command(), &controls).is_err());
+        assert_eq!(store.presentations(Instant::now()), before);
+        assert!(before.iter().all(|v| v.runtime_binding.target.is_none()));
+        assert!(store.live_targets().iter().all(|t| t.claimed_by.is_none()));
+        assert_eq!(store.source_count(), 1);
+    }
+
+    #[test]
+    fn production_graphical_main_is_manual_even_without_preferences() {
+        for with_preferences in [false, true] {
+            let (dir, path) = fixture();
+            let (sender, receiver) = mpsc::channel();
+            let server = Server::start_graphical_with_preferences(
+                &path,
+                move |views| {
+                    sender.send(views).unwrap();
+                },
+                |_| {},
+                None,
+                || {},
+                true,
+                FamiliarSettings::default(),
+                with_preferences.then(|| dir.path().join("preferences.json")),
+            )
+            .unwrap();
+            let initial = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(initial[0].runtime_binding.target.is_none());
+            let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+            producer
+                .update("task", 1, ActivityState::Working, false, None)
+                .unwrap();
+            let info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+            assert_eq!(info["unattached_open"], true);
+            assert!(serde_json::to_vec(&info).unwrap().len() < MAX_LINE);
+            let snapshot = server.familiar_control().target_snapshot("main").unwrap();
+            assert!(snapshot.binding.attachment.target.is_none());
+            assert_eq!(snapshot.targets.len(), 1);
+            assert!(snapshot.targets[0].claimed_by.is_none());
+            assert!(receiver.try_recv().is_err());
+            server.familiar_control().open_unattached("djinn").unwrap();
+            let views = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(views.len(), 2);
+            assert!(
+                views
+                    .iter()
+                    .all(|v| v.runtime_binding.target.is_none() && v.preference.is_none())
+            );
+            drop(producer);
+            drop(server);
+        }
+        let (_dir, path) = fixture();
+        let server = Server::start(&path, |_| {}).unwrap();
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        producer
+            .update("task", 1, ActivityState::Working, false, None)
+            .unwrap();
+        let info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+        assert_eq!(info["unattached_open"], false);
+        assert!(
+            server
+                .familiar_control()
+                .target_snapshot("main")
+                .unwrap()
+                .binding
+                .attachment
+                .target
+                .is_some()
+        );
+        assert!(
+            control(
+                &path,
+                json!({"version":1,"type":"familiar.open","items":[{}]})
+            )
+            .is_err()
+        );
+    }
+
     fn picker_store() -> (Store, ControlContext) {
         let mut store = Store::default();
         store
@@ -1812,11 +1973,11 @@ mod tests {
                     .map(|index| protocol::OpenRequest {
                         id: Some(format!("picker-{index:02}")),
                         preset: "djinn".into(),
-                        target: protocol::TargetRequest {
+                        target: Some(protocol::TargetRequest {
                             source: "source-00".into(),
                             instance: Some("one".into()),
                             activity: format!("task-{index:02}"),
-                        },
+                        }),
                     })
                     .collect::<Vec<_>>(),
             )
@@ -2010,11 +2171,11 @@ mod tests {
                         .open(&[protocol::OpenRequest {
                             id: Some("other".into()),
                             preset: "djinn".into(),
-                            target: protocol::TargetRequest {
+                            target: Some(protocol::TargetRequest {
                                 source: "test".into(),
                                 instance: Some("one".into()),
                                 activity: "b".into(),
-                            },
+                            }),
                         }])
                         .unwrap();
                 }
@@ -3367,7 +3528,7 @@ mod tests {
             protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
             assert_eq!(
                 info,
-                json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"preferences":false,"familiar_count":usize::from(bootstrap_main),"source_count":0,"diagnostics":_server.diagnostics().snapshot()})
+                json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":true,"lifecycle":true,"unattached_open":true,"navigation":false,"settings":false,"preferences":false,"familiar_count":usize::from(bootstrap_main),"source_count":0,"diagnostics":_server.diagnostics().snapshot()})
             );
             let mut peer = Publisher {
                 stream: connect_private(&path).unwrap(),
@@ -3679,7 +3840,7 @@ mod tests {
             let request = json!({"version":1,"type":"companion.service"});
             let info = control(&path, request.clone()).unwrap();
             protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
-            let mut expected = json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":mode >= 2,"lifecycle":mode >= 2,"navigation":mode == 3,"settings":false,"preferences":false,"familiar_count":1,"source_count":0,"diagnostics":_server.diagnostics().snapshot()});
+            let mut expected = json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":mode >= 2,"lifecycle":mode >= 2,"unattached_open":mode >= 2,"navigation":mode == 3,"settings":false,"preferences":false,"familiar_count":1,"source_count":0,"diagnostics":_server.diagnostics().snapshot()});
             assert_eq!(info, expected);
             let mut peer = Publisher {
                 stream: connect_private(&path).unwrap(),
@@ -3863,7 +4024,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&response).unwrap(),
-            json!({"version":1,"ok":true,"data":{"api_version":1,"service_instance":"test-service","pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"preferences":false,"familiar_count":1,"source_count":1,"diagnostics":RuntimeDiagnostics::new(true).snapshot()}})
+            json!({"version":1,"ok":true,"data":{"api_version":1,"service_instance":"test-service","pid":std::process::id(),"graphical":true,"lifecycle":true,"unattached_open":true,"navigation":false,"settings":false,"preferences":false,"familiar_count":1,"source_count":1,"diagnostics":RuntimeDiagnostics::new(true).snapshot()}})
         );
         assert_eq!(client.source, Some(id.clone()));
         assert_eq!(store.presentations(now), before);
@@ -5004,6 +5165,33 @@ mod tests {
             None
         ));
         assert!(!client.step(&mut store, now + REGISTER_TIMEOUT, &mut |_, _| {}, None));
+    }
+
+    #[test]
+    fn strict_json_rejects_batch_duplicates_without_echoing_peer_text() {
+        for bytes in [
+            r#"[{"source":null,"source":"secret-peer-value"}]"#,
+            r#"[{"id":null,"id":"secret-peer-value"}]"#,
+            r#"[{"future":{"secret-peer-key":0,"secret-peer-key":1}}]"#,
+            r#"[{"future":[{"key":0,"k\u0065y":1}]}]"#,
+        ] {
+            let error = parse_unique_json(bytes.as_bytes()).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("duplicate JSON object key"));
+            assert!(!message.contains("secret-peer-value"));
+            assert!(!message.contains("secret-peer-key"));
+        }
+        let rows = br#"[{"source":"a","id":null},{"source":"b","id":"x"}]"#;
+        assert_eq!(
+            parse_unique_json(rows).unwrap(),
+            json!([{"source":"a","id":null},{"source":"b","id":"x"}])
+        );
+        let mut bounded = rows.to_vec();
+        bounded.resize(MAX_LINE, b' ');
+        assert!(parse_unique_json(&bounded).is_ok());
+        bounded.push(b' ');
+        assert!(parse_unique_json(&bounded).is_err());
+        assert!(parse_unique_json(b"[] []").is_err());
     }
 
     #[test]

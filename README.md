@@ -9,6 +9,16 @@ Numen means divine power or presence: an unseen, animating presence in the machi
 
 ## Overview
 
+### Unattached-first workflow (current)
+
+Run **`numen`** to open **one unattached familiar**. It reuses the current graphical service or performs bounded detached `run --empty` bootstrap, then sends a `service_instance`-sealed Open after checking `unattached_open`. Repeating `numen` opens independent unattached familiars in the same service, up to **16 total**. `numen run` remains the foreground service with an unattached `main`; `run --empty` starts with zero views.
+
+Click a familiar to **Attach to app / chat** (a supported live protocol app/chat), or choose **Open another familiar** to create another unattached view. No OS process scan, dummy PID/source, application launch or source execution is involved. Production graphical Main and newly opened unbound views **never auto-attach** on registration, state, reconnect or expiry. Existing exact bound pins retain their reconnect/availability behavior. Legacy headless/test constructors alone retain the compatibility first-selection rule.
+
+Default fzf preset **Open** is immediate and unattached, with no target picker. **Open attached…** retains the target picker and restores remembered chat style/position. First manual Attach, like later Attach, preserves the current appearance/location and does **not** load destination preferences. Unattached settings/drags are runtime-only (no logical preference key); new explicit edits after attachment can remember that chat.
+
+**Deployment/evidence boundary:** the unattached-first debug binary is installed at `/Users/jdawson/.local/bin/numen`; installed help and fresh Djinn interoperability passed. Read-only doctor found the existing graphical service reachable with a different, older recorded build; it was left untouched. **One explicit user-chosen Numen restart is required to load the new code, not a Djinn restart.** A service missing `unattached_open` fails with a manual-restart error, never automatic replacement. See [canonical delivery evidence and manual limits](#unattached-first-validation-status).
+
 Inspired by the pet feature in the Codex app, but generalized beyond a single application: the companion is its own process. Tools publish semantic activity through the initial local v1 protocol. In the implemented **shared-focused** mode, one visible familiar represents **one selected conversation (activity)**, never an aggregate of every conversation. Background activities remain tracked and queryable but cannot steal its expression or completion cues. The included publisher is an interactive diagnostic, not a stable public SDK or automatic integration.
 
 The source reports **what is happening**; the companion chooses **how to express it**.
@@ -28,7 +38,7 @@ Production live `run` (including menu-bootstrapped `run --empty`) now remembers 
 The remembered key is **only `(source, activity)`**, never producer instance or familiar ID. **Assumption:** a source keeps activity IDs stable for the same logical chat across producer restarts. Stored data is the three settings (`sprite_scale`, `font_size`, `bubble_duration`) plus optional manually chosen foot-center `{x,y}` in desktop logical points. No titles/prompts, runtime pins, open-window list, autostart, cues, pause or navigation state is saved. Named profiles and character selection remain future work.
 
 - Explicit Open uses remembered style/placement when present, otherwise the **original startup defaults**; saved style takes precedence over startup fallback flags. Attach, focus and next keep the live appearance and location and associate future explicit edits with the new key.
-- Bootstrap Main's existing first-selection policy is unchanged and may load saved style. Its first-binding placement applies only if the user has not already moved/interacted with it. Sources/reconnects never create or retarget views because preferences exist.
+- Production Main starts unattached and never source-auto-selects. First manual Attach preserves live style/location without destination restore; unattached edits have no saved key. The old bootstrap first-selection preference rule is compatibility-only, not user UI.
 - Distinct instances sharing one logical key keep independent live views. The last accepted explicit edit updates the corresponding remembered data; it never automatically reapplies to other views.
 - Only explicit Settings edits and **actual completed manual drags** save. Go to Mouse, programmatic movement, bubble layout, resize, clamp, close and source events do not.
 - Placement allows finite negative coordinates within ±1,000,000. Each new native view restores once, with bounded native-size/DPI feedback (one second, at most five real corrections, 20 ms polling), clamped against all available monitors in logical coordinates using each monitor's own backing scale. Restore does not focus the view or save the clamped/resized result.
@@ -65,6 +75,9 @@ Background I/O keeps one pending plus one in-flight document, with at most 200 m
 Requires Rust 1.89 or newer (edition 2024) and a graphical desktop for `run`. Rendering uses winit 0.30.13, pixels 0.17.2, and image 0.25.8.
 
 ```sh
+numen # Default: one unattached familiar; reuse service or bounded bootstrap
+numen # Another independent unattached familiar in that service
+numen open # Same unattached Open, but requires a RUNNING graphical service
 cargo run --locked -- check-assets
 cargo run --locked -- run
 cargo run --locked -- run --bubble-duration 3 # Timed notifications and reveals
@@ -107,7 +120,8 @@ djinn # Open a chat from the dashboard
 djinn -s REF
 # Or:
 djinn session chat REF
-# Separately, select Djinn preset → Open → the chat target:
+# Separately, use bare numen then click Attach to app / chat; or restore with
+# Djinn preset → Open attached… → the chat target:
 ~/Projects/numen/target/debug/numen menu
 ```
 
@@ -162,7 +176,7 @@ numen menu
 ```
 
 Installing does not restart a running service. To load new code, explicitly run
-`numen quit`, then `numen menu` and reopen the attached familiar. Future menu and
+`numen quit`, then `numen` for an unattached familiar. Use Open attached… to restore a chat. Future menu and
 control commands no longer need the checkout's full executable path.
 
 ## API / Interfaces
@@ -193,11 +207,11 @@ Doctor makes **one bounded read-only `companion.service` query**, with private-s
 
 `menu [--no-start] [--fzf PATH]` requires stdin and stderr TTYs and installed fzf (already installed on the validation machine). Use Wisp **run/summon**, not exec. It lists clearly labeled running/waiting familiars and presets, with distinct `familiar:` / `preset:` identities. Tab multi-selects up to 16; Enter advances to commands. Command Escape/Back retains the familiar selection; target Escape/Back discards the **entire** pending batch. Ctrl-R refreshes the current stage. One accepted action exits the menu so the Wisp Kitty floater can close.
 
-Commands are the capability intersection of **all** selected rows: presets support only Open; active familiars support Info, Go to Mouse, Settings, Attach and Close as advertised. A mixed selection may have no common command: Back is offered with an explanation, never silent partial execution. Open/Attach fetch fresh target pages separately for each selection, excluding other owners and earlier pending choices while allowing one's own current attachment. Empty lists offer Refresh/Back; only connected publishers appear, including supported Djinn chats discovered by default. If empty, open a Chat tab in an updated Djinn UI, check reporting is not opted out and the sockets match, allow reconnect, then Refresh. Backend mutation revalidates the whole batch; retryable errors appear in the menu header. With only one Djinn preset, opening more copies requires repeated invocations; a batch applies once to each actual selection.
+Commands are the capability intersection of **all** selected rows: presets support `open` and `open-attached` (**Open** / **Open attached…**); active familiars support Info, Go to Mouse, Settings, Attach and Close as advertised. Default Open immediately creates unattached views. Open attached…/Attach fetch fresh target pages per selection, excluding other owners and earlier pending choices while allowing one's own attachment. Target Back/Esc cancels the whole batch. Only connected supported protocol targets appear; empty lists offer Refresh/Back. Mixed selections with no common command get an explanation, never partial execution. Backend revalidation is atomic; with one Djinn preset, repeat invocations to open more copies.
 
 Merely entering the menu or discovering sources never spawns a service or writes files. Choosing Open while offline starts the current executable as detached `run --empty`, unless `--no-start` requests a visible error instead. It creates no unattached `main`; source updates alone keep the registry empty. Startup uses a private 0600 `service.log` beside the socket and a five-second control-readiness wait, not GPU readiness. Concurrent starts reuse the winning graphical listener. Existing headless, outdated or unsafe services are never replaced or killed: stop an old foreground service manually once or choose another `--socket`. **Direct CLI `open` still requires an already-running graphical service.**
 
-`service-info` queries `{api_version, pid, service_instance, graphical, lifecycle, navigation}` plus additive `settings`, `preferences`, `familiar_count`, `source_count` and `diagnostics` in current services. The menu pins `service_instance` and seals each RPC with it: a restart rejects stale selections before dispatch, rather than acting on reused familiar IDs. Close/reopen the menu after a service restart. `quit` sends `companion.quit`: `{"quitting":true}` means scheduled, not completed. Current graphical services exit their event loop, release all views/hotkey and clean up their owned socket; headless/legacy handlers without a shutdown callback reject it. No source applications are terminated and no reported PID is signaled. Closing the last view retains the service; `quit` stops it globally. Cancelling Open after bootstrap may leave an empty resident service: use `quit` when desired.
+`service-info` includes v1 `unattached_open: bool`, reflecting actual multi-familiar support, alongside graphical/lifecycle metadata, settings, preferences, counts and diagnostics. Missing legacy `unattached_open` means false. The launcher/default menu Open checks it; attached Open remains compatible. Menu RPCs pin `service_instance`; restart requires reopening the menu. `quit` schedules global graphical shutdown, never source termination or PID signaling. Last Close retains the service. Cancelling Open attached… after bootstrap may leave an empty service for explicit quit.
 
 ```sh
 ~/Projects/numen/target/debug/numen menu
@@ -258,7 +272,7 @@ A normal **left-click release** opens an AppKit `NSMenu`; **right-click** opens 
 
 #### Change chat / Attach to chat
 
-**Feature done; automated/native input-free verification confirmed; physical selection pending.** A live familiar offers **Change chat** when bound, or **Attach to chat** when unbound. Choose a connected protocol activity directly; there is no mandatory process drill-down. Only eligible live exact `(source, instance, activity)` targets appear. Another familiar's claims are excluded, including disconnected reserved pins; your own live current target remains enabled and checked.
+**Feature done; automated/native input-free verification confirmed; physical selection pending.** A live familiar offers **Change attachment** when bound, or **Attach to app / chat** when unbound. The historical heading above is retained for link compatibility. Choose a connected protocol activity directly; there is no mandatory process drill-down. Only eligible live exact `(source, instance, activity)` targets appear. Another familiar's claims are excluded, including disconnected reserved pins; your own live current target remains enabled and checked.
 
 Up to 16 choices appear directly; larger lists use pages of 16, covering the full 512-target service bound. Labels are bounded and sanitized, include shortened title/identity plus a unique ordinal, and have full-tuple tooltips to disambiguate duplicate titles and instances. An unavailable current pin is disabled context, not a selectable live target. An empty eligible list shows disabled **No compatible live chats**. A busy/unready cache or mismatch with the view's applied binding shows disabled **Chat list updating—reopen menu**; reopen to refresh.
 
@@ -266,7 +280,7 @@ The popup freezes its choices: selecting an item refers to the same owned choice
 
 Retargeting preserves the existing view's appearance, location, pause, Preview/manual override and navigation. It clears the old cue just like existing Attach. Destination saved preferences are **not loaded** into this existing familiar (explicit Open loads them); later explicit Settings edits/completed manual drags remember the new logical `(source, activity)` key. Live bindings are never persisted. Picker generations are independent of preference/Forget epochs: Forget does not invalidate a chat choice. This works with preferences enabled or disabled, not only `--no-preferences`.
 
-**Example:** left-click release → Change chat → select an eligible chat (or its numbered page). Wait for the committed snapshot before expecting the bubble/attachment to change. If the list is updating or the choice becomes stale, reopen the menu. This never launches, resumes or cancels a source, opens another familiar, or invokes terminal/fzf, socket or file I/O on the GUI thread. Manual/demo have no chat-attachment control; other action gates are unchanged.
+**Example:** left-click release → Change attachment → select an eligible chat (or its numbered page). Wait for the committed snapshot before expecting the bubble/attachment to change. If the list is updating or the choice becomes stale, reopen the menu. This never launches, resumes or cancels a source, opens another familiar, or invokes terminal/fzf, socket or file I/O on the GUI thread. Manual/demo have no chat-attachment control; other action gates are unchanged.
 
 **Confirmed final main-agent validation:** **386 passed (342 unit + 7 build-fingerprint + 37 CLI), one existing visual-preview test ignored**. Formatting, strict all-target Clippy, offline `--locked` tests/build and diff checks passed with the command-scoped macOS SDK 26.5 workaround. Pure/IPC coverage includes the combined 512-target/16-binding memo, target-only publication, worker bootstrap/unbound-generation staleness, injected canonical-unbound successful Attach, and the retarget → source-animation pipeline preserving manual override, navigation, pause, appearance and position. Runtime reviewers reported no bugs after the test fixture's invalid failed-state `attention: true` was corrected to `false`.
 
@@ -274,7 +288,7 @@ Retargeting preserves the existing view's appearance, location, pause, Preview/m
 
 The current wiring is complete: the App has one service/control lifetime, compares the applied attachment binding against the memo, and the worker guards service instance authoritatively. No root GUI snapshot service-stamp rewrite or remaining integration workaround is needed.
 
-**Final local installation confirmed:** the main agent successfully ran `cargo install --path . --debug --locked --offline --root ~/.local --force` with the command-scoped SDKROOT 26.5 workaround. `command -v numen` resolved to `~/.local/bin/numen`; `numen doctor --json` reported the new client build and default service `not_running`, without automatic startup or restart. This is an observation at verification time, not a permanent service-state guarantee. Installed-binary Djinn interoperability also passed: `NUMEN_TEST_BINARY=~/.local/bin/numen` with Bun `test/numen/interoperability.test.ts`, **1 passed / 46 assertions**. No current user service was controlled and no home preferences/configuration were modified. Installation does not upgrade an already-running process: an older running Numen still needs one explicit user-chosen restart to load this picker; **do not restart Djinn**. Physical **NativeChoiceSelected** remains pending, not established by the older USER-REPORTED workflow. This docs-only update runs no tests, shell commands, Rust edits, commits, OS input or app controls.
+**Historical picker delivery:** the earlier installation/interop report observed the default service as `not_running`; that is not the current result. See [current unattached-first installation, reachable-service diagnostics and fresh interop evidence](#unattached-first-validation-status). Physical **NativeChoiceSelected** remains manual, not established by the older USER-REPORTED workflow.
 
 See [internal interfaces/data flow](PROTOCOL.md#native-chat-picker-internal-interface) and [memo/commit boundaries](ARCHITECTURE.md#native-chat-picker-snapshot-and-commit).
 
@@ -284,7 +298,8 @@ See [internal interfaces/data flow](PROTOCOL.md#native-chat-picker-internal-inte
 | Go to mouse | Clicked view only, with live navigation and an available pointer reader; preserves pause. |
 | Pause / Resume | Only the clicked view's animation/motion pause state. |
 | Settings | Three existing fields and preset sets below; one field per selection, live service only. |
-| Change chat / Attach to chat | Existing live view only; eligible connected exact targets, with frozen choices and authoritative commit checks above. |
+| Open another familiar | Live-service-only, service-scoped unattached Open; worker rechecks graphical support/capacity, then canonical Store Open with no target. No optimistic window or source execution; unlike Quit it does not exit. |
+| Change attachment / Attach to app / chat | Existing live view only; eligible connected exact targets, with frozen choices and authoritative commit checks above. |
 | Forget saved preferences | Writable bound view only; removes remembered style/placement, leaving the current view unchanged. |
 | Close familiar | Only the clicked familiar, using the existing bounded close/retry path; last Close keeps the service. |
 | Quit Numen (all familiars) | Normal root shutdown of the entire Numen service, never Djinn or another source app. |
@@ -326,7 +341,7 @@ Actual startup `run` options seed Main and immutable defaults for future Opens, 
 ~/Projects/numen/target/debug/numen menu
 ```
 
-Then choose Djinn preset → Open to reattach the existing chat. **No Djinn restart is needed** for this Numen update; the adapter reconnects. A legacy service without quit support must be stopped manually. Numen never auto-quits/replaces it. Once updated, runtime edits need **no restart**. Saved preferences now remember explicit edits/manual placement as described above; character/variant selection, named profiles and autostart remain future work.
+Then use `numen` and click Attach to app / chat; to restore remembered style/position instead, choose Djinn preset → Open attached…. **No Djinn restart is needed** for this Numen update. A legacy service without quit support must be stopped manually; Numen never auto-replaces it. Runtime edits need no restart.
 
 The same one-time explicit Numen restart enables Option+M, the native click menu and saved preferences in an older running service; rebuilding alone leaves it unchanged. Use the rebuilt full path above: an older Homebrew `numen` may not be current. Restart only when explicitly chosen by the user, never automatically. No Djinn restart or Wisp reinstallation is required. Production live startup now uses the preference path above; development must leave the existing user process/home untouched.
 
@@ -336,21 +351,23 @@ One service supports **16 familiars**. Bindings are exclusive exact `(source, in
 
 | Command | Contract |
 | --- | --- |
-| `presets` | Offline JSON: `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]}`. |
+| `presets` | Offline JSON: `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open","open-attached"]}]}`. |
 | `familiars --offset N` | Four records/page: `id`, `preset`, `attachment`, `available`, optional `summary`, `capabilities`, complete `settings`. GUI capabilities: `info`, `attach`, `close`, plus `settings`, `go-to-mouse`, and writable-bound `preferences` independently; headless/legacy handlers: `[]`. |
 | `targets --offset N [--familiar ID]` | Four connected protocol-advertised activities/page with `claimed_by` and `eligible`; an owner may reselect its own target. The menu filters eligible entries; supported Djinn chats publish here by default unless opted out, without OS scanning. |
-| `open --source NAME --activity A [--instance I] [--id ID] [--preset djinn]` | Opens an attached view in an already-running graphical service; no auto-bootstrap. |
+| `open [--source NAME --activity A [--instance I]] [--id ID] [--preset djinn]` | No target opens unattached; complete target opens attached/restores preferences. Requires a running graphical service, unlike bare `numen`. |
 | `attach --familiar ID --source NAME --activity A [--instance I]` | Retargets an existing familiar, never executes/stops the source. |
 | `close --familiar ID1 ID2` | Atomically removes selected familiars, not their applications. |
 | `go-to-mouse --familiar ID1 ID2` | Explicit 1–16 unique existing IDs; no implicit all. ACK data `{"moving":["ID1","ID2"]}` means accepted, not arrived. Requires graphical navigation support (currently macOS). |
 
-Open/Attach alternatively accept `--batch FILE` or `--batch -` (stdin): a **root JSON array**, one flattened target per selection. Use item field `id`, not `familiar`:
+Open/Attach alternatively accept `--batch FILE` or `--batch -` (stdin): a **root JSON array**. Open can mix unattached and flattened targeted entries atomically; Attach still requires targets. Use item field `id`, not `familiar`:
 
 ```json
-[{"id":"build-pet","preset":"djinn","source":"build","instance":"worker-2","activity":"task"}]
+[{"id":"free-pet"},{"id":"build-pet","preset":"djinn","source":"build","instance":"worker-2","activity":"task"}]
 ```
 
 Attach requires `id` and does not use `preset`; Open defaults `preset` to `djinn` and can generate `id`. Duplicate owners/targets/IDs, unknown presets, unavailable targets or ambiguous omitted instances reject the entire batch without changes. Attach cannot swap targets currently owned by another familiar, even when both owners are in the batch. Revalidation happens at mutation. ACK data contains `opened`, `attached` or `closed` ID arrays: accepted does not mean rendered. Asynchronous native/GPU creation can fail and remove only the bad view.
+
+Open target fields must be entirely absent or contain non-null `source` **and** `activity`, with optional `instance` (including legacy attached `instance: null`). Partial targets, null source/activity, instance-only entries (even null) and nested `target` reject. Arbitrary other unique keys remain tolerated; duplicate JSON keys reject.
 
 IDs are stable only for the service lifetime. Generated `familiar-N` IDs increase monotonically without growing generated-ID history; closed IDs are not reused. Explicit-ID history is capped at 256 plus reserved `main` (257 total); omit `id` to continue generating IDs. No persistent profiles exist; restart resets IDs.
 
@@ -370,6 +387,8 @@ IDs are stable only for the service lifetime. Generated `familiar-N` IDs increas
 `publish` requires either `--state` (the six semantic states in [Protocol](PROTOCOL.md)) or `--demo`. Defaults: `--source diagnostic`, `--activity task`, a generated PID/time-based instance, and `--duration 3` seconds per state. It holds activity while connected, sends heartbeats at approximately one-second intervals, then removes the activity and disconnects. `--attention` is valid only with `--state waiting`; `--reason` supplies optional detail. Demo publishes seven steps: working, waiting requiring attention, succeeded, working, failed, cancelled, idle. Connection, validation, or ACK errors exit nonzero. Socket I/O is bounded, but synchronous stderr logging can still block; this command is not an agent callback or best-effort SDK.
 
 ## Data Flow
+
+**Current unbound labels:** menu rows say **Unattached**, not Waiting; bubble identity/summary/status are **Unattached familiar** / **Click for actions** / **Unattached**. These supersede the old no-conversation labels described historically below. Preview labels remain unchanged.
 
 When visible, the thought bubble shows a clipped `source / activity / instance` identity line, a producer-supplied summary wrapped by measured width to at most three lines with `…` (U+2026) truncation, and the current base status: **Idle**, **Working**, **Needs your input**, **Waiting on dependency**, **Completed**, **Failed**, **Cancelled**, or **Unavailable**. Font metrics and available space determine the line count; larger fonts can reduce it without resizing the sprite. No selected conversation shows **Choose a conversation** / **Not following**; a missing summary falls back to the activity ID. Manual/demo expressions visibly say **Preview**, not agent activity. Text follows the current base, not a transient animation cue: a completed conversation can correctly say Completed while the pet rests.
 
@@ -401,13 +420,48 @@ Graphical startup validates the embedded `assets/djinn/` PNG/manifest through th
 - Always-on-top, transparency, and native drag depend on desktop support. GPU logs do not prove correct visual composition or focus behavior.
 - The latest-only headless output slot and detached stdout writer keep an unread pipe from blocking the service or `--exit-after`. Slow readers may miss intermediate presentations; the latest pending value is retained. Process shutdown terminates a blocked writer and may truncate the last diagnostic line.
 - Active socket collisions refuse startup. Only safely identified, user-owned stale sockets whose connection is refused are replaced. Normal drop removes only the owned inode; abrupt termination can leave a stale socket for recovery at next startup.
-- Only bootstrap `main` auto-selects the first unclaimed live activity once (lexical among initial snapshot records). Exact pins survive removal, disconnect and expiry and remain exclusively claimed while waiting, without fallback. A new instance needs explicit selection/next. There is no OS-focus inference.
+- Production graphical Main/new unbound views never auto-select from source events. Legacy headless/test constructors retain the old first-selection compatibility rule only. Exact bound pins survive removal/disconnect/expiry, reserve ownership and become available again only for the same exact tuple; new instances need explicit selection. No OS-focus inference.
 - Completion is not idle or disconnect. Only new success/failure transitions of the focused conversation can cue; repeated terminal states, snapshots and selection of historical terminal records do not replay outcomes. Focused attention clears/drops cues rather than queuing them. Background attention, failure and success never take over.
 - Movement commits the hidden sprite anchor so bubble expiry does not snap back to the pre-command position. Pointer reading is read-only: fresh macOS `CGEvent` snapshots from `CombinedSessionState`, no cursor warp, event posting, event tap, permission request or OS process scan. Other platforms currently advertise no navigation capability.
 - Menu labels/summaries are sanitized and never shell-interpolated. fzf default-options/options-file/default-command environment variables are removed; unoffered or duplicate output identities are rejected, with a 64 KiB output cap.
 - Next: broader adapter coverage and an unrelated runner. Other [mode choices](MODES.md), app-signaled following, different per-view characters/additional options, named profiles, general installation/autostart, packaging, gaze and roaming remain future work. General saved appearance/manual-placement preferences are delivered.
 
 ## Validation
+
+### Unattached-first validation status
+
+**Delivery confirmed:** the unattached-first debug installation succeeded with:
+
+```sh
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk cargo install --path . --debug --locked --offline --root /Users/jdawson/.local --force
+```
+
+- `command -v numen` resolved to `/Users/jdawson/.local/bin/numen`. Installed `--help` and `open --help` confirmed the optional command and optional Open target.
+- Installed `doctor --json` was read-only: `service_state: "reachable"`, graphical service **PID 76604**, `build_comparison: "different"`. The existing older service was left untouched. The comparison itself identifies different recorded inputs, not build age.
+  - New client: `numen-build-v1-fnv1a128:11627cc3106216ddc459a33a782b2aa8`.
+  - Existing service: `numen-build-v1-fnv1a128:733132e3d43df2c5de9ee15819b7a04c`.
+- Fresh installed-binary interop from Djinn's `packages/opencode`: `NUMEN_TEST_BINARY=/Users/jdawson/.local/bin/numen bun test test/numen/interoperability.test.ts --timeout 30000` → **1 pass, 0 fail, 46 assertions**.
+- Fresh delivery checks: `git diff --check` and `cargo fmt --all -- --check` passed. These are supplied delivery results, not commands rerun by this documentation edit.
+
+No startup, restart, window or user-preference changes occurred during final delivery verification. **One explicit user-chosen Numen restart is required to load the installed code into the older service; no Djinn restart is needed.** Physical native menu-item selection and Wisp palette → Kitty handoff remain manual. Earlier `not_running` observations below are historical, not the latest service result.
+
+**Previously confirmed main-agent results (not freshly rerun): 413 passed — 361 unit + 7 build-fingerprint + 45 CLI; one existing visual-preview test ignored.** Prior strict all-target Clippy, offline locked tests/build and native smoke evidence retain their recorded scope. Earlier feature totals/installations below remain historical. This edit changes documentation only; it performs no installation, service controls, Rust edits or commits.
+
+Private native harness evidence: **`ua-NAWoE3/evidence.json`**.
+
+| Check | Confirmed result |
+| --- | --- |
+| Fresh bare CLI | Actually bootstrapped detached empty GUI and opened one unbound familiar with zero sources/targets. |
+| Second bare CLI | Reused the **same service PID** and opened a new independent ID. |
+| Direct target-free CLI Open | Opened a third independent unbound familiar; real Metal graphics initialized for all three. |
+| Producer registration and state change | All three remained unattached. Explicit Attach bound **only the first**; the other two stayed unbound. |
+| First attachment and persistence | Unbound custom font 16 survived Attach. Unbound Settings created **no saved-chat JSON**; a **new font 18 edit after attachment** became durable as one record. |
+| Foreground production Main | Owned `run --no-hotkey --no-preferences` created `main` with null attachment. Registration/state changes left it unbound; explicit Attach to source `b` succeeded. |
+| Cleanup/isolation | Owned services quit and removed sockets; foreground run exited 0. Private HOME/XDG configuration was used; the existing default user service and home preferences were untouched. |
+
+The native popup adapter, now including **Open another familiar**, showed and auto-cancelled three fixtures: **4 choices / 379 ms**, **512 choices / 375 ms**, **unavailable current with 0 choices / 379 ms**, exit 0. Elapsed time was measured at popup return **before joining the canceller**, not inferred from join delay. This verifies construction/tracking cancellation, **not physical item selection**. No actual OS input or menu-item selection occurred. Native Open's queue/commit/service scope tests pass, but physical **Open another familiar** and chat selection remain manual.
+
+Label tests confirm **Unattached familiar / Click for actions / Unattached** and fzf **Unattached**, not Waiting; existing disconnected **bound** fixtures retain Waiting. CLI batches now pass raw bytes through `ipc::parse_unique_json`: duplicate keys at root/deep object levels reject before service I/O, preventing JSON-value duplicate collapse; independent valid rows remain allowed.
 
 ### Saved-preferences validation status
 

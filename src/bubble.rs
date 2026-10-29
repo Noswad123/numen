@@ -47,15 +47,15 @@ pub fn dimensions(show: bool, sprite_scale: f32) -> (u32, u32) {
 pub fn text(view: &Presentation, preview: Option<Animation>) -> BubbleText {
     let Some(following) = &view.following else {
         return BubbleText {
-            identity: "No conversation selected".into(),
+            identity: "Unattached familiar".into(),
             summary: if preview.is_some() {
                 "Animation preview"
             } else {
-                "Choose a conversation"
+                "Click for actions"
             }
             .into(),
             status: preview.map_or_else(
-                || "Not following".into(),
+                || "Unattached".into(),
                 |animation| format!("Preview: {}", animation.label()),
             ),
         };
@@ -879,9 +879,9 @@ mod tests {
     #[test]
     fn preview_without_focus_is_not_agent_activity() {
         let view = Presentation::default();
-        assert_eq!(text(&view, None).identity, "No conversation selected");
-        assert_eq!(text(&view, None).summary, "Choose a conversation");
-        assert_eq!(text(&view, None).status, "Not following");
+        assert_eq!(text(&view, None).identity, "Unattached familiar");
+        assert_eq!(text(&view, None).summary, "Click for actions");
+        assert_eq!(text(&view, None).status, "Unattached");
         for animation in Animation::ALL {
             let model = text(&view, Some(animation));
             assert_eq!(model.summary, "Animation preview");

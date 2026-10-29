@@ -39,7 +39,7 @@ struct Cli {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -63,7 +63,7 @@ enum Command {
     Targets(TargetOptions),
     /// List available character presets without starting a service.
     Presets,
-    /// Open a familiar attached to a distinct live source.
+    /// Open an unattached familiar, or attach it to a distinct live source.
     Open(OpenOptions),
     /// Choose a distinct source for each selected familiar.
     Attach(AttachOptions),
@@ -260,12 +260,22 @@ fn parse_preferences_path(value: &str) -> std::result::Result<PathBuf, String> {
 }
 
 #[derive(Args)]
-struct AttachmentTarget {
+struct AttachTarget {
     #[arg(long, required_unless_present = "batch", conflicts_with = "batch", value_parser = parse_id)]
     source: Option<String>,
     #[arg(long, conflicts_with = "batch", value_parser = parse_id)]
     instance: Option<String>,
     #[arg(long, required_unless_present = "batch", conflicts_with = "batch", value_parser = parse_id)]
+    activity: Option<String>,
+}
+
+#[derive(Args)]
+struct OpenTarget {
+    #[arg(long, requires = "activity", conflicts_with = "batch", value_parser = parse_id)]
+    source: Option<String>,
+    #[arg(long, requires_all = ["source", "activity"], conflicts_with = "batch", value_parser = parse_id)]
+    instance: Option<String>,
+    #[arg(long, requires = "source", conflicts_with = "batch", value_parser = parse_id)]
     activity: Option<String>,
 }
 
@@ -277,7 +287,7 @@ struct OpenOptions {
     #[arg(long, default_value = "djinn", conflicts_with = "batch", value_parser = parse_id)]
     preset: String,
     #[command(flatten)]
-    target: AttachmentTarget,
+    target: OpenTarget,
     /// Read a JSON array of per-familiar requests from a file, or - for stdin.
     #[arg(long)]
     batch: Option<PathBuf>,
@@ -288,7 +298,7 @@ struct AttachOptions {
     #[arg(long, required_unless_present = "batch", conflicts_with = "batch", value_parser = parse_id)]
     familiar: Option<String>,
     #[command(flatten)]
-    target: AttachmentTarget,
+    target: AttachTarget,
     /// Read a JSON array of per-familiar requests from a file, or - for stdin.
     #[arg(long)]
     batch: Option<PathBuf>,
@@ -310,7 +320,8 @@ fn read_batch(path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
         bytes.len() <= protocol::MAX_LINE,
         "batch input exceeds 8 KiB"
     );
-    serde_json::from_slice(&bytes).context("batch must be a JSON array of familiar requests")
+    let value = ipc::parse_unique_json(&bytes).context("invalid batch JSON")?;
+    serde_json::from_value(value).context("batch must be a JSON array of familiar requests")
 }
 
 #[derive(Args)]
@@ -429,6 +440,22 @@ fn parse_move_speed(value: &str) -> Result<f64, String> {
 
 fn socket_path(path: Option<PathBuf>) -> Result<PathBuf> {
     path.map_or_else(ipc::default_socket_path, Ok)
+}
+
+fn launch_default(path: PathBuf) -> Result<()> {
+    let info = bootstrap::ensure_graphical(&path)?;
+    anyhow::ensure!(
+        info.unattached_open,
+        "existing service does not support unattached familiars; update/restart Numen manually"
+    );
+    let data = ipc::control(
+        &path,
+        serde_json::json!({"version":1,"type":"familiar.open","items":[{}],
+            "service_instance":info.service_instance}),
+    )?;
+    menu::validate_opened_ids(&data, 1)?;
+    println!("{}", serde_json::to_string_pretty(&data)?);
+    Ok(())
 }
 
 fn listen(path: PathBuf, options: ListenOptions) -> Result<()> {
@@ -584,7 +611,11 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match cli.command {
+    let command = match cli.command {
+        Some(command) => command,
+        None => return launch_default(socket_path(cli.socket)?),
+    };
+    match command {
         Command::Run(options) => {
             let path = if options.manual || options.demo {
                 None
@@ -639,17 +670,21 @@ fn main() -> Result<()> {
             let items = if let Some(path) = options.batch {
                 read_batch(&path)?
             } else {
-                vec![
-                    serde_json::json!({"id": options.id, "preset": options.preset,
-                    "source": options.target.source.context("--source is required")?,
-                    "instance": options.target.instance,
-                    "activity": options.target.activity.context("--activity is required")?}),
-                ]
+                let mut item = serde_json::json!({"id": options.id, "preset": options.preset});
+                if let Some(source) = options.target.source {
+                    item["source"] = source.into();
+                    item["instance"] = serde_json::json!(options.target.instance);
+                    item["activity"] = serde_json::json!(options.target.activity);
+                }
+                vec![item]
             };
-            print_control(
-                socket_path(cli.socket)?,
-                serde_json::json!({"version":1,"type":"familiar.open","items":items}),
-            )
+            let count = items.len();
+            let request = serde_json::json!({"version":1,"type":"familiar.open","items":items});
+            protocol::Request::parse(&serde_json::to_vec(&request)?)?;
+            let data = ipc::control(&socket_path(cli.socket)?, request)?;
+            menu::validate_opened_ids(&data, count)?;
+            println!("{}", serde_json::to_string_pretty(&data)?);
+            Ok(())
         }
         Command::Attach(options) => {
             let items = if let Some(path) = options.batch {
@@ -761,6 +796,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_command_keeps_run_flags_explicit_and_help_side_effect_free() {
+        assert!(Cli::try_parse_from(["numen"]).unwrap().command.is_none());
+        assert!(
+            Cli::try_parse_from(["numen", "--socket", "/private/numen/s"])
+                .unwrap()
+                .command
+                .is_none()
+        );
+        for args in [
+            vec!["numen", "--empty"],
+            vec!["numen", "--scale", "2"],
+            vec!["numen", "unknown"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for (flag, kind) in [
+            ("--help", clap::error::ErrorKind::DisplayHelp),
+            ("--version", clap::error::ErrorKind::DisplayVersion),
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(["numen", flag]).err().unwrap().kind(),
+                kind
+            );
+        }
+        assert!(
+            Cli::command()
+                .render_usage()
+                .to_string()
+                .contains("[COMMAND]")
+        );
+    }
+
+    #[test]
     fn no_hotkey_help_names_both_global_chords_and_retains_local_controls() {
         let help = Cli::command()
             .find_subcommand_mut("run")
@@ -769,7 +837,7 @@ mod tests {
             .to_string();
         assert!(help.contains("Option+I or Option+M"));
         assert!(help.contains("local controls remain"));
-        let Command::Run(options) = Cli::try_parse_from(["numen", "run", "--no-hotkey"])
+        let Some(Command::Run(options)) = Cli::try_parse_from(["numen", "run", "--no-hotkey"])
             .unwrap()
             .command
         else {
@@ -784,7 +852,7 @@ mod tests {
     fn accepts_defaults_and_diagnostic_options() {
         Cli::command().debug_assert();
         let cli = Cli::try_parse_from(["numen", "run"]).unwrap();
-        let Command::Run(options) = cli.command else {
+        let Some(Command::Run(options)) = cli.command else {
             panic!("expected run")
         };
         assert_eq!(options.animation, Animation::Idle);
@@ -908,6 +976,7 @@ mod tests {
     fn familiar_controls_require_explicit_distinct_target_requests() {
         for args in [
             vec!["numen", "presets"],
+            vec!["numen", "open"],
             vec!["numen", "familiars", "--offset", "4"],
             vec!["numen", "targets", "--familiar", "main"],
             vec![
@@ -941,8 +1010,10 @@ mod tests {
             assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
         }
         for args in [
-            vec!["numen", "open"],
             vec!["numen", "open", "--source", "djinn"],
+            vec!["numen", "open", "--activity", "chat-1"],
+            vec!["numen", "open", "--instance", "one"],
+            vec!["numen", "attach", "--familiar", "main"],
             vec!["numen", "open", "--batch", "-", "--source", "djinn"],
             vec![
                 "numen",
@@ -974,7 +1045,8 @@ mod tests {
                     args.extend([flag.into(), value.into()]);
                 }
             }
-            let Command::Settings(options) = Cli::try_parse_from(args).unwrap().command else {
+            let Some(Command::Settings(options)) = Cli::try_parse_from(args).unwrap().command
+            else {
                 panic!("expected settings");
             };
             let request = options.request().unwrap();

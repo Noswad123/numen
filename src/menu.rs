@@ -25,7 +25,7 @@ pub struct MenuOptions {
 
 /// The offline preset catalog is also used by the CLI's `presets` command.
 pub fn presets() -> Value {
-    json!({"presets": [{"id": "djinn", "name": "Djinn", "capabilities": ["open"]}]})
+    json!({"presets": [{"id": "djinn", "name": "Djinn", "capabilities": ["open", "open-attached"]}]})
 }
 
 pub fn run(path: &Path, options: MenuOptions) -> Result<()> {
@@ -36,6 +36,7 @@ pub fn run(path: &Path, options: MenuOptions) -> Result<()> {
     let mut backend = NativeBackend {
         path,
         pinned_instance: None,
+        unattached_open: false,
     };
     let mut picker = Fzf {
         executable: options.fzf,
@@ -61,6 +62,7 @@ trait Backend {
 struct NativeBackend<'a> {
     path: &'a Path,
     pinned_instance: Option<String>,
+    unattached_open: bool,
 }
 
 impl NativeBackend<'_> {
@@ -73,6 +75,7 @@ impl NativeBackend<'_> {
         } else {
             self.pinned_instance = Some(info.service_instance.clone());
         }
+        self.unattached_open = info.unattached_open;
         Ok(())
     }
 }
@@ -112,6 +115,16 @@ impl Backend for NativeBackend<'_> {
     }
 
     fn control(&mut self, mut request: Value) -> Result<Value> {
+        if request["type"] == "familiar.open"
+            && request["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item.get("source").is_none()))
+        {
+            ensure!(
+                self.unattached_open,
+                "existing service does not support unattached familiars; update/restart Numen manually"
+            );
+        }
         let instance = self
             .pinned_instance
             .as_ref()
@@ -469,7 +482,9 @@ fn catalog(backend: &mut impl Backend) -> Result<(Vec<Choice>, String)> {
                 let name = preset_name(&familiar.preset);
                 let label = format!(
                     "{} | {} [{}] | {} | {}",
-                    if familiar.available {
+                    if familiar.attachment.is_none() {
+                        "Unattached"
+                    } else if familiar.available {
                         "Running"
                     } else {
                         "Waiting"
@@ -533,8 +548,9 @@ fn preset_name(id: &str) -> String {
         .to_owned()
 }
 
-const ACTIONS: [(&str, &str); 6] = [
+const ACTIONS: [(&str, &str); 7] = [
     ("open", "Open"),
+    ("open-attached", "Open attached…"),
     ("info", "Info bubble"),
     ("go-to-mouse", "Go to mouse"),
     ("attach", "Attach to process"),
@@ -548,8 +564,8 @@ fn commands(selection: &[Choice]) -> Vec<Row> {
         .filter(|(action, _)| {
             !selection.is_empty()
                 && selection.iter().all(|choice| {
-                    // Presets can only Open; active identities can never Open.
-                    (choice.preset == (*action == "open"))
+                    // Only presets can open new familiars, with or without a target.
+                    (choice.preset == matches!(*action, "open" | "open-attached"))
                         && choice.capabilities.iter().any(|cap| cap == action)
                 })
         })
@@ -676,8 +692,8 @@ fn execute(
         return settings(backend, picker, selection);
     }
     let ids: Vec<_> = selection.iter().map(|choice| choice.id.clone()).collect();
-    let request = if action == "open" || action == "attach" {
-        if action == "open" {
+    let request = if matches!(action, "open" | "open-attached" | "attach") {
+        if matches!(action, "open" | "open-attached") {
             match backend.service()? {
                 Service::Graphical => {}
                 Service::Offline if no_start => bail!(
@@ -689,10 +705,23 @@ fn execute(
                 ),
             }
         }
-        let Some(items) = target_items(backend, picker, selection, action)? else {
-            return Ok(None);
+        let items = if action == "open" {
+            selection
+                .iter()
+                .map(|choice| json!({"preset":choice.id}))
+                .collect()
+        } else {
+            let Some(items) = target_items(backend, picker, selection, action)? else {
+                return Ok(None);
+            };
+            items
         };
-        json!({"version": 1, "type": format!("familiar.{action}"), "items": items})
+        let kind = if action == "open-attached" {
+            "open"
+        } else {
+            action
+        };
+        json!({"version": 1, "type": format!("familiar.{kind}"), "items": items})
     } else {
         let (kind, field) = match action {
             "info" => ("companion.reveal", "familiars"),
@@ -706,13 +735,15 @@ fn execute(
     };
     let data = backend.control(request)?;
     let result_field = match action {
-        "open" => "opened",
+        "open" | "open-attached" => "opened",
         "attach" => "attached",
         "close" => "closed",
         "go-to-mouse" => "moving",
         _ => "",
     };
-    let result_ids = if result_field.is_empty() {
+    let result_ids = if result_field == "opened" {
+        validate_opened_ids(&data, selection.len())?
+    } else if result_field.is_empty() {
         ids
     } else {
         let returned: Vec<String> = serde_json::from_value(
@@ -735,6 +766,24 @@ fn execute(
         "Accepted {action}: {}",
         result_ids.join(", ")
     )))
+}
+
+pub(crate) fn validate_opened_ids(data: &Value, count: usize) -> Result<Vec<String>> {
+    let ids: Vec<String> = serde_json::from_value(
+        data.get("opened")
+            .cloned()
+            .context("accepted open omitted result IDs")?,
+    )?;
+    ensure!(
+        ids.len() == count,
+        "accepted open returned unexpected ID count"
+    );
+    let mut seen = HashSet::new();
+    for id in &ids {
+        valid_id(id)?;
+        ensure!(seen.insert(id), "accepted open returned duplicate IDs");
+    }
+    Ok(ids)
 }
 
 pub(crate) fn validate_updated_ids(data: &Value, ids: &[String]) -> Result<()> {
@@ -1005,7 +1054,11 @@ fn target_items(
                     let target = eligible.get(n).context("target not offered")?;
                     reserved.insert(target.binding.clone());
                     let mut item = target.binding.item();
-                    item[if action == "open" { "preset" } else { "id" }] = json!(choice.id);
+                    item[if action == "open-attached" {
+                        "preset"
+                    } else {
+                        "id"
+                    }] = json!(choice.id);
                     items.push(item);
                     break;
                 }
@@ -1141,8 +1194,10 @@ mod tests {
 
     fn settings_page() -> Value {
         let mut a = familiar("a", &["settings"]);
+        a["attachment"] = json!({"source":"djinn","instance":"i","activity":"a"});
         a["settings"] = json!({"sprite_scale":0.5,"font_size":12.0,"bubble_duration":5.0});
         let mut b = familiar("b", &["settings"]);
+        b["attachment"] = json!({"source":"djinn","instance":"i","activity":"b"});
         b["settings"] = json!({"sprite_scale":0.5,"font_size":16.0,"bubble_duration":5.0});
         familiar_page(vec![a, b])
     }
@@ -1432,6 +1487,7 @@ mod tests {
         let mut backend = NativeBackend {
             path: &path,
             pinned_instance: None,
+            unattached_open: false,
         };
         let (choices, _) = catalog(&mut backend).unwrap();
         let mut picker = Script::new(vec![select(&["font_size"]), select(&["value:2"])]);
@@ -1464,6 +1520,7 @@ mod tests {
         let mut backend = NativeBackend {
             path: &path,
             pinned_instance: None,
+            unattached_open: false,
         };
         let mut picker = Script::new(vec![
             select(&["familiar:a"]),
@@ -1483,6 +1540,52 @@ mod tests {
         assert_eq!(backend.pinned_instance.as_deref(), Some("old"));
         assert!(!dir.path().join("service.log").exists());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn native_unattached_open_checks_feature_without_disabling_attached_open() {
+        for supported in [false, true] {
+            let ok = |data| json!({"version":1,"ok":true,"data":data});
+            let mut info = service_info("generation");
+            if supported {
+                info["unattached_open"] = json!(true);
+            }
+            let attached = json!({"version":1,"type":"familiar.open","items":[{
+                "preset":"djinn","source":"djinn","instance":"i","activity":"one"}]});
+            let unattached =
+                json!({"version":1,"type":"familiar.open","items":[{"preset":"djinn"}]});
+            let mut sealed = attached.clone();
+            sealed["service_instance"] = json!("generation");
+            let mut replies = vec![
+                (json!({"version":1,"type":"companion.service"}), ok(info)),
+                (sealed, ok(json!({"opened":["attached"]}))),
+            ];
+            if supported {
+                let mut sealed = unattached.clone();
+                sealed["service_instance"] = json!("generation");
+                replies.push((sealed, ok(json!({"opened":["unattached"]}))));
+            }
+            let (_dir, path, server) = native_server(replies);
+            let mut backend = NativeBackend {
+                path: &path,
+                pinned_instance: None,
+                unattached_open: false,
+            };
+            backend.ensure_graphical().unwrap();
+            backend.control(attached).unwrap();
+            let result = backend.control(unattached);
+            if supported {
+                assert_eq!(result.unwrap()["opened"], json!(["unattached"]));
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("update/restart Numen")
+                );
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]
@@ -1510,6 +1613,7 @@ mod tests {
         let mut backend = NativeBackend {
             path: &path,
             pinned_instance: None,
+            unattached_open: false,
         };
         assert!(
             backend
@@ -1535,6 +1639,7 @@ mod tests {
         let mut backend = NativeBackend {
             path: &path,
             pinned_instance: Some("old".into()),
+            unattached_open: false,
         };
         assert!(
             backend
@@ -1561,7 +1666,7 @@ mod tests {
         let (catalog, _) = catalog(&mut backend).unwrap();
         assert_eq!(
             presets(),
-            json!({"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]})
+            json!({"presets":[{"id":"djinn","name":"Djinn","capabilities":["open","open-attached"]}]})
         );
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].row.key, "preset:djinn");
@@ -1574,6 +1679,7 @@ mod tests {
     #[test]
     fn typed_ids_capability_intersection_and_sanitized_labels() {
         let mut row = familiar("djinn", &["info", "attach", "close"]);
+        row["attachment"] = json!({"source":"djinn","instance":"i","activity":"chat"});
         row["summary"] = json!("a\t\u{1b}[31mred\u{1b}[0m\nline");
         let mut backend = FakeBackend::new(
             true,
@@ -1598,6 +1704,28 @@ mod tests {
         );
         assert_eq!(commands(&catalog).len(), 1);
         assert_eq!(commands(&catalog[1..])[0].key, "open");
+    }
+
+    #[test]
+    fn unattached_familiar_is_not_labeled_waiting_for_a_source() {
+        let mut backend = FakeBackend::new(
+            true,
+            vec![(
+                request("familiar.list", None, 0),
+                Ok(familiar_page(vec![familiar(
+                    "free",
+                    &["info", "attach", "close"],
+                )])),
+            )],
+        );
+        let (choices, _) = catalog(&mut backend).unwrap();
+        assert!(
+            choices[0]
+                .row
+                .label
+                .starts_with("Unattached | Djinn [free]")
+        );
+        assert!(!choices[0].row.label.contains("Waiting"));
     }
 
     #[test]
@@ -1854,22 +1982,24 @@ mod tests {
 
     #[test]
     fn offline_no_start_open_is_visible_and_retryable() {
-        let mut backend = FakeBackend::new(false, vec![]);
-        let mut picker = Script::new(vec![
-            select(&["preset:djinn"]),
-            select(&["open"]),
-            Pick::Cancel,
-            Pick::Cancel,
-        ]);
-        assert!(menu(&mut backend, &mut picker, true).unwrap().is_none());
-        assert!(picker.shown[2].2.contains("--no-start"));
-        assert_eq!(picker.shown[3].1, vec!["preset:djinn"]);
-        assert_eq!(backend.starts, 0);
-        assert!(backend.calls.is_empty());
+        for action in ["open", "open-attached"] {
+            let mut backend = FakeBackend::new(false, vec![]);
+            let mut picker = Script::new(vec![
+                select(&["preset:djinn"]),
+                select(&[action]),
+                Pick::Cancel,
+                Pick::Cancel,
+            ]);
+            assert!(menu(&mut backend, &mut picker, true).unwrap().is_none());
+            assert!(picker.shown[2].2.contains("--no-start"));
+            assert_eq!(picker.shown[3].1, vec!["preset:djinn"]);
+            assert_eq!(backend.starts, 0);
+            assert!(backend.calls.is_empty());
+        }
     }
 
     #[test]
-    fn open_bootstraps_then_queries_and_uses_generated_ids() {
+    fn open_attached_bootstraps_then_queries_and_uses_generated_ids() {
         let mut backend = FakeBackend::new(
             false,
             vec![
@@ -1885,15 +2015,108 @@ mod tests {
         );
         let mut picker = Script::new(vec![
             select(&["preset:djinn"]),
-            select(&["open"]),
+            select(&["open-attached"]),
             select(&["target:0"]),
         ]);
         assert_eq!(
             menu(&mut backend, &mut picker, false).unwrap().unwrap(),
-            "Accepted open: familiar-1"
+            "Accepted open-attached: familiar-1"
         );
         assert_eq!(backend.starts, 1);
         assert!(picker.steps.is_empty());
+    }
+
+    #[test]
+    fn open_is_unattached_and_never_queries_targets_or_uses_picker() {
+        for graphical in [false, true] {
+            let mut backend = FakeBackend::new(graphical, vec![]);
+            let (choices, _) = catalog(&mut FakeBackend::new(false, vec![])).unwrap();
+            let selection = vec![choices[0].clone(), choices[0].clone()];
+            backend.replies.push_back((
+                json!({"version":1,"type":"familiar.open","items":[{"preset":"djinn"},{"preset":"djinn"}]}),
+                Ok(json!({"opened":["familiar-1","familiar-2"]})),
+            ));
+            let mut picker = Script::new(vec![]);
+            assert_eq!(
+                execute(&mut backend, &mut picker, &selection, "open", false)
+                    .unwrap()
+                    .unwrap(),
+                "Accepted open: familiar-1, familiar-2"
+            );
+            assert_eq!(backend.starts, usize::from(!graphical));
+            assert_eq!(backend.calls.len(), 1);
+            assert!(picker.shown.is_empty());
+            assert_eq!(
+                commands(&choices)
+                    .iter()
+                    .map(|row| row.key.as_str())
+                    .collect::<Vec<_>>(),
+                ["open", "open-attached", "back"]
+            );
+        }
+    }
+
+    #[test]
+    fn open_attached_target_cancellation_discards_entire_batch() {
+        for cancel_first in [true, false] {
+            let (choices, _) = catalog(&mut FakeBackend::new(false, vec![])).unwrap();
+            let selection = vec![choices[0].clone(), choices[0].clone()];
+            let mut backend = FakeBackend::new(
+                true,
+                (0..if cancel_first { 1 } else { 2 })
+                    .map(|_| {
+                        (
+                            request("companion.targets", None, 0),
+                            Ok(target_page(vec![
+                                target("one", None, true),
+                                target("two", None, true),
+                            ])),
+                        )
+                    })
+                    .collect(),
+            );
+            let steps = if cancel_first {
+                vec![Pick::Cancel]
+            } else {
+                vec![select(&["target:0"]), Pick::Cancel]
+            };
+            assert!(
+                execute(
+                    &mut backend,
+                    &mut Script::new(steps),
+                    &selection,
+                    "open-attached",
+                    false
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                backend
+                    .calls
+                    .iter()
+                    .all(|call| call["type"] == "companion.targets")
+            );
+            assert_eq!(backend.starts, 0);
+        }
+    }
+
+    #[test]
+    fn open_ack_requires_unique_valid_ids_and_exact_count() {
+        for data in [
+            json!({}),
+            json!({"opened":[]}),
+            json!({"opened":["a"]}),
+            json!({"opened":["a","a"]}),
+            json!({"opened":["a","bad/id"]}),
+            json!({"opened":["a","b","c"]}),
+        ] {
+            assert!(validate_opened_ids(&data, 2).is_err(), "{data}");
+        }
+        assert_eq!(
+            validate_opened_ids(&json!({"opened":["b","a"]}), 2).unwrap(),
+            ["b", "a"]
+        );
     }
 
     #[test]
@@ -2137,7 +2360,7 @@ mod tests {
                 &mut backend,
                 &mut Script::new(vec![Pick::Cancel]),
                 &[preset],
-                "open",
+                "open-attached",
                 false
             )
             .unwrap()

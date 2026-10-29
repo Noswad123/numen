@@ -564,7 +564,7 @@ fn presets_are_available_without_a_service() {
     let (_dir, socket) = fixture();
     assert_eq!(
         control(&socket, &["presets"]),
-        json!({"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]})
+        json!({"presets":[{"id":"djinn","name":"Djinn","capabilities":["open","open-attached"]}]})
     );
     assert!(!socket.exists());
 }
@@ -691,6 +691,167 @@ fn headless_discovery_reports_live_targets_but_no_lifecycle_capabilities() {
 }
 
 // Keep lifecycle serialization independent of a graphical server and its callbacks.
+fn mock_bare(info: Value, open_reply: Option<Value>) -> (ExitStatus, String, String) {
+    let (dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let mut child = ChildGuard(command(&socket).spawn().unwrap());
+    let deadline = Instant::now() + LIMIT;
+    let mut replies = vec![(
+        json!({"version":1,"type":"companion.service"}),
+        json!({"version":1,"ok":true,"data":info}),
+    )];
+    if let Some(reply) = open_reply {
+        replies.push((
+            json!({"version":1,"type":"familiar.open","items":[{}],
+            "service_instance":"bare-generation"}),
+            reply,
+        ));
+    }
+    for (expected, reply) in replies {
+        let stream = loop {
+            match server.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "missing request {expected}");
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "bare launch exited early"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(LIMIT)).unwrap();
+        stream.set_write_timeout(Some(LIMIT)).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), expected);
+        writeln!(reader.get_mut(), "{reply}").unwrap();
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+    }
+    let status = child.wait_until(deadline);
+    let (stdout, stderr) = child.output();
+    assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "bare reuse wrote files"
+    );
+    (status, stdout, stderr)
+}
+
+fn bare_service_info() -> Value {
+    json!({"api_version":1,"service_instance":"bare-generation","pid":123,
+        "graphical":true,"lifecycle":true,"navigation":false,"unattached_open":true})
+}
+
+#[test]
+fn bare_launch_reuses_service_and_seals_one_unattached_open() {
+    let data = json!({"opened":["familiar-42"]});
+    let (status, stdout, stderr) = mock_bare(
+        bare_service_info(),
+        Some(json!({"version":1,"ok":true,"data":data})),
+    );
+    assert!(status.success(), "{stderr}");
+    assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), data);
+}
+
+#[test]
+fn bare_launch_rejects_old_headless_and_changed_services_without_restart() {
+    for field in [
+        "unattached_open",
+        "graphical",
+        "lifecycle",
+        "missing-feature",
+    ] {
+        let mut info = bare_service_info();
+        if field == "missing-feature" {
+            info.as_object_mut().unwrap().remove("unattached_open");
+        } else {
+            info[field] = json!(false);
+        }
+        let (status, stdout, stderr) = mock_bare(info, None);
+        assert!(!status.success());
+        assert!(stdout.is_empty());
+        assert!(
+            stderr.contains(
+                if field == "unattached_open" || field == "missing-feature" {
+                    "update/restart Numen"
+                } else {
+                    "will not be replaced"
+                }
+            ),
+            "{stderr}"
+        );
+    }
+    let (status, stdout, stderr) = mock_bare(
+        bare_service_info(),
+        Some(json!({"version":1,
+        "ok":false,"error":"service instance changed; reopen menu"})),
+    );
+    assert!(!status.success());
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("service instance changed"), "{stderr}");
+}
+
+#[test]
+fn bare_launch_validates_open_ack_before_printing() {
+    for data in [
+        json!({}),
+        json!({"opened":[]}),
+        json!({"opened":["a","b"]}),
+        json!({"opened":["bad/id"]}),
+    ] {
+        let (status, stdout, stderr) = mock_bare(
+            bare_service_info(),
+            Some(json!({"version":1,"ok":true,"data":data})),
+        );
+        assert!(!status.success(), "{data}");
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+    }
+}
+
+#[test]
+fn open_partial_targets_and_bare_help_validate_before_io() {
+    let (dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    for args in [
+        vec!["open", "--source", "djinn"],
+        vec!["open", "--activity", "a"],
+        vec!["open", "--instance", "i"],
+        vec!["attach", "--familiar", "main"],
+        vec!["open", "--source", "djinn", "--batch", "missing.json"],
+        vec!["--scale", "2"],
+        vec!["unknown"],
+        vec!["--help"],
+        vec!["--version"],
+    ] {
+        let help = args == ["--help"] || args == ["--version"];
+        let mut child = ChildGuard(command(&socket).args(&args).spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert_eq!(
+            status.code(),
+            Some(if help { 0 } else { 2 }),
+            "{args:?}: {stderr}"
+        );
+        if args == ["--help"] {
+            assert!(stdout.contains("[COMMAND]"), "{stdout}");
+        }
+        assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
 fn mock_control(args: &[&str], input: Option<&Value>, expected: Value, data: Value) {
     let (status, stdout, stderr) = mock_control_result(args, input, expected, data.clone());
     assert!(status.success(), "{args:?}: {stderr}");
@@ -950,16 +1111,45 @@ fn preferences_help_describes_remembering_and_explicit_forgetting_without_io() {
 }
 
 #[test]
+fn direct_unattached_open_never_bootstraps_and_validates_ack_ids() {
+    let (dir, socket) = fixture();
+    let mut child = ChildGuard(command(&socket).arg("open").spawn().unwrap());
+    let status = child.wait_until(Instant::now() + LIMIT);
+    let (stdout, stderr) = child.output();
+    assert!(!status.success());
+    assert!(stdout.is_empty());
+    assert!(!stderr.is_empty());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    for data in [
+        json!({}),
+        json!({"opened":[]}),
+        json!({"opened":["bad/id"]}),
+        json!({"opened":["a","b"]}),
+    ] {
+        let (status, stdout, stderr) = mock_control_result(
+            &["open"],
+            None,
+            json!({"version":1,"type":"familiar.open","items":[{"id":null,"preset":"djinn"}]}),
+            data,
+        );
+        assert!(!status.success());
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+    }
+}
+
+#[test]
 fn lifecycle_commands_serialize_each_selection_and_print_ack_data() {
     let open = json!([
         {"id":"first","preset":"djinn","source":"djinn","instance":"one","activity":"a"},
-        {"source":"build","activity":"b"}
+        {"source":"build","activity":"b"},
+        {}
     ]);
     mock_control(
         &["open", "--batch", "-"],
         Some(&open),
         json!({"version":1,"type":"familiar.open","items":open}),
-        json!({"opened":["first","generated"]}),
+        json!({"opened":["first","generated","unattached"]}),
     );
     let attach = json!([
         {"id":"first","source":"build","instance":"two","activity":"b"},
@@ -972,6 +1162,7 @@ fn lifecycle_commands_serialize_each_selection_and_print_ack_data() {
         json!({"attached":["first","second"]}),
     );
     for (args, item) in [
+        (vec!["open"], json!({"id":null,"preset":"djinn"})),
         (
             vec!["open", "--source", "djinn", "--activity", "a"],
             json!({"id":null,"preset":"djinn","source":"djinn","instance":null,"activity":"a"}),
@@ -1193,6 +1384,144 @@ fn settings_rejects_invalid_options_before_connecting() {
         );
     }
     assert!(!dir.path().join("service.log").exists());
+}
+
+#[test]
+fn raw_batches_reject_recursive_duplicate_keys_before_socket_or_ancestor_io() {
+    let (dir, _) = fixture();
+    let batch = dir.path().join("batch.json");
+    let blocked = dir.path().join("blocked");
+    fs::write(&blocked, b"not a directory").unwrap();
+    for raw in [
+        r#"[{"source":null,"source":"a","activity":"b","id":"x"}]"#,
+        r#"[{"id":null,"id":"x","source":"a","activity":"b"}]"#,
+        r#"[{"id":"x","source":"a","source":"c","activity":"b"}]"#,
+        r#"[{"id":"x","source":"a","activity":"b","preset":{"name":null,"name":"djinn"}}]"#,
+        r#"[{"id":"x","target":{"source":null,"source":"a","activity":"b"}}]"#,
+        r#"[{"id":"x","source":"a","activity":"b","metadata":{"rows":[{"key":null,"key":"value"}]}}]"#,
+        r#"[{"id":"x","source":"a","activity":"b","metadata":null,"metadata":{}}]"#,
+    ] {
+        fs::write(&batch, raw).unwrap();
+        for action in ["open", "attach"] {
+            for file_input in [false, true] {
+                for ancestor in ["missing", "blocked"] {
+                    let socket = dir.path().join(ancestor).join("s");
+                    let mut cmd = command(&socket);
+                    cmd.current_dir(dir.path())
+                        .args([action, "--batch"])
+                        .arg(if file_input {
+                            batch.as_os_str()
+                        } else {
+                            std::ffi::OsStr::new("-")
+                        })
+                        .stdin(Stdio::piped());
+                    let mut child = ChildGuard(cmd.spawn().unwrap());
+                    if !file_input {
+                        child
+                            .0
+                            .stdin
+                            .take()
+                            .unwrap()
+                            .write_all(raw.as_bytes())
+                            .unwrap();
+                    } else {
+                        drop(child.0.stdin.take());
+                    }
+                    let status = child.wait_until(Instant::now() + LIMIT);
+                    let (stdout, stderr) = child.output();
+                    assert!(!status.success(), "{action}: {raw}");
+                    assert!(stdout.is_empty(), "{stdout}");
+                    assert!(
+                        stderr.contains("duplicate JSON object key"),
+                        "{action}, file={file_input}, ancestor={ancestor}, {raw}: {stderr}"
+                    );
+                    assert!(!dir.path().join("missing").exists());
+                    assert_eq!(fs::read(&blocked).unwrap(), b"not a directory");
+                    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_key_uniqueness_is_scoped_to_each_independent_object() {
+    let raw = br#"[
+        {"id":"first","source":"a","activity":"one","metadata":{"key":"first"}},
+        {"id":"second","source":"a","activity":"two","metadata":{"key":"second"}}
+    ]"#;
+    let items: Value = serde_json::from_slice(raw).unwrap();
+    let mut batch = tempfile::NamedTempFile::new().unwrap();
+    batch.write_all(raw).unwrap();
+    for action in ["open", "attach"] {
+        let expected = json!({"version":1,"type":format!("familiar.{action}"),"items":items});
+        let data = if action == "open" {
+            json!({"opened":["first","second"]})
+        } else {
+            json!({"attached":["first","second"]})
+        };
+        mock_control(
+            &[action, "--batch", "-"],
+            Some(&items),
+            expected.clone(),
+            data.clone(),
+        );
+        mock_control(
+            &[action, "--batch", batch.path().to_str().unwrap()],
+            None,
+            expected,
+            data,
+        );
+    }
+}
+
+#[test]
+fn raw_batch_null_target_groups_fail_before_socket_io() {
+    let (dir, _) = fixture();
+    let socket = dir.path().join("missing/s");
+    let batch = dir.path().join("batch.json");
+    for raw in [
+        r#"[{"source":null,"activity":"b"}]"#,
+        r#"[{"source":"a","activity":null}]"#,
+        r#"[{"source":null,"activity":null,"instance":null}]"#,
+        r#"[{"instance":null}]"#,
+    ] {
+        fs::write(&batch, raw).unwrap();
+        for file_input in [false, true] {
+            let mut cmd = command(&socket);
+            cmd.current_dir(dir.path())
+                .args(["open", "--batch"])
+                .arg(if file_input {
+                    batch.as_os_str()
+                } else {
+                    std::ffi::OsStr::new("-")
+                })
+                .stdin(Stdio::piped());
+            let mut child = ChildGuard(cmd.spawn().unwrap());
+            if !file_input {
+                child
+                    .0
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(raw.as_bytes())
+                    .unwrap();
+            } else {
+                drop(child.0.stdin.take());
+            }
+            let status = child.wait_until(Instant::now() + LIMIT);
+            let (stdout, stderr) = child.output();
+            assert!(!status.success());
+            assert!(stdout.is_empty());
+            assert!(
+                stderr.contains("invalid type")
+                    || stderr.contains("target requires source and activity"),
+                "{raw}: {stderr}"
+            );
+            assert!(!dir.path().join("missing").exists());
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
 }
 
 #[test]
@@ -1592,7 +1921,7 @@ fn service_info_reports_actual_headless_listener_pid_and_capabilities() {
     assert_eq!(
         info,
         json!({"api_version":1,"pid":listener.0.id(),"graphical":false,
-            "lifecycle":false,"navigation":false,"preferences":false})
+            "lifecycle":false,"navigation":false,"preferences":false,"unattached_open":false})
     );
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     let status = listener.wait_until(deadline);

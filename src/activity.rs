@@ -145,6 +145,7 @@ pub(crate) struct Store {
     preferences_writable: bool,
     preference_revision: u64,
     preference_capacity: bool,
+    auto_select_main: bool,
 }
 
 #[derive(Default)]
@@ -167,6 +168,10 @@ impl Default for Store {
 }
 
 impl Store {
+    pub(crate) fn set_auto_select_main(&mut self, enabled: bool) {
+        self.auto_select_main = enabled;
+    }
+
     pub(crate) fn enable_preferences(&mut self, document: preferences::Document, writable: bool) {
         self.preferences = Some(document);
         self.preferences_writable = writable;
@@ -385,6 +390,7 @@ impl Store {
             preferences_writable: false,
             preference_revision: 0,
             preference_capacity: false,
+            auto_select_main: true,
         }
     }
 }
@@ -469,7 +475,8 @@ impl Store {
     }
 
     fn validate_initial(&self, id: &SourceId, records: &BTreeMap<String, Record>) -> Result<()> {
-        if let Some(main) = self.familiars.get("main")
+        if self.auto_select_main
+            && let Some(main) = self.familiars.get("main")
             && main.focus.is_none()
             && (self.visible().iter().any(|s| {
                 (&s.source, &s.instance) != (&id.0, &id.1)
@@ -497,10 +504,11 @@ impl Store {
     }
 
     fn choose_initial(&mut self) {
-        if self
-            .familiars
-            .get("main")
-            .is_some_and(|f| f.focus.is_none())
+        if self.auto_select_main
+            && self
+                .familiars
+                .get("main")
+                .is_some_and(|f| f.focus.is_none())
         {
             let first = self
                 .visible()
@@ -952,17 +960,21 @@ impl Store {
         );
         let mut targets = Vec::new();
         for item in items {
-            let selected = self.resolve(
-                &item.target.source,
-                item.target.instance.as_deref(),
-                &item.target.activity,
-            )?;
-            let target = FocusTarget::from(&selected);
-            ensure!(
-                self.owner(&target).is_none() && !targets.contains(&target),
-                "target already claimed"
-            );
-            targets.push(target.clone());
+            let selected = item
+                .target
+                .as_ref()
+                .map(|target| {
+                    self.resolve(&target.source, target.instance.as_deref(), &target.activity)
+                })
+                .transpose()?;
+            let target = selected.as_ref().map(FocusTarget::from);
+            if let Some(target) = &target {
+                ensure!(
+                    self.owner(target).is_none() && !targets.contains(target),
+                    "target already claimed"
+                );
+                targets.push(target.clone());
+            }
             let id = if let Some(id) = &item.id {
                 id.clone()
             } else {
@@ -976,7 +988,7 @@ impl Store {
                     }
                 }
             };
-            let saved = self.saved(&target);
+            let saved = target.as_ref().and_then(|target| self.saved(target));
             pending.insert(
                 id.clone(),
                 Familiar {
@@ -984,8 +996,8 @@ impl Store {
                     placement: saved.and_then(|r| r.placement),
                     generation: 1,
                     attachment_generation: 1,
-                    focus: Some(target),
-                    focus_summary: selected.summary,
+                    focus: target,
+                    focus_summary: selected.and_then(|selected| selected.summary),
                     ..Familiar::default()
                 },
             );
@@ -1119,6 +1131,168 @@ mod tests {
         let mut store = Store::with_settings(false, FamiliarSettings::default());
         store.enable_preferences(preferences::Document::default(), true);
         store
+    }
+
+    fn unattached() -> OpenRequest {
+        OpenRequest {
+            id: None,
+            preset: "djinn".into(),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn manual_main_never_auto_selects_but_exact_pin_reconnects() {
+        let now = Instant::now();
+        let mut store = Store::default();
+        store.set_auto_select_main(false);
+        // Manual policy must also bypass the legacy initial-generation check.
+        store.familiars.get_mut("main").unwrap().generation = u64::MAX;
+        store.register(id("a"), vec![], now).unwrap();
+        update(&mut store, "a", a(1, ActivityState::Working), now).unwrap();
+        assert!(store.attachment_binding("main").unwrap().target.is_none());
+        assert!(store.live_targets()[0].claimed_by.is_none());
+        store.familiars.get_mut("main").unwrap().generation = 0;
+        store
+            .attach(&[AttachRequest {
+                id: "main".into(),
+                target: target("a"),
+            }])
+            .unwrap();
+        let binding = store.attachment_binding("main").unwrap();
+        store.disconnect(&id("a"));
+        store
+            .register(id("b"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        assert!(store.presentation(now).base.is_none());
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        assert_eq!(store.attachment_binding("main").unwrap(), binding);
+        assert_eq!(store.presentation(now).base.unwrap().source, "a");
+    }
+
+    #[test]
+    fn mixed_open_is_atomic_and_unattached_opens_do_not_claim_or_load_preferences() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        store.defaults = FamiliarSettings {
+            font_size: 18.0,
+            ..Default::default()
+        };
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let before = store.list(0);
+        let used = store.used_ids.clone();
+        assert!(
+            store
+                .open(&[unattached(), open_request("a"), open_request("missing")])
+                .is_err()
+        );
+        assert_eq!(store.list(0), before);
+        assert_eq!(store.next_familiar, 1);
+        assert_eq!(store.used_ids, used);
+        assert!(store.live_targets()[0].claimed_by.is_none());
+        assert_eq!(store.preference_revision(), 0);
+        let ids = store
+            .open(&[unattached(), open_request("a"), unattached()])
+            .unwrap();
+        assert_eq!(ids, ["familiar-1", "familiar-2", "familiar-3"]);
+        for view in store
+            .presentations(now)
+            .into_iter()
+            .filter(|v| v.id != ids[1])
+        {
+            assert_eq!(view.presentation, Presentation::default());
+            assert_eq!(view.settings, store.defaults);
+            assert!(view.preference.is_none());
+            assert_eq!(view.runtime_binding.target, None);
+            assert!(view.runtime_binding.generation > 0);
+            assert!(store.familiars[&view.id].placement.is_none());
+        }
+        assert_eq!(
+            store.live_targets()[0].claimed_by.as_deref(),
+            Some(ids[1].as_str())
+        );
+        assert!(store.preference_document().unwrap().1.records.is_empty());
+        assert_eq!(store.expire(now + SOURCE_TIMEOUT), vec![id("a")]);
+    }
+
+    #[test]
+    fn first_manual_attach_preserves_style_and_placement_without_loading_saved() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        let saved = FamiliarSettings {
+            font_size: 30.0,
+            ..Default::default()
+        };
+        store
+            .preferences
+            .as_mut()
+            .unwrap()
+            .records
+            .push(preferences::Record {
+                source: "a".into(),
+                activity: "task".into(),
+                settings: saved,
+                placement: Some(preferences::Placement { x: 1.0, y: 2.0 }),
+            });
+        let ids = store.open(&[unattached()]).unwrap();
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(20.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let placement = Some(preferences::Placement { x: 300.0, y: 400.0 });
+        store.familiars.get_mut(&ids[0]).unwrap().placement = placement;
+        assert_eq!(store.preference_revision(), 0);
+        assert_eq!(
+            store.preferences.as_ref().unwrap().records[0].settings,
+            saved
+        );
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        store
+            .attach(&[AttachRequest {
+                id: ids[0].clone(),
+                target: target("a"),
+            }])
+            .unwrap();
+        let view = store.presentations(now).remove(0);
+        assert_eq!(view.settings.font_size, 20.0);
+        assert_eq!(view.preference.unwrap().placement, placement);
+        assert_eq!(store.preference_revision(), 0);
+        store.close(&ids).unwrap();
+        store.open(&[open_request("a")]).unwrap();
+        assert_eq!(store.presentations(now)[0].settings, saved);
+    }
+
+    #[test]
+    fn sixteen_unattached_familiars_are_independent_without_dummy_sources() {
+        let now = Instant::now();
+        let mut store = preference_store();
+        store.set_auto_select_main(false);
+        for _ in 0..16 {
+            store.open(&[unattached()]).unwrap();
+        }
+        let before = store.presentations(now);
+        let next = store.next_familiar;
+        assert!(store.open(&[unattached()]).is_err());
+        assert_eq!(store.next_familiar, next);
+        assert_eq!(store.presentations(now), before);
+        assert_eq!(store.source_count(), 0);
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        assert_eq!(store.presentations(now), before);
+        assert!(store.live_targets()[0].claimed_by.is_none());
+        assert!(store.preference_document().unwrap().1.records.is_empty());
     }
 
     #[test]
@@ -1536,7 +1710,7 @@ mod tests {
             .into_iter()
             .map(|instance| {
                 let mut request = open_request("a");
-                request.target.instance = Some(instance.into());
+                request.target.as_mut().unwrap().instance = Some(instance.into());
                 request
             })
             .collect();
@@ -1664,7 +1838,7 @@ mod tests {
             .into_iter()
             .map(|(source, instance)| {
                 let mut request = open_request(source);
-                request.target.instance = Some(instance.into());
+                request.target.as_mut().unwrap().instance = Some(instance.into());
                 request
             })
             .collect();
@@ -1933,7 +2107,7 @@ mod tests {
         OpenRequest {
             id: None,
             preset: "djinn".into(),
-            target: target(source),
+            target: Some(target(source)),
         }
     }
 
@@ -2281,11 +2455,11 @@ mod tests {
             .map(|(n, activity)| OpenRequest {
                 id: Some(format!("{n:096}")),
                 preset: "djinn".into(),
-                target: TargetRequest {
+                target: Some(TargetRequest {
                     source: source.clone(),
                     instance: Some(instance.clone()),
                     activity: activity.activity.clone(),
-                },
+                }),
             })
             .collect();
         s.open(&items).unwrap();
@@ -2301,7 +2475,7 @@ mod tests {
         .unwrap();
         let mut extra = items[0].clone();
         extra.id = None;
-        extra.target.activity = activities[16].activity.clone();
+        extra.target.as_mut().unwrap().activity = activities[16].activity.clone();
         assert!(s.open(&[extra]).is_err());
         assert_eq!(s.familiars.len(), 16);
         for offset in [0, 4, 8, 12, 16, usize::MAX] {

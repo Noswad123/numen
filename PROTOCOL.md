@@ -2,6 +2,10 @@
 
 ## Overview
 
+**Current contract: unattached-first.** Bare `numen` reuses/bootstrap-starts a GUI service and opens one unattached familiar, sealed to its `service_instance` and gated on `unattached_open`. Direct `numen open`/wire Open still require a running GUI. Production graphical Main and new unbound views never bind from source arrivals; exact existing pins keep their reconnect behavior. The historical attached-only Open design and user-UI Main auto-selection rule are **SUPERSEDED**; compatibility headless/test constructors retain the latter only.
+
+**Delivery confirmed:** the unattached-first debug binary is installed; installed help and fresh Djinn interop passed. Read-only doctor found the existing graphical service reachable with a different, older recorded build and left it untouched. One explicit user-chosen Numen restart is required to load new code, not Djinn. See [canonical evidence](README.md#unattached-first-validation-status) for fingerprints, fresh checks and prior 413-test/Clippy/build/native smoke results (not freshly rerun). Physical native menu selection and Wisp handoff remain manual; older reports below retain their historical scope.
+
 Implemented additive local v1 API: newline-delimited JSON over a user-private Unix-domain socket. The first multi-familiar foundation is delivered and verified by automated checks and a three-view Metal smoke test. This is not a stable public SDK. Sources report semantic activity, not animations; an optional built-from-source Djinn interactive adapter publishes through this protocol without OS scanning. Graphical `run` supports lifecycle control; headless `listen` supports discovery/legacy selection, not GUI lifecycle.
 
 ## API / Interfaces
@@ -9,6 +13,8 @@ Implemented additive local v1 API: newline-delimited JSON over a user-private Un
 ### Framing, validation and acknowledgments
 
 Each request is one JSON object terminated by `\n`, at most **8 KiB excluding the newline**. `version: 1` is mandatory on every request; unsupported versions and unknown message types are rejected. Unknown optional fields are tolerated.
+
+CLI `open --batch` and `attach --batch` parse raw file/stdin bytes with `ipc::parse_unique_json` **before service I/O**, rejecting duplicate keys at every object depth before conversion to JSON values can collapse them. Repeating a key name in separate valid array rows is allowed; it is not a duplicate within one object. This closes the CLI batch duplicate-collapse bypass without changing the flat v1 item contract.
 
 Source, instance and activity identifiers contain 1–96 ASCII letters, digits, or `._:-`. Activity records contain:
 
@@ -51,7 +57,7 @@ Each processed complete message receives an ordered JSON-line ACK:
 | `companion.reveal` | Optional `familiars` array | Timed reveal of the subset, or all actual current views when omitted/null. Returns legacy status at offset 0, without changing selections. Headless errors. |
 | `familiar.list` | Optional nonnegative `offset` (default 0) | Four familiar registry rows per page, including unavailable bindings and capabilities. |
 | `companion.targets` | Optional nonnegative `offset`, `familiar` | Four connected protocol-advertised activity rows per page with ownership/eligibility. |
-| `familiar.open` | `items` array | Atomically adds 1–16 attached familiars to a graphical service; ACK data `{"opened":["ID"]}`. |
+| `familiar.open` | `items` array | Atomically adds 1–16 unattached and/or targeted familiars to a running graphical service; ACK data `{"opened":["ID"]}`. |
 | `familiar.attach` | `items` array | Atomically retargets 1–16 existing familiars; ACK data `{"attached":["ID"]}`. |
 | `familiar.close` | `ids` array | Atomically removes 1–16 familiars, not their source applications; ACK data `{"closed":["ID"]}`. |
 | `familiar.go-to-mouse` | `ids` array | Starts/restarts live-pointer pursuit for 1–16 unique existing familiar IDs; ACK data `{"moving":["ID"]}` means accepted, not arrived. Requires an installed navigation callback. |
@@ -69,7 +75,7 @@ The GUI uses `Server::start_graphical_with_preferences`, detailed below. Navigat
 
 ### Native chat picker: internal interface
 
-The macOS typed `src/context_menu.rs` → AppKit `NSMenu` picker adds **no wire API, public command or required capability**. Bound views show **Change chat**; unbound views show **Attach to chat**. CLI/fzf Attach retain their existing wire/control behavior and root `service_instance` precondition. This section describes internal GUI/service metadata, not new producer fields.
+The macOS typed `src/context_menu.rs` → AppKit `NSMenu` picker adds **no wire API, public command or required capability**. Bound views show **Change attachment**; unbound views show **Attach to app / chat**. CLI/fzf Attach retain their existing wire/control behavior and root `service_instance` precondition. This section describes internal GUI/service metadata, not new producer fields.
 
 - `AttachmentBinding {target: Option<FocusTarget>, generation: u64}` is positive even when unbound. Complete `FamiliarPresentation` snapshots **always** include `runtime_binding`, independent of optional `preference`. Its serialization belongs to the internal snapshot, not public `familiar.list` or saved preference documents.
 - `ipc::RuntimeBinding {service_instance, attachment}` seals the GUI operation to the listener and attachment. `FamiliarControl::target_snapshot(id)` returns `FamiliarTargetSnapshot {binding, targets: Arc<[LiveTarget]>}` from the worker memo. Each `LiveTarget` has a selection, `claimed_by` and positive source-registration `incarnation`; each successful Register gets a new incarnation, protecting against disconnect/reconnect with the same full tuple.
@@ -85,7 +91,7 @@ The current wiring is complete without a root GUI snapshot service-stamp rewrite
 
 Production-adapter **NativePopupInputFree** fixtures passed: 4 choices **393 ms**, 512 choices **374 ms**, unavailable/0 choices **378 ms**, exit 0/no errors, including native build, pagination/tooltips and cancellation retention/cleanup. Timing was measured at `show` return before canceller join, requiring ≥250 ms to establish actual native tracking cancellation. The fixture uses a stub `FocusTarget` and exact preset table, not the service/root Store; full service contract coverage is pure/IPC. No OS input/item selection/drag/hotkeys/user-app controls occurred; physical **NativeChoiceSelected** remains pending, and prior user feedback does not verify it.
 
-**Final installation confirmed:** SDKROOT 26.5 `cargo install --path . --debug --locked --offline --root ~/.local --force` succeeded; `command -v numen` resolved to `~/.local/bin/numen`. Installed `numen doctor --json` reported the new client build and default service `not_running`, with no automatic startup/restart. Bun `test/numen/interoperability.test.ts` using `NUMEN_TEST_BINARY=~/.local/bin/numen` passed **1 test / 46 assertions**. No current user-service controls or home preference/configuration modifications occurred. An older running Numen still needs one explicit user-chosen restart, not Djinn. See the [evidence boundaries](README.md#change-chat--attach-to-chat); this docs edit reruns no commands or tests.
+**Historical picker installation:** the earlier installed-binary check observed `not_running` and passed 1 interop test / 46 assertions. This is not the latest service result; see [current installation, reachable-service diagnostics and fresh interop](README.md#unattached-first-validation-status). Physical selection remains manual.
 
 ### Runtime settings
 
@@ -132,7 +138,7 @@ Persisted `preferences::Document` is **not** a GUI snapshot or runtime pin:
 
 Complete `FamiliarPresentation` adds optional **`preference`**, whose actual fields are `{binding:{target:{source,instance,activity},generation},placement,writable}` (`PreferencePresentation`, `PreferenceBinding`). This runtime full-tuple/epoch metadata is separate from the saved logical key and never enters `Document`. `FamiliarControl::placement(id: &str, binding: &PreferenceBinding, sequence: u64, placement: Placement) -> Result<()>` and `forget_preferences(id: &str, binding: &PreferenceBinding) -> Result<()>` use the same bounded nonblocking GUI channel as existing controls. Positive generation/sequence and the exact current binding are checked; stale queued drags after Attach/Forget reject. Retries retain the captured coordinates, never resample later programmatic motion.
 
-Open loads saved style/placement or original startup defaults. Attach/focus/next retain current style/location, associating future edits with the new key. Bootstrap Main's first-selection policy is unchanged; it may load style, but placement at first binding is allowed only before user movement/interaction. Source updates/reconnects do not create or retarget views. Different instances of one logical key have independent live views; last accepted explicit edits update remembered data without autoapplying to siblings. Only explicit Settings and completed actual manual drag save, not Go to Mouse/layout/resize/clamp/close/source events. Native restore occurs once per new view, with one-second/five-real-correction/20 ms feedback bounds, all-monitor logical clamping using each monitor's own scale, no focus and no write-back of clamp/resize.
+Targeted Open loads saved style/placement or original startup defaults. Unattached Open uses startup defaults, claims no target and has no logical preference key; unattached edits are runtime-only. First manual Attach, just like retarget/focus/next, retains current style/location without loading destination preferences; new explicit edits can then remember that logical chat. Production Main never source-auto-selects (old bootstrap preference selection is compatibility-only). Different instances of a logical key retain independent live views. Only explicit Settings/completed actual manual drags save, not source events, Go to Mouse/layout/resize/clamp/close. New-view restore retains its one-second/five-correction/20 ms bounds, all-monitor logical clamping, no focus or clamp write-back.
 
 `familiar.preferences.forget {ids}` requires 1–16 unique valid existing IDs and writable preferences; the whole batch validates before mutation. Success `data: {"forgotten":["main"]}` returns the requested IDs. CLI: `numen preferences forget --familiar main build-pet`. Both style and placement are removed for selected logical keys, leaving current settings/native location unchanged. All live shared-key binding epochs are bumped **even if no record exists**, revoking old pending placement. Native **Forget saved preferences** additionally freezes/revalidates the clicked binding and rejects rebinding. Close retains records. There is no immediate automatic resave; a later new explicit Settings edit or drag may remember again. ACK/queue acceptance is not durability or secure erasure of backups.
 
@@ -166,6 +172,7 @@ Publication-race fixes preserve externally changed backups through private-quara
 
 | Field | Contract |
 | --- | --- |
+| `unattached_open` | Boolean reflecting actual multi-familiar support. Missing legacy field defaults false; not inferred from `graphical`/version. Bare launcher/default fzf Open require true; old attached Open remains compatible. Errors never authorize auto-kill/replacement. |
 | `settings` | Boolean: graphical settings handler support. |
 | `familiar_count` | Logical familiar registry size, including unavailable bindings; not native-window count. |
 | `source_count` | Registered protocol source count; not OS-process count. |
@@ -207,7 +214,7 @@ Any request may include optional **root** `service_instance` using the same 1–
 
 `numen quit` sends `companion.quit` without additional fields. Current graphical startup installs the shutdown callback; headless/legacy handlers without one reject it. Success is `{"version":1,"ok":true,"data":{"quitting":true}}`: scheduled, not completed. After ACK flush, callback delivery waits for client EOF or 500 ms; later pipelined input is ignored. A coalesced root `AppEvent::QuitService` exits even with zero windows, drops all views and releases the server/owned socket/global hotkey. No source applications are terminated and no metadata PID is killed. Close remains per-view and last-close retains the service.
 
-Only offline **menu** Open can bootstrap detached current-executable `run --empty` (unless `--no-start`), with a five-second control-readiness bound. Discovery alone never spawns or writes files. Direct CLI/wire Open still needs a running graphical service. `run --empty` uses `Store::empty()`: no unattached `main` appears, even on source updates; it conflicts with manual/demo. Concurrent startup reuses the UDS winner; headless/outdated/unsafe existing services are never replaced or killed. See [Wisp](WISP.md) and [architecture](ARCHITECTURE.md#menu-bootstrap-and-quit).
+Bare `numen` and offline menu **Open** / **Open attached…** may bootstrap detached current-executable `run --empty`, with a five-second control-readiness bound (menu `--no-start` opts out). Bare launch then submits exactly one target-free Open, after feature checking and sealing `service_instance`. Discovery/control-only commands remain read-only/nonstarting. Direct CLI/wire Open requires a running GUI. Empty bootstrap creates no Main, even on source updates; it conflicts with manual/demo. Concurrent starts reuse the UDS winner; headless/outdated/unsafe services are never killed/replaced. An old service requires one explicit manual restart with the updated binary.
 
 `numen go-to-mouse --familiar ID1 ID2` sends `familiar.go-to-mouse` with `ids`, not `familiars`. The field is required and non-null: 1–16 distinct valid IDs, each existing at dispatch. Missing/empty arrays, duplicates, invalid IDs and unknown/closed IDs reject the entire request before any callback; there is no implicit all or partial delivery. Unsupported handlers (including headless and old `start_with_familiars`) reject with `go-to-mouse requires graphical navigation support`. Success is `{"version":1,"ok":true,"data":{"moving":["ID1","ID2"]}}`; no arrival/completion event or guarantee is implied. Like other controls, this requires no producer registration and does not refresh liveness or mutate bindings/activity state.
 
@@ -229,9 +236,9 @@ Explicit scoped status additionally includes `familiar_id`. `activities` still l
 
 `companion.targets` data is `{targets, offset, total, next_offset}`. Rows flatten the Selection fields above and add `claimed_by` (ID or null) and `eligible` (boolean). Only currently connected protocol-advertised activities appear, including terminals; unavailable waiting pins are not live targets but still reserve ownership. Eligibility means unclaimed, or already owned by the supplied familiar. The menu fetches fresh pages per selection, filters ineligible rows and excludes earlier pending choices. Discovery itself is not an adapter or OS scan; the optional Djinn adapter supplies ordinary protocol records, enabled by default for supported local interactive chats in updated builds. Both discovery endpoints page four rows with the same paging semantics as status.
 
-Open items are `{id?, preset?, source, instance?, activity}`; preset defaults to `djinn`, the only supported preset. Attach items are `{id, source, instance?, activity}`. Targets are **flattened inside each item**, not nested or a shared batch target. IDs for presets and active familiars occupy different concepts. Offline CLI `presets` returns `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open"]}]}` without contacting a service.
+Open items are either `{id?, preset?}` (unattached) or `{id?, preset?, source, instance?, activity}` (targeted); preset defaults to `djinn`. Attach remains `{id, source, instance?, activity}`. Targets stay **flat**, preserving the attached v1 API. Source/activity must both be present non-null strings or both entirely absent with instance absent. Partial/null targets, instance-only entries (even `instance: null`) and any nested `target` reject; attached `instance: null` remains compatible. Arbitrary other unique keys are tolerated; duplicate JSON keys reject. Offline presets advertise `["open","open-attached"]` without service contact.
 
-Open/Attach/Close require the multi-familiar graphical handler, not headless `listen` or a legacy reveal-only handler. Open does not bootstrap the service. Each Open/Attach entry resolves exactly one currently live `(source, instance, activity)`; omitted instance errors if ambiguous. Ownership is exclusive across all familiars, **including disconnected waiting pins**. Unknown presets, duplicate IDs/targets, unavailable/ambiguous targets or ownership conflicts reject the entire batch with no changes. Close likewise validates every distinct existing ID first. Attach allows reselecting one's own target, but cannot take a target currently held by another familiar even if that owner is in the same batch: swaps are rejected. Validation is repeated at mutation, not trusted from a previous discovery page. Sources are never executed or stopped.
+Open/Attach/Close require the multi-familiar graphical handler, not headless/reveal-only handlers. Open does not itself bootstrap. Targeted entries resolve one currently live exact tuple; omitted instance errors if ambiguous. Unattached entries resolve/claim nothing and may mix with targeted entries in one **atomic batch**. Invalid IDs/presets, duplicate targets, unavailable/ambiguous targets, ownership conflicts or capacity failure leave the whole batch unchanged. Ownership includes disconnected reserved pins. Attach permits self-reselection, not swaps of others' owned targets. Mutation revalidates; sources are never executed/stopped.
 
 At most **16 active familiars**, including bootstrap `main`. Generated `familiar-N` IDs increase monotonically over the service lifetime without accumulating generated-ID history. Explicit-ID history is limited to 256 IDs plus reserved `main` (257 history entries total). Closed IDs cannot be reused, including generated IDs. Omit Open `id` to continue using generated IDs after explicit history fills. Runtime registry/pins/IDs are ephemeral and restart resets IDs; saved logical-key appearance/manual placement is separate. No named profiles exist.
 
@@ -263,7 +270,7 @@ Discovery is on by default for the supported local ordinary interactive UI in an
 
 ### Presentation policy
 
-Each familiar implements **shared-focused** semantics: one selected activity, never aggregate work. Only bootstrap `main` auto-chooses the first unclaimed live activity once, lexically among records arriving together. Later arrivals cannot steal selection. Each exact pin survives removal, snapshot omission, disconnect and expiry with no base; it retains ownership while resting until explicit selection/next or that exact record returns. There is no OS-focus inference.
+Each bound familiar implements **shared-focused** semantics: one exact activity, never aggregate work. Production graphical Main/new unbound views remain unattached through registration, state, reconnect and expiry; only explicit selection binds them. Legacy headless/test constructors retain the old one-time Main selection for compatibility, not user UI. Exact existing pins survive removal/snapshot omission/disconnect/expiry without fallback and retain ownership until explicit selection or the exact record returns. No OS-focus inference.
 
 `companion.focus` requires exactly one live match not owned by another familiar; missing/ambiguous/conflicting matches leave the pin unchanged. Include `instance` to disambiguate. `companion.next` cycles eligible live records, including terminals, in lexical `(source, instance, activity)` order; an unavailable pin starts at the first eligible record. Selection clears only that familiar's cue without historical celebration. Background updates cannot take over. Bindings, cues and summary caches are per familiar over one canonical activity store.
 
@@ -282,6 +289,8 @@ A latest-only mailbox coalesces presentations with one pending GUI wake; accepta
 Tab/L reveal that view on live resume; 1–9 (and non-macOS right-click) reveal its Preview. On macOS right-click opens the native menu. Demo cycling does not auto-reveal. Initial `main` can request startup focus with `--focus`; non-macOS left-click retains its explicit focus/drag request. Later Open, notifications and reveal never request focus; actual native menu/drag focus acceptance remains manual.
 
 ## Edge Cases
+
+Current unbound UI text supersedes the older no-conversation wording above: menu **Unattached**, bubble **Unattached familiar** / **Click for actions** / **Unattached**. Preview remains unchanged. This is not the Unavailable state of a retained bound pin.
 
 ### Bounds and EOF
 
@@ -316,6 +325,20 @@ An active listener collision refuses startup. Only a user-owned socket whose bou
 The bundled synchronous publisher bounds connection, write and ACK waits to 500 ms as applicable and validates ACKs. It reports errors/nonzero exit rather than silently ignoring them. Its synchronous stderr logging can still block. It is an interactive diagnostic, not a safe automatic agent callback or stable best-effort SDK. Adapters must isolate publishing from source execution and recover current state via snapshots; the optional Djinn transport is separate from this diagnostic command.
 
 ## Example usage
+
+```sh
+numen # Reuse GUI or bounded empty bootstrap; open one unattached familiar
+numen open # Requires that GUI already running; no target picker
+numen open --source djinn --activity chatid --instance producer-1 # Restore saved chat appearance/placement
+```
+
+Mixed Open wire example (running GUI; target must be live/unclaimed):
+
+```json
+{"version":1,"type":"familiar.open","items":[{"id":"free-pet"},{"source":"djinn","activity":"chatid","instance":null}]}
+```
+
+Native **Open another familiar** is internal: `FamiliarControl::open_unattached` → bounded shared queue → worker graphical/capacity recheck → canonical `Store::open` with `target: None` → complete snapshot → GUI reconciliation. It is live-service-only and service-scoped, independent of clicked-view survival; unlike Quit it neither exits nor executes a source. Queue acceptance never creates an optimistic view. Native Attach keeps exact tuple/incarnation/stale-binding guards and preserves first-attachment appearance/location.
 
 Service-only controls need no producer registration:
 

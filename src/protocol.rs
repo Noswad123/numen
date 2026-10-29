@@ -124,14 +124,63 @@ fn default_preset() -> String {
     "djinn".into()
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct OpenRequest {
-    #[serde(default)]
     pub id: Option<String>,
-    #[serde(default = "default_preset")]
     pub preset: String,
-    #[serde(flatten)]
-    pub target: TargetRequest,
+    pub target: Option<TargetRequest>,
+}
+
+impl<'de> Deserialize<'de> for OpenRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Option<T>, D::Error> {
+            T::deserialize(deserializer).map(Some)
+        }
+        // Keep the v1 flat wire shape. Presence matters even for instance:null.
+        #[derive(Deserialize)]
+        struct Fields {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default = "default_preset")]
+            preset: String,
+            #[serde(default, deserialize_with = "present")]
+            source: Option<String>,
+            #[serde(default, deserialize_with = "present")]
+            activity: Option<String>,
+            #[serde(default, deserialize_with = "present")]
+            instance: Option<Option<String>>,
+            #[serde(default, deserialize_with = "present")]
+            target: Option<serde::de::IgnoredAny>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        if fields.target.is_some() {
+            return Err(serde::de::Error::custom(
+                "target must use flat source/instance/activity fields",
+            ));
+        }
+        let target = match (fields.source, fields.activity, fields.instance) {
+            (None, None, None) => None,
+            (Some(source), Some(activity), instance) => Some(TargetRequest {
+                source,
+                activity,
+                instance: instance.flatten(),
+            }),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "target requires source and activity",
+                ));
+            }
+        };
+        Ok(Self {
+            id: fields.id,
+            preset: fields.preset,
+            target,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -386,7 +435,9 @@ impl Request {
                         validate_id(id)?;
                     }
                     ensure!(item.preset == "djinn", "unknown preset");
-                    item.target.validate()?;
+                    if let Some(target) = &item.target {
+                        target.validate()?;
+                    }
                 }
             }
             Event::Attach { items } => {
@@ -433,6 +484,45 @@ fn validate_snapshot(activities: &[Activity]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_target_is_flat_complete_or_entirely_absent() {
+        for item in [
+            r#"{}"#,
+            r#"{"future":true}"#,
+            r#"{"source":"a","activity":"b"}"#,
+            r#"{"source":"a","activity":"b","instance":null}"#,
+            r#"{"source":"a","activity":"b","instance":"one"}"#,
+        ] {
+            let packet = format!(r#"{{"version":1,"type":"familiar.open","items":[{item}]}}"#);
+            let Event::Open { items } = Request::parse(packet.as_bytes()).unwrap().event else {
+                panic!("expected open");
+            };
+            assert_eq!(items[0].target.is_some(), item.contains("source"));
+        }
+        for item in [
+            r#"{"source":"a"}"#,
+            r#"{"activity":"b"}"#,
+            r#"{"instance":"one"}"#,
+            r#"{"instance":null}"#,
+            r#"{"source":null}"#,
+            r#"{"activity":null}"#,
+            r#"{"source":null,"activity":"b"}"#,
+            r#"{"source":"a","activity":null}"#,
+            r#"{"source":null,"activity":null}"#,
+            r#"{"target":{"source":"a","activity":"b"}}"#,
+            r#"{"target":null}"#,
+            r#"{"source":"a","activity":"bad/id"}"#,
+            r#"{"id":null,"id":"x"}"#,
+            r#"{"preset":"djinn","preset":"djinn"}"#,
+            r#"{"source":"a","source":"a","activity":"b"}"#,
+            r#"{"source":"a","activity":"b","activity":"b"}"#,
+            r#"{"source":"a","activity":"b","instance":null,"instance":null}"#,
+        ] {
+            let packet = format!(r#"{{"version":1,"type":"familiar.open","items":[{item}]}}"#);
+            assert!(Request::parse(packet.as_bytes()).is_err(), "{item}");
+        }
+    }
 
     #[test]
     fn forget_preferences_validates_unique_bounded_ids() {

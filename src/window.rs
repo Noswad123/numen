@@ -2257,6 +2257,10 @@ impl App {
                 settings: self.control.as_ref().map(|_| view.settings),
                 preferences: menu_binding.is_some(),
                 attachments,
+                open_familiar: self
+                    .control
+                    .as_ref()
+                    .map(|_| self.views.len() < crate::protocol::MAX_FAMILIARS),
             });
         let result = if let Some(context) =
             context.filter(|_| !event_loop.exiting() && !self.quit_pending.load(Ordering::Acquire))
@@ -2343,13 +2347,11 @@ impl App {
         else {
             return;
         };
-        // Service-wide actions do not depend on the clicked familiar surviving.
-        if action.is_service() {
-            info!("Quit Numen requested; closing graphical service");
-            event_loop.exit();
+        if event_loop.exiting() {
             return;
         }
-        if event_loop.exiting() {
+        // Service-wide actions do not depend on the clicked familiar surviving.
+        if self.dispatch_service_menu(action, || event_loop.exit()) {
             return;
         }
         let view = self.views.get_mut(id).expect("validated menu target");
@@ -2400,6 +2402,24 @@ impl App {
             Action::CloseFamiliar => view.close(event_loop),
             _ => {}
         }
+    }
+
+    fn dispatch_service_menu(&self, action: Action, quit: impl FnOnce()) -> bool {
+        match action {
+            Action::QuitNumen => {
+                info!("Quit Numen requested; closing graphical service");
+                quit();
+            }
+            Action::OpenFamiliar => {
+                if let Some(control) = &self.control
+                    && let Err(error) = control.open_unattached(DEFAULT_CHARACTER_ID)
+                {
+                    warn!(%error, "Could not queue opening another familiar");
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -3616,6 +3636,7 @@ mod tests {
                 settings: Some(view.settings),
                 preferences: false,
                 attachments: None,
+                open_familiar: None,
             });
             let context_menu::Entry::Submenu {
                 entries: fields, ..
@@ -3642,7 +3663,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_actions_fail_closed_but_quit_is_service_wide() {
+    fn menu_actions_fail_closed_but_open_and_quit_are_service_wide() {
         let current = WindowId::from(1);
         let stale = WindowId::from(2);
         for (window, closing, failed) in [
@@ -3669,6 +3690,10 @@ mod tests {
             assert_eq!(
                 validated_menu_action(Some(Action::QuitNumen), valid),
                 Some(Action::QuitNumen)
+            );
+            assert_eq!(
+                validated_menu_action(Some(Action::OpenFamiliar), valid),
+                Some(Action::OpenFamiliar)
             );
         }
         assert!(menu_target_valid(current, Some(current), false, false));
@@ -4065,6 +4090,257 @@ mod tests {
             .unwrap();
         assert_eq!(familiar_settings(&view.options), updated);
         assert!(view.deferred_settings.is_none());
+    }
+
+    #[test]
+    fn service_open_outlives_clicked_view_and_only_commits_new_default_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private/open.sock");
+        let (send, receive) = std::sync::mpsc::channel();
+        let defaults = FamiliarSettings::default();
+        let server = Server::start_graphical_with_settings(
+            &path,
+            move |snapshot| send.send(snapshot).unwrap(),
+            |_| {},
+            None,
+            || {},
+            true,
+            defaults,
+        )
+        .unwrap();
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        app.control = Some(server.familiar_control());
+        app.stage_snapshot(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(app.dispatch_service_menu(Action::OpenFamiliar, || panic!("open quit")));
+        assert_eq!(app.views.len(), 1, "queueing must not create a view");
+        app.stage_snapshot(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+        app.control.as_ref().unwrap().close("main").unwrap();
+        app.stage_snapshot(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(!app.views.contains_key("main"));
+        let patch = crate::protocol::SettingsPatch {
+            font_size: Some(19.0),
+            ..Default::default()
+        };
+        app.control
+            .as_ref()
+            .unwrap()
+            .settings("familiar-1", patch)
+            .unwrap();
+        app.stage_snapshot(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+        let view = app.views.get_mut("familiar-1").unwrap();
+        view.paused = true;
+        view.display.manual(Animation::Waving);
+        view.select(Animation::Waving);
+        view.navigation = Some(Navigation::Celebrating);
+        view.hidden_position = Some(PhysicalPosition::new(321, 654));
+        let settings = view.settings;
+        let binding = view.runtime_binding.clone();
+        let tick = view.last_tick;
+        let selected = validated_menu_action(Some(Action::OpenFamiliar), false).unwrap();
+        assert!(app.dispatch_service_menu(selected, || panic!("open quit")));
+        assert_eq!(app.views.len(), 1);
+        app.stage_snapshot(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+        let existing = &app.views["familiar-1"];
+        assert_eq!(existing.settings, settings);
+        assert_eq!(existing.runtime_binding, binding);
+        assert!(existing.paused);
+        assert!(existing.display.is_manual());
+        assert_eq!(existing.player.animation(), Animation::Waving);
+        assert!(matches!(existing.navigation, Some(Navigation::Celebrating)));
+        assert_eq!(
+            existing.hidden_position,
+            Some(PhysicalPosition::new(321, 654))
+        );
+        assert_eq!(existing.last_tick, tick);
+        let new = &app.views["familiar-2"];
+        assert_eq!(new.settings, defaults);
+        assert_eq!(new.runtime_binding.target, None);
+        assert!(new.runtime_binding.generation > 0);
+        assert!(new.preference.is_none());
+        assert!(!new.paused);
+        assert!(!new.display.is_manual());
+        assert!(new.navigation.is_none());
+        assert!(new.hidden_position.is_none());
+        assert_eq!(new.latest_view, Presentation::default());
+
+        // Manual/demo mode has no live control and must neither start a service nor quit.
+        app.control = None;
+        assert!(app.dispatch_service_menu(Action::OpenFamiliar, || panic!("open quit")));
+        assert_eq!(app.views.len(), 2);
+        let mut quit = false;
+        assert!(app.dispatch_service_menu(Action::QuitNumen, || quit = true));
+        assert!(quit);
+        assert!(!app.dispatch_service_menu(Action::CloseFamiliar, || panic!("close quit")));
+    }
+
+    #[test]
+    fn first_manual_attachment_preserves_unbound_state_and_never_loads_saved_destination() {
+        use crate::protocol::{Activity, ActivityState, AttachRequest, OpenRequest, TargetRequest};
+
+        for id in ["main", "familiar-1"] {
+            for manual in [false, true] {
+                for navigating in [false, true] {
+                    let now = Instant::now();
+                    let settings = FamiliarSettings {
+                        font_size: 19.0,
+                        ..Default::default()
+                    };
+                    let saved = FamiliarSettings {
+                        sprite_scale: 2.0,
+                        font_size: 24.0,
+                        bubble_duration: 9.0,
+                    };
+                    let mut store = crate::activity::Store::with_settings(true, settings);
+                    store.set_auto_select_main(false);
+                    store.enable_preferences(
+                        preferences::Document {
+                            version: 1,
+                            records: vec![preferences::Record {
+                                source: "source".into(),
+                                activity: "chat".into(),
+                                settings: saved,
+                                placement: Some(Placement { x: 900.0, y: 700.0 }),
+                            }],
+                        },
+                        true,
+                    );
+                    if id != "main" {
+                        assert_eq!(
+                            store
+                                .open(&[OpenRequest {
+                                    id: None,
+                                    preset: DEFAULT_CHARACTER_ID.into(),
+                                    target: None,
+                                }])
+                                .unwrap(),
+                            [id]
+                        );
+                    }
+                    let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+                    app.stage_snapshot(store.presentations(now));
+                    let view = app.views.get_mut(id).unwrap();
+                    view.bootstrap_unbound = id == "main";
+                    view.paused = true;
+                    if navigating {
+                        view.start_navigation(now);
+                    }
+                    if manual {
+                        view.display.manual(Animation::Waving);
+                        view.select(Animation::Waving);
+                    }
+                    view.hidden_position = Some(PhysicalPosition::new(123, 456));
+                    let previous_binding = view.runtime_binding.clone();
+                    assert!(previous_binding.target.is_none());
+                    assert!(previous_binding.generation > 0);
+                    assert!(view.preference.is_none());
+                    // A producer appearing after the unbound open must not select it implicitly.
+                    store
+                        .register(
+                            ("source".into(), "actor".into()),
+                            vec![Activity {
+                                activity: "chat".into(),
+                                sequence: 1,
+                                state: ActivityState::Waiting,
+                                attention: true,
+                                reason: None,
+                                summary: Some("Latest chat".into()),
+                            }],
+                            now,
+                        )
+                        .unwrap();
+                    let unbound = store.presentations(now);
+                    assert!(unbound.iter().all(|f| f.runtime_binding.target.is_none()));
+                    app.stage_snapshot(unbound);
+                    store
+                        .attach(&[AttachRequest {
+                            id: id.into(),
+                            target: TargetRequest {
+                                source: "source".into(),
+                                instance: Some("actor".into()),
+                                activity: "chat".into(),
+                            },
+                        }])
+                        .unwrap();
+                    for (id, presentation) in app.stage_snapshot(store.presentations(now)) {
+                        let view = app.views.get_mut(&id).unwrap();
+                        view.latest_view = presentation.clone();
+                        view.source_animation(presentation);
+                    }
+                    let view = &app.views[id];
+                    assert!(view.runtime_binding.generation > previous_binding.generation);
+                    assert_eq!(
+                        view.runtime_binding.target.as_ref().unwrap().instance,
+                        "actor"
+                    );
+                    assert_eq!(view.settings, settings);
+                    assert_eq!(familiar_settings(&view.options), settings);
+                    let preference = view.preference.as_ref().unwrap();
+                    assert!(preference.writable);
+                    assert!(preference.placement.is_none());
+                    assert!(!view.first_binding_restore);
+                    assert!(view.pending_restore.is_none());
+                    assert_eq!(view.hidden_position, Some(PhysicalPosition::new(123, 456)));
+                    assert!(view.paused);
+                    assert_eq!(view.display.is_manual(), manual);
+                    assert_eq!(view.seeking(), navigating);
+                    let following = view.latest_view.following.as_ref().unwrap();
+                    assert_eq!(following.summary.as_deref(), Some("Latest chat"));
+                    assert!(following.available);
+                    let binding = view.runtime_binding.clone();
+                    let animation = view.player.animation();
+                    store
+                        .apply(
+                            &("source".into(), "actor".into()),
+                            crate::protocol::Event::State {
+                                activity: Activity {
+                                    activity: "chat".into(),
+                                    sequence: 2,
+                                    state: ActivityState::Succeeded,
+                                    attention: false,
+                                    reason: None,
+                                    summary: Some("Completed chat".into()),
+                                },
+                            },
+                            now,
+                        )
+                        .unwrap();
+                    for (id, presentation) in app.stage_snapshot(store.presentations(now)) {
+                        let view = app.views.get_mut(&id).unwrap();
+                        view.latest_view = presentation.clone();
+                        view.source_animation(presentation);
+                    }
+                    let view = &app.views[id];
+                    assert_eq!(view.runtime_binding, binding);
+                    assert_eq!(
+                        view.latest_view.base.as_ref().unwrap().state,
+                        ActivityState::Succeeded
+                    );
+                    assert_eq!(
+                        view.latest_view
+                            .following
+                            .as_ref()
+                            .unwrap()
+                            .summary
+                            .as_deref(),
+                        Some("Completed chat")
+                    );
+                    assert_eq!(view.display.is_manual(), manual);
+                    assert_eq!(view.seeking(), navigating);
+                    assert!(view.paused);
+                    assert_eq!(view.hidden_position, Some(PhysicalPosition::new(123, 456)));
+                    if manual || navigating {
+                        assert_eq!(view.player.animation(), animation);
+                    }
+                    let patch = crate::protocol::SettingsPatch {
+                        font_size: Some(20.0),
+                        ..Default::default()
+                    };
+                    store.settings(&[id.into()], patch).unwrap();
+                    let (_, document) = store.preference_document().unwrap();
+                    assert_eq!(document.records[0].settings.font_size, 20.0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -4625,7 +4901,8 @@ mod tests {
 
     fn options() -> RunOptions {
         use clap::Parser;
-        let crate::Command::Run(options) = crate::Cli::parse_from(["numen", "run"]).command else {
+        let Some(crate::Command::Run(options)) = crate::Cli::parse_from(["numen", "run"]).command
+        else {
             unreachable!()
         };
         options
@@ -5490,7 +5767,8 @@ mod tests {
             (Animation::Failed, Animation::Review),
             (Animation::Waving, Animation::RunningLeft),
         ] {
-            let crate::Command::Run(mut options) = crate::Cli::parse_from(["numen", "run"]).command
+            let Some(crate::Command::Run(mut options)) =
+                crate::Cli::parse_from(["numen", "run"]).command
             else {
                 unreachable!()
             };
