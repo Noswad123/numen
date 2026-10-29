@@ -587,7 +587,7 @@ fn headless_discovery_reports_live_targets_but_no_lifecycle_capabilities() {
     assert_eq!(
         familiars,
         json!({"familiars":[{"id":"main","preset":"djinn","attachment":attachment,
-            "available":true,"capabilities":[]}],"offset":0,"total":1,"next_offset":null})
+            "available":true,"capabilities":[],"settings":{"sprite_scale":0.5,"font_size":12.0,"bubble_duration":5.0}}],"offset":0,"total":1,"next_offset":null})
     );
     assert_eq!(
         control(&socket, &["familiars", "--offset", "1"]),
@@ -659,6 +659,20 @@ fn headless_discovery_reports_live_targets_but_no_lifecycle_capabilities() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(
         stderr.contains("go-to-mouse requires graphical navigation support"),
+        "{stderr}"
+    );
+    let mut settings = ChildGuard(
+        command(&socket)
+            .args(["settings", "--familiar", "main", "--font-size", "16"])
+            .spawn()
+            .unwrap(),
+    );
+    let status = settings.wait_until(deadline);
+    let (stdout, stderr) = settings.output();
+    assert!(!status.success(), "accepted headless settings command");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("settings requires live graphical settings support"),
         "{stderr}"
     );
     assert_eq!(control(&socket, &["familiars"]), familiars);
@@ -893,6 +907,104 @@ fn targeted_controls_serialize_familiar_ids_and_print_ack_data() {
             json!({"focus":{"source":"build","instance":"two","activity":"b"},"activities":[]}),
         );
     }
+}
+
+#[test]
+fn settings_serializes_only_explicit_fields_in_one_atomic_request() {
+    for (flags, patch) in [
+        (vec!["--sprite-scale", "0.25"], json!({"sprite_scale":0.25})),
+        (vec!["--font-size", "16"], json!({"font_size":16.0})),
+        (
+            vec!["--bubble-duration", "2"],
+            json!({"bubble_duration":2.0}),
+        ),
+        (
+            vec![
+                "--sprite-scale",
+                "2",
+                "--font-size",
+                "32",
+                "--bubble-duration",
+                "30",
+            ],
+            json!({"sprite_scale":2.0,"font_size":32.0,"bubble_duration":30.0}),
+        ),
+        (
+            vec!["--font-size", "8", "--bubble-duration", "0.25"],
+            json!({"font_size":8.0,"bubble_duration":0.25}),
+        ),
+    ] {
+        let mut args = vec!["settings", "--familiar", "first", "second"];
+        args.extend(flags);
+        mock_control(
+            &args,
+            None,
+            json!({"version":1,"type":"familiar.settings","ids":["first","second"],"patch":patch}),
+            json!({"updated":["second","first"]}),
+        );
+    }
+}
+
+#[test]
+fn settings_rejects_invalid_options_before_connecting() {
+    let (dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let mut cases = vec![
+        vec!["settings".to_owned()],
+        vec!["settings".into(), "--font-size".into(), "16".into()],
+        vec!["settings".into(), "--familiar".into(), "a".into()],
+    ];
+    for ids in [
+        vec!["".into()],
+        vec!["bad/id".into()],
+        vec!["a".into(), "a".into()],
+        (0..17).map(|n| format!("f{n}")).collect(),
+    ] {
+        let mut args = vec![
+            "settings".into(),
+            "--font-size".into(),
+            "16".into(),
+            "--familiar".into(),
+        ];
+        args.extend(ids);
+        cases.push(args);
+    }
+    for (flag, values) in [
+        (
+            "--sprite-scale",
+            vec!["0.24", "2.01", "0", "NaN", "inf", "-inf"],
+        ),
+        ("--font-size", vec!["7.9", "32.1", "0", "NaN", "Inf", "-1"]),
+        (
+            "--bubble-duration",
+            vec!["0.24", "30.01", "0", "NaN", "inf", "-1"],
+        ),
+        ("--config", vec!["unknown.json"]),
+        ("--unknown", vec!["1"]),
+    ] {
+        for value in values {
+            cases.push(
+                ["settings", "--familiar", "a", flag, value]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
+        }
+    }
+    for args in cases {
+        let mut child = ChildGuard(command(&socket).args(&args).spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert!(!status.success(), "accepted {args:?}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        assert!(!stderr.is_empty(), "{args:?}");
+        assert!(
+            matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "{args:?}: connected before validation"
+        );
+    }
+    assert!(!dir.path().join("service.log").exists());
 }
 
 #[test]
@@ -1255,6 +1367,35 @@ fn service_info_reports_actual_headless_listener_pid_and_capabilities() {
         instance
     );
     assert_eq!(
+        info.as_object_mut().unwrap().remove("settings"),
+        Some(json!(false))
+    );
+    assert_eq!(
+        info.as_object_mut().unwrap().remove("familiar_count"),
+        Some(json!(1))
+    );
+    assert_eq!(
+        info.as_object_mut().unwrap().remove("source_count"),
+        Some(json!(0))
+    );
+    let diagnostics = info.as_object_mut().unwrap().remove("diagnostics").unwrap();
+    assert_eq!(diagnostics["version"], 1);
+    assert_eq!(diagnostics["build"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        diagnostics["hotkeys"]["option_i"],
+        json!({"state":"unavailable","reason":"headless"})
+    );
+    assert_eq!(
+        diagnostics["hotkeys"]["option_m"],
+        diagnostics["hotkeys"]["option_i"]
+    );
+    let doctor = control(&socket, &["doctor", "--json"]);
+    assert_eq!(doctor["service_state"], "reachable");
+    assert_eq!(doctor["service"]["pid"], listener.0.id());
+    assert_eq!(doctor["service"]["diagnostics"], diagnostics);
+    assert_eq!(doctor["client"]["build"], diagnostics["build"]);
+    assert_eq!(doctor["build_comparison"], "match");
+    assert_eq!(
         info,
         json!({"api_version":1,"pid":listener.0.id(),"graphical":false,
             "lifecycle":false,"navigation":false})
@@ -1263,6 +1404,372 @@ fn service_info_reports_actual_headless_listener_pid_and_capabilities() {
     let (_, stderr) = listener.output();
     assert!(status.success(), "{stderr}");
     assert!(!socket.exists());
+}
+
+#[test]
+fn doctor_offline_does_not_create_socket_parent_or_logs() {
+    let (dir, socket) = fixture();
+    let leaf = dir.path().join("missing");
+    for path in [&socket, &leaf.join("s")] {
+        for json in [false, true] {
+            let mut cmd = command(path);
+            cmd.current_dir(dir.path()).arg("doctor");
+            if json {
+                cmd.arg("--json");
+            }
+            let mut child = ChildGuard(cmd.spawn().unwrap());
+            let status = child.wait_until(Instant::now() + LIMIT);
+            let (stdout, stderr) = child.output();
+            assert!(status.success(), "{stderr}");
+            assert!(stderr.is_empty(), "{stderr}");
+            if json {
+                let report: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(report["service_state"], "not_running");
+                assert_eq!(report["service"], Value::Null);
+                assert_eq!(report["build_comparison"], "unknown");
+                assert!(Path::new(report["client"]["executable"].as_str().unwrap()).is_absolute());
+            } else {
+                assert!(stdout.contains("Service: not_running"));
+                assert!(stdout.contains("Comparison: unknown"));
+            }
+            assert!(!leaf.exists());
+            assert!(!socket.exists());
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+    // A refused, private stale socket is informational, but must not be removed.
+    drop(UnixListener::bind(&socket).unwrap());
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        control(&socket, &["doctor", "--json"])["service_state"],
+        "not_running"
+    );
+    assert!(socket.exists());
+}
+
+#[test]
+fn doctor_default_socket_resolution_does_not_create_runtime_leaf() {
+    let (dir, _) = fixture();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_numen"))
+            .args(["doctor", "--json"])
+            .current_dir(dir.path())
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("PATH", dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let status = child.wait_until(Instant::now() + LIMIT);
+    let (stdout, stderr) = child.output();
+    assert!(status.success(), "{stderr}");
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["service_state"], "not_running");
+    assert_eq!(
+        Path::new(report["socket"].as_str().unwrap()),
+        dir.path().join("numen/events.sock")
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+fn doctor_mock(reply: Option<&str>, human: bool) -> (ExitStatus, String, String) {
+    let (_dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let mut cmd = command(&socket);
+    cmd.arg("doctor");
+    if !human {
+        cmd.arg("--json");
+    }
+    let mut child = ChildGuard(cmd.spawn().unwrap());
+    let deadline = Instant::now() + LIMIT;
+    let stream = loop {
+        match server.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "doctor never connected");
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "doctor exited before request"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("accept: {error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream.set_read_timeout(Some(LIMIT)).unwrap();
+    stream.set_write_timeout(Some(LIMIT)).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).unwrap() > 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap(),
+        json!({"version":1,"type":"companion.service"})
+    );
+    if let Some(reply) = reply {
+        writeln!(reader.get_mut(), "{reply}").unwrap();
+    }
+    let status = child.wait_until(deadline);
+    let (stdout, stderr) = child.output();
+    line.clear();
+    assert_eq!(
+        reader.read_line(&mut line).unwrap(),
+        0,
+        "extra request: {line}"
+    );
+    assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    (status, stdout, stderr)
+}
+
+fn doctor_data(data: &Value) -> Value {
+    let reply = json!({"version":1,"ok":true,"data":data}).to_string();
+    let (status, stdout, stderr) = doctor_mock(Some(&reply), false);
+    assert!(status.success(), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    serde_json::from_str(&stdout).unwrap()
+}
+
+fn legacy_service() -> Value {
+    json!({"api_version":1,"pid":123,"service_instance":"mock-service",
+        "graphical":true,"lifecycle":true,"navigation":true})
+}
+
+// Keep this as wire text: constructing a Value would erase duplicate-key evidence.
+const DOCTOR_ACK: &str = r#"{"version":1,"ok":true,"data":{"api_version":1,"pid":123,"service_instance":"mock-service","graphical":true,"lifecycle":true,"navigation":true,"settings":true,"familiar_count":1,"source_count":0,"diagnostics":{"version":1,"executable":"/safe/path","build":{"version":"0.1.0","fingerprint":"unknown","source_fingerprint":"unknown","target":"target","profile":"profile"},"hotkeys":{"option_i":{"state":"registered","reason":null},"option_m":{"state":"registered","reason":null}}}}}"#;
+
+#[test]
+fn doctor_rejects_contradictory_shortcut_states_and_per_key_reasons() {
+    for (key, state, reason) in [
+        ("option_i", "registered", "registration_failed"),
+        ("option_m", "registered", "registration_failed"),
+        ("option_i", "disabled", "registration_pending"),
+        ("option_m", "disabled", "no_bubble"),
+        ("option_i", "unavailable", "pointer_initialization_failed"),
+        ("option_i", "unsupported", "unsupported_mode"),
+    ] {
+        let reply = DOCTOR_ACK.replace(
+            &format!(r#""{key}":{{"state":"registered","reason":null}}"#),
+            &format!(r#""{key}":{{"state":"{state}","reason":"{reason}"}}"#),
+        );
+        assert_ne!(reply, DOCTOR_ACK);
+        let (status, stdout, stderr) = doctor_mock(Some(&reply), false);
+        assert_eq!(status.code(), Some(1), "{reply}: {stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(
+            stderr.contains("invalid service shortcut metadata"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn doctor_rejects_recursive_duplicate_ack_keys_before_value_collapse() {
+    for (needle, duplicate) in [
+        (r#""pid":123"#, r#""pid":0,"pid":123"#),
+        (
+            r#""executable":"/safe/path""#,
+            r#""executable":"/unsafe/\u202epath","executable":"/safe/path""#,
+        ),
+        (
+            r#""fingerprint":"unknown""#,
+            r#""fingerprint":"malicious","fingerprint":"unknown""#,
+        ),
+        (
+            r#""source_fingerprint":"unknown""#,
+            r#""source_fingerprint":"malicious","source_fingerprint":"unknown""#,
+        ),
+        (
+            r#""state":"registered""#,
+            r#""state":"disabled","state":"registered""#,
+        ),
+    ] {
+        let reply = DOCTOR_ACK.replacen(needle, duplicate, 1);
+        assert_ne!(reply, DOCTOR_ACK);
+        let (status, stdout, stderr) = doctor_mock(Some(&reply), false);
+        assert_eq!(status.code(), Some(1), "{reply}: {stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(!stderr.is_empty());
+        assert!(!stderr.contains("malicious"));
+    }
+}
+
+#[test]
+fn doctor_accepts_bounded_256_byte_build_labels_but_rejects_unsafe_labels() {
+    for field in ["version", "target", "profile"] {
+        let original = match field {
+            "version" => "0.1.0",
+            "target" => "target",
+            _ => "profile",
+        };
+        let needle = format!(r#""{field}":"{original}""#);
+        let reply = DOCTOR_ACK.replace(&needle, &format!(r#""{field}":"{}""#, "a".repeat(256)));
+        assert_ne!(reply, DOCTOR_ACK);
+        let (status, stdout, stderr) = doctor_mock(Some(&reply), false);
+        assert!(status.success(), "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["service_state"], "reachable");
+        assert_eq!(report["build_comparison"], "unknown");
+        assert_eq!(
+            report["service"]["diagnostics"]["build"][field],
+            "a".repeat(256)
+        );
+        for value in [
+            "a".repeat(257),
+            r#"bad\nlabel"#.into(),
+            r#"bad\u202elabel"#.into(),
+        ] {
+            let reply = DOCTOR_ACK.replace(&needle, &format!(r#""{field}":"{value}""#));
+            let (status, stdout, stderr) = doctor_mock(Some(&reply), false);
+            assert_eq!(status.code(), Some(1), "{reply}: {stderr}");
+            assert!(stdout.is_empty(), "{stdout}");
+            assert!(!stderr.is_empty());
+            assert!(!stderr.contains("bad"));
+        }
+    }
+}
+
+#[test]
+fn doctor_compares_embedded_metadata_not_pid_path_or_package_version() {
+    let (_dir, socket) = fixture();
+    let client = control(&socket, &["doctor", "--json"])["client"].clone();
+    let mut data = legacy_service();
+    data["settings"] = json!(true);
+    data["familiar_count"] = json!(2);
+    data["source_count"] = json!(3);
+    data["diagnostics"] = json!({"version":1,"executable":client["executable"],"build":client["build"],
+        "hotkeys":{"option_i":{"state":"registered","reason":null},
+        "option_m":{"state":"unavailable","reason":"registration_failed"}}});
+    let report = doctor_data(&data);
+    assert_eq!(report["service_state"], "reachable");
+    assert_eq!(report["build_comparison"], "match");
+    let reply = json!({"version":1,"ok":true,"data":data}).to_string();
+    let (status, stdout, stderr) = doctor_mock(Some(&reply), true);
+    assert!(status.success(), "{stderr}");
+    assert!(stdout.contains("Comparison: match (recorded build/input fingerprints)"));
+    assert!(stdout.contains("Match does not guarantee identical executables"));
+    assert!(stdout.contains("different is not proof of age"));
+    assert_eq!(report["service"]["source_count"], 3);
+    assert_eq!(
+        report["service"]["diagnostics"]["hotkeys"]["option_m"]["reason"],
+        "registration_failed"
+    );
+    // Same installed path and version are not enough when recorded build inputs differ.
+    data["diagnostics"]["build"]["fingerprint"] =
+        json!(format!("numen-build-v1-fnv1a128:{}", "a".repeat(32)));
+    assert_eq!(doctor_data(&data)["build_comparison"], "different");
+    data["diagnostics"]["build"]["fingerprint"] = json!("unknown");
+    assert_eq!(doctor_data(&data)["build_comparison"], "unknown");
+    let reply = json!({"version":1,"ok":true,"data":data}).to_string();
+    let (status, stdout, stderr) = doctor_mock(Some(&reply), true);
+    assert!(status.success(), "{stderr}");
+    assert!(stdout.contains("Option+I: registered"));
+    assert!(stdout.contains("Option+M: unavailable (reason: registration_failed)"));
+    assert!(stdout.contains("Comparison: unknown"));
+    assert!(!stdout.contains("Comparison: older"));
+}
+
+#[test]
+fn doctor_legacy_and_future_diagnostics_remain_unknown() {
+    let mut data = legacy_service();
+    let legacy = doctor_data(&data);
+    assert_eq!(legacy["service_state"], "legacy");
+    assert_eq!(legacy["build_comparison"], "unknown");
+    assert_eq!(legacy["service"]["settings"], Value::Null);
+    assert_eq!(legacy["service"]["diagnostics"], Value::Null);
+    data["diagnostics"] =
+        json!({"version":2,"executable":"bad\npath","hotkeys":{"option_i":{"state":"registered"}}});
+    let future = doctor_data(&data);
+    assert_eq!(future["service_state"], "unsupported_diagnostics");
+    assert_eq!(future["build_comparison"], "unknown");
+    assert_eq!(future["service"]["diagnostics"], Value::Null);
+    assert!(!future.to_string().contains("bad"));
+    let reply = json!({"version":1,"ok":true,"data":legacy_service()}).to_string();
+    let (status, stdout, stderr) = doctor_mock(Some(&reply), true);
+    assert!(status.success(), "{stderr}");
+    assert!(stdout.contains("Option+I: unknown"));
+    assert!(stdout.contains("Option+M: unknown"));
+    assert!(!stdout.contains("disabled"));
+    assert!(stdout.contains("legacy, or unsupported diagnostics leave comparison unknown"));
+}
+
+#[test]
+fn doctor_live_read_and_schema_failures_are_errors_not_offline() {
+    let mut cases = vec![
+        None,
+        Some("not-json".to_owned()),
+        Some(json!({"version":2,"ok":true,"data":legacy_service()}).to_string()),
+        Some(json!({"version":1,"ok":false,"error":"private untrusted error"}).to_string()),
+    ];
+    for (field, value) in [
+        ("api_version", json!(2)),
+        ("pid", json!(0)),
+        ("service_instance", json!("bad/id")),
+        ("navigation", json!("true")),
+        ("diagnostics", json!({"version":1})),
+        ("diagnostics", json!(null)),
+    ] {
+        let mut data = legacy_service();
+        data[field] = value;
+        cases.push(Some(json!({"version":1,"ok":true,"data":data}).to_string()));
+    }
+    let (_dir, socket) = fixture();
+    let build = control(&socket, &["doctor", "--json"])["client"]["build"].clone();
+    for (field, value) in [
+        ("executable", json!("bad\npath")),
+        ("executable", json!("x".repeat(1025))),
+        ("executable", json!("/path/\u{202e}bad")),
+        (
+            "build",
+            json!({"version":"1","fingerprint":"malicious","source_fingerprint":"unknown","target":"t","profile":"p"}),
+        ),
+        (
+            "hotkeys",
+            json!({"option_i":{"state":"registered","reason":"arbitrary text"},"option_m":{"state":"registered"}}),
+        ),
+    ] {
+        let mut data = legacy_service();
+        data["settings"] = json!(false);
+        data["familiar_count"] = json!(1);
+        data["source_count"] = json!(0);
+        data["diagnostics"] = json!({"version":1,"executable":"/safe/path","build":build,
+            "hotkeys":{"option_i":{"state":"registered","reason":null},"option_m":{"state":"registered","reason":null}}});
+        data["diagnostics"][field] = value;
+        cases.push(Some(json!({"version":1,"ok":true,"data":data}).to_string()));
+    }
+    for reply in cases {
+        let (status, stdout, stderr) = doctor_mock(reply.as_deref(), false);
+        assert_eq!(status.code(), Some(1), "{reply:?}: {stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(!stderr.is_empty());
+        assert!(!stderr.contains("private untrusted error"));
+    }
+}
+
+#[test]
+fn doctor_rejects_unsafe_socket_permissions_without_connecting() {
+    let (dir, socket) = fixture();
+    let server = UnixListener::bind(&socket).unwrap();
+    server.set_nonblocking(true).unwrap();
+    for (parent_mode, socket_mode) in [(0o700, 0o666), (0o755, 0o600)] {
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(parent_mode)).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(socket_mode)).unwrap();
+        let mut child = ChildGuard(command(&socket).args(["doctor", "--json"]).spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert_eq!(status.code(), Some(1));
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+        assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        assert!(socket.exists());
+        assert!(!dir.path().join("service.log").exists());
+    }
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]
@@ -1362,4 +1869,137 @@ fn menu_with_mock_fzf_and_pty_dispatches_info_without_a_gui() {
     assert_eq!(stdout.trim(), "Accepted info: main");
     assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
     assert!(!dir.path().join("service.log").exists());
+}
+
+#[test]
+fn menu_settings_with_mock_fzf_and_pty_commits_once_or_cancels_without_writes() {
+    for cancel in [false, true] {
+        let (dir, socket) = fixture();
+        let fzf = dir.path().join("fake-fzf");
+        // The value-stage cancellation is followed by Esc at fields, commands and families.
+        let script = format!(
+            r#"#!/bin/sh
+n=0
+[ ! -f '{state}' ] || read -r n < '{state}'
+n=$((n + 1))
+printf '%s\n' "$n" > '{state}'
+case "$n" in
+  1) key='familiar:main' ;;
+  2) key='settings' ;;
+  3) key='font_size' ;;
+  4) key='value:2' ;;
+  *) key='' ;;
+esac
+selected=''
+while IFS= read -r row; do
+  case "$row" in "$key"'\t'*) selected=$row ;; esac
+done
+[ '{cancel}' != true ] || [ "$n" -lt 4 ] || exit 130
+[ -n "$selected" ] || exit 130
+printf '\n%s\n' "$selected"
+"#,
+            state = dir.path().join("stage").display(),
+            cancel = cancel
+        )
+        .replace("'\\t'", "'\t'");
+        fs::write(&fzf, script).unwrap();
+        fs::set_permissions(&fzf, fs::Permissions::from_mode(0o700)).unwrap();
+        let server = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let (_master, slave) = pty();
+        let mut child = ChildGuard(
+            command(&socket)
+                .args(["menu", "--no-start", "--fzf"])
+                .arg(&fzf)
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + LIMIT;
+        let mut queries = 0;
+        let mut writes = 0;
+        let status = loop {
+            assert!(Instant::now() < deadline, "Settings menu exceeded deadline");
+            let stream = match server.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        break status;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("accept: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let data = match request["type"].as_str().unwrap() {
+                "companion.service" => {
+                    assert_eq!(request, json!({"version":1,"type":"companion.service"}));
+                    json!({"api_version":1,"pid":123,"graphical":true,"lifecycle":true,
+                        "navigation":false,"service_instance":"settings-generation"})
+                }
+                "familiar.list" => {
+                    queries += 1;
+                    assert_eq!(
+                        request,
+                        json!({"version":1,"type":"familiar.list","offset":0,
+                        "service_instance":"settings-generation"})
+                    );
+                    json!({"familiars":[{"id":"main","preset":"djinn","attachment":null,
+                        "available":false,"capabilities":["settings"],
+                        "settings":{"sprite_scale":0.5,"font_size":12.0,"bubble_duration":5.0}}],
+                        "offset":0,"total":1,"next_offset":null})
+                }
+                "familiar.settings" => {
+                    assert!(!cancel, "cancel dispatched settings");
+                    writes += 1;
+                    assert_eq!(
+                        request,
+                        json!({"version":1,"type":"familiar.settings","ids":["main"],
+                        "patch":{"font_size":16.0},"service_instance":"settings-generation"})
+                    );
+                    json!({"updated":["main"]})
+                }
+                _ => panic!("unexpected request: {request}"),
+            };
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                json!({"version":1,"ok":true,"data":data})
+            )
+            .unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "extra request: {line}"
+            );
+        };
+        let (stdout, _) = child.output();
+        assert!(status.success(), "Settings menu failed: {status}");
+        assert_eq!(queries, 2);
+        assert_eq!(writes, usize::from(!cancel));
+        assert_eq!(
+            stdout.trim(),
+            if cancel {
+                ""
+            } else {
+                "Accepted settings: main"
+            }
+        );
+        assert!(matches!(server.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        assert!(!dir.path().join("service.log").exists());
+    }
 }

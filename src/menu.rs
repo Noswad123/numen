@@ -365,6 +365,8 @@ struct Familiar {
     available: bool,
     summary: Option<String>,
     capabilities: Vec<String>,
+    #[serde(default)]
+    settings: Option<crate::protocol::FamiliarSettings>,
 }
 
 #[derive(Deserialize)]
@@ -441,6 +443,7 @@ struct Choice {
     id: String,
     preset: bool,
     capabilities: Vec<String>,
+    settings: Option<crate::protocol::FamiliarSettings>,
 }
 
 fn catalog(backend: &mut impl Backend) -> Result<(Vec<Choice>, String)> {
@@ -488,6 +491,7 @@ fn catalog(backend: &mut impl Backend) -> Result<(Vec<Choice>, String)> {
                     id: familiar.id,
                     preset: false,
                     capabilities: familiar.capabilities,
+                    settings: familiar.settings,
                 });
             }
             "Select one or more familiars or presets. Ctrl-R refreshes. Esc exits."
@@ -514,6 +518,7 @@ fn catalog(backend: &mut impl Backend) -> Result<(Vec<Choice>, String)> {
             id,
             preset: true,
             capabilities: serde_json::from_value(preset["capabilities"].clone())?,
+            settings: None,
         });
     }
     Ok((choices, note.into()))
@@ -528,11 +533,12 @@ fn preset_name(id: &str) -> String {
         .to_owned()
 }
 
-const ACTIONS: [(&str, &str); 5] = [
+const ACTIONS: [(&str, &str); 6] = [
     ("open", "Open"),
     ("info", "Info bubble"),
     ("go-to-mouse", "Go to mouse"),
     ("attach", "Attach to process"),
+    ("settings", "Settings"),
     ("close", "Close"),
 ];
 
@@ -650,7 +656,7 @@ fn menu(
             }
             match execute(backend, picker, &selection, &action, no_start) {
                 Ok(Some(message)) => return Ok(Some(message)),
-                Ok(None) => header = "Target selection cancelled; no batch was sent.".into(),
+                Ok(None) => header = "Selection cancelled; no batch was sent.".into(),
                 Err(error) => {
                     header = format!("Command failed: {error:#}. Retry, Ctrl-R refresh, or Back.")
                 }
@@ -666,6 +672,9 @@ fn execute(
     action: &str,
     no_start: bool,
 ) -> Result<Option<String>> {
+    if action == "settings" {
+        return settings(backend, picker, selection);
+    }
     let ids: Vec<_> = selection.iter().map(|choice| choice.id.clone()).collect();
     let request = if action == "open" || action == "attach" {
         if action == "open" {
@@ -728,6 +737,198 @@ fn execute(
     )))
 }
 
+pub(crate) fn validate_updated_ids(data: &Value, ids: &[String]) -> Result<()> {
+    let updated: Vec<String> = serde_json::from_value(
+        data.get("updated")
+            .cloned()
+            .context("accepted settings omitted updated IDs")?,
+    )?;
+    let expected: HashSet<_> = ids.iter().collect();
+    let returned: HashSet<_> = updated.iter().collect();
+    ensure!(
+        updated.len() == ids.len() && returned.len() == updated.len() && returned == expected,
+        "accepted settings returned unexpected IDs"
+    );
+    Ok(())
+}
+
+pub(crate) type SettingDefinition = (&'static str, &'static str, [(&'static str, f64); 4]);
+
+pub(crate) const SETTINGS: [SettingDefinition; 3] = [
+    (
+        "sprite_scale",
+        "Sprite size",
+        [
+            ("Small", 0.25),
+            ("Default", 0.5),
+            ("Large", 1.0),
+            ("XL", 2.0),
+        ],
+    ),
+    (
+        "font_size",
+        "Text size",
+        [
+            ("Small", 10.0),
+            ("Default", 12.0),
+            ("Large", 16.0),
+            ("XL", 20.0),
+        ],
+    ),
+    (
+        "bubble_duration",
+        "Bubble duration (seconds)",
+        [
+            ("Short", 2.0),
+            ("Default", 5.0),
+            ("Long", 10.0),
+            ("XL", 30.0),
+        ],
+    ),
+];
+
+fn setting_value(choice: &Choice, field: &str) -> Option<f64> {
+    choice.settings.as_ref().map(|settings| match field {
+        "sprite_scale" => settings.sprite_scale,
+        "font_size" => settings.font_size,
+        "bubble_duration" => settings.bubble_duration,
+        _ => unreachable!("trusted setting field"),
+    })
+}
+
+fn settings_selection(backend: &mut impl Backend, selection: &[Choice]) -> Result<Vec<Choice>> {
+    let (fresh, _) = catalog(backend)?;
+    selection
+        .iter()
+        .map(|old| {
+            let choice = fresh
+                .iter()
+                .find(|choice| choice.row.key == old.row.key)
+                .context("selected familiar disappeared; refresh commands")?;
+            ensure!(
+                !choice.preset && choice.capabilities.iter().any(|cap| cap == "settings"),
+                "selected familiar no longer supports settings; refresh commands"
+            );
+            Ok(choice.clone())
+        })
+        .collect()
+}
+
+fn settings(
+    backend: &mut impl Backend,
+    picker: &mut impl Picker,
+    selection: &[Choice],
+) -> Result<Option<String>> {
+    ensure!(
+        commands(selection).iter().any(|row| row.key == "settings"),
+        "settings unavailable for selection"
+    );
+    let ids: Vec<_> = selection.iter().map(|choice| choice.id.clone()).collect();
+    crate::protocol::validate_ids(&ids)?;
+    let mut selection = selection.to_vec();
+    'fields: loop {
+        let mut rows: Vec<_> = SETTINGS
+            .iter()
+            .map(|(field, label, presets)| {
+                let first = setting_value(&selection[0], field);
+                let current = if selection
+                    .iter()
+                    .any(|choice| setting_value(choice, field) != first)
+                {
+                    "Mixed".into()
+                } else if let Some(value) = first {
+                    let name = presets
+                        .iter()
+                        .find(|(_, preset)| *preset == value)
+                        .map(|(name, _)| *name)
+                        .unwrap_or("Unknown");
+                    format!("{name} ({value})")
+                } else {
+                    "Unknown".into()
+                };
+                Row {
+                    key: (*field).into(),
+                    label: format!("{label} | Current: {current}"),
+                }
+            })
+            .collect();
+        rows.push(back());
+        let field = match pick(
+            picker,
+            &rows,
+            false,
+            &[],
+            "Settings. Choose one field. Esc returns to commands. Ctrl-R discards and refreshes.",
+        )? {
+            Pick::Cancel => return Ok(None),
+            Pick::Refresh => {
+                selection = settings_selection(backend, &selection)?;
+                continue;
+            }
+            Pick::Selected(keys) if keys[0] == "back" => return Ok(None),
+            Pick::Selected(keys) => keys[0].clone(),
+        };
+        let index = SETTINGS
+            .iter()
+            .position(|(key, _, _)| *key == field)
+            .context("unknown setting field")?;
+        let (_, _, presets) = &SETTINGS[index];
+        let mut values: Vec<_> = presets
+            .iter()
+            .enumerate()
+            .map(|(index, (label, value))| Row {
+                key: format!("value:{index}"),
+                label: format!(
+                    "{label} ({value}){}",
+                    if selection
+                        .iter()
+                        .all(|choice| setting_value(choice, &field) == Some(*value))
+                    {
+                        " | Current"
+                    } else {
+                        ""
+                    }
+                ),
+            })
+            .collect();
+        values.push(back());
+        let value = match pick(
+            picker,
+            &values,
+            false,
+            &[],
+            &format!(
+                "{}. Choose a preset for all selected familiars. Esc returns to fields. Ctrl-R discards and refreshes.",
+                rows[index].label
+            ),
+        )? {
+            Pick::Cancel => continue 'fields,
+            Pick::Refresh => {
+                selection = settings_selection(backend, &selection)?;
+                continue 'fields;
+            }
+            Pick::Selected(keys) if keys[0] == "back" => continue 'fields,
+            Pick::Selected(keys) => {
+                let index = values
+                    .iter()
+                    .position(|row| row.key == keys[0])
+                    .context("unknown setting value")?;
+                presets[index].1
+            }
+        };
+        // Recheck all identities/capabilities without starting or replacing a service.
+        // NativeBackend also seals the atomic request to the original service instance.
+        settings_selection(backend, &selection)?;
+        let mut patch = json!({});
+        patch[&field] = json!(value);
+        let request = json!({"version":1,"type":"familiar.settings","ids":ids,"patch":patch});
+        crate::protocol::Request::parse(&serde_json::to_vec(&request)?)?;
+        let data = backend.control(request)?;
+        validate_updated_ids(&data, &ids)?;
+        return Ok(Some(format!("Accepted settings: {}", ids.join(", "))));
+    }
+}
+
 fn target_items(
     backend: &mut impl Backend,
     picker: &mut impl Picker,
@@ -781,7 +982,7 @@ fn target_items(
                 .collect();
             rows.extend([refresh(), back()]);
             let status = if eligible.is_empty() {
-                "No compatible running targets. Only connected protocol sources appear; enable the optional Djinn interactive adapter and open a chat, then Refresh. No OS scanning."
+                "No compatible running targets. Open a chat in an updated local Djinn UI, then Refresh. Discovery is on by default unless disabled; no OS scanning."
             } else {
                 "Choose one connected target. Esc discards all pending choices."
             };
@@ -925,6 +1126,7 @@ mod tests {
                     "close".into(),
                     "go-to-mouse".into(),
                 ],
+                settings: None,
             })
             .collect()
     }
@@ -935,6 +1137,236 @@ mod tests {
     fn service_info(instance: &str) -> Value {
         json!({"api_version":1,"pid":123,"graphical":true,"lifecycle":true,
             "navigation":false,"service_instance":instance})
+    }
+
+    fn settings_page() -> Value {
+        let mut a = familiar("a", &["settings"]);
+        a["settings"] = json!({"sprite_scale":0.5,"font_size":12.0,"bubble_duration":5.0});
+        let mut b = familiar("b", &["settings"]);
+        b["settings"] = json!({"sprite_scale":0.5,"font_size":16.0,"bubble_duration":5.0});
+        familiar_page(vec![a, b])
+    }
+
+    #[test]
+    fn settings_unavailable_batch_intersection_and_current_values() {
+        let mut backend = FakeBackend::new(
+            true,
+            vec![
+                (request("familiar.list", None, 0), Ok(settings_page())),
+                (request("familiar.list", None, 0), Ok(settings_page())),
+                (
+                    json!({"version":1,"type":"familiar.settings","ids":["a","b"],"patch":{"font_size":16.0}}),
+                    Ok(json!({"updated":["b","a"]})),
+                ),
+            ],
+        );
+        let mut picker = Script::new(vec![
+            select(&["familiar:a", "familiar:b"]),
+            select(&["settings"]),
+            select(&["font_size"]),
+            select(&["value:2"]),
+        ]);
+        assert_eq!(
+            menu(&mut backend, &mut picker, false).unwrap().unwrap(),
+            "Accepted settings: a, b"
+        );
+        assert!(picker.shown[0].0[0].label.contains("Waiting"));
+        assert_eq!(
+            picker.shown[1]
+                .0
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            ["settings", "back"]
+        );
+        assert!(picker.shown[2].0[0].label.contains("Default (0.5)"));
+        assert!(picker.shown[2].0[1].label.contains("Mixed"));
+        assert!(
+            picker.shown[3]
+                .0
+                .iter()
+                .all(|row| !row.label.contains("Current"))
+        );
+        assert_eq!(backend.starts, 0);
+        assert!(backend.replies.is_empty());
+    }
+
+    #[test]
+    fn settings_cancel_and_back_at_every_stage_never_write() {
+        for steps in [
+            vec![Pick::Cancel],
+            vec![select(&["familiar:a"]), Pick::Cancel, Pick::Cancel],
+            vec![
+                select(&["familiar:a"]),
+                select(&["settings"]),
+                Pick::Cancel,
+                Pick::Cancel,
+                Pick::Cancel,
+            ],
+            vec![
+                select(&["familiar:a"]),
+                select(&["settings"]),
+                select(&["back"]),
+                Pick::Cancel,
+                Pick::Cancel,
+            ],
+            vec![
+                select(&["familiar:a"]),
+                select(&["settings"]),
+                select(&["font_size"]),
+                Pick::Cancel,
+                select(&["bubble_duration"]),
+                select(&["back"]),
+                select(&["back"]),
+                Pick::Cancel,
+                Pick::Cancel,
+            ],
+        ] {
+            let mut backend = FakeBackend::new(
+                true,
+                (0..2)
+                    .map(|_| (request("familiar.list", None, 0), Ok(settings_page())))
+                    .collect(),
+            );
+            let mut picker = Script::new(steps);
+            assert!(menu(&mut backend, &mut picker, false).unwrap().is_none());
+            assert!(
+                backend
+                    .calls
+                    .iter()
+                    .all(|call| call["type"] == "familiar.list")
+            );
+            assert_eq!(backend.starts, 0);
+            if picker.shown.len() > 2 {
+                assert_eq!(picker.shown.last().unwrap().1, ["familiar:a"]);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_unknown_legacy_and_mixed_presets_do_not_fake_defaults() {
+        let mut backend = FakeBackend::new(
+            true,
+            vec![(
+                request("familiar.list", None, 0),
+                Ok(familiar_page(vec![familiar("a", &["settings"])])),
+            )],
+        );
+        let (mut choices, _) = catalog(&mut backend).unwrap();
+        assert!(!commands(&choices).iter().any(|row| row.key == "settings"));
+        assert_eq!(commands(&choices[1..])[0].key, "open");
+        let mut picker = Script::new(vec![select(&["font_size"]), Pick::Cancel, Pick::Cancel]);
+        assert!(
+            settings(&mut backend, &mut picker, &choices[..1])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            picker.shown[0]
+                .0
+                .iter()
+                .take(3)
+                .all(|row| row.label.contains("Unknown"))
+        );
+        assert!(
+            picker.shown[1]
+                .0
+                .iter()
+                .all(|row| !row.label.contains("Current"))
+        );
+        choices[0].settings = Some(crate::protocol::FamiliarSettings {
+            sprite_scale: 0.7,
+            font_size: 13.0,
+            bubble_duration: 7.0,
+        });
+        let mut picker = Script::new(vec![Pick::Cancel]);
+        settings(&mut backend, &mut picker, &choices[..1]).unwrap();
+        assert!(picker.shown[0].0[1].label.contains("Unknown (13)"));
+    }
+
+    #[test]
+    fn settings_refresh_discards_value_and_rechecks_capabilities_before_dispatch() {
+        for refresh in [true, false] {
+            let mut backend = FakeBackend::new(
+                true,
+                vec![
+                    (request("familiar.list", None, 0), Ok(settings_page())),
+                    (
+                        request("familiar.list", None, 0),
+                        Ok(familiar_page(vec![familiar("a", &["info"])])),
+                    ),
+                ],
+            );
+            let (choices, _) = catalog(&mut backend).unwrap();
+            let mut picker = Script::new(vec![
+                select(&["font_size"]),
+                if refresh {
+                    Pick::Refresh
+                } else {
+                    select(&["value:2"])
+                },
+            ]);
+            assert!(
+                settings(&mut backend, &mut picker, &choices[..1])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no longer supports")
+            );
+            assert!(
+                backend
+                    .calls
+                    .iter()
+                    .all(|call| call["type"] == "familiar.list")
+            );
+            assert_eq!(backend.starts, 0);
+        }
+        let mut backend = FakeBackend::new(
+            true,
+            (0..3)
+                .map(|_| (request("familiar.list", None, 0), Ok(settings_page())))
+                .collect(),
+        );
+        let (choices, _) = catalog(&mut backend).unwrap();
+        let mut picker = Script::new(vec![
+            Pick::Refresh,
+            select(&["font_size"]),
+            Pick::Refresh,
+            Pick::Cancel,
+        ]);
+        assert!(
+            settings(&mut backend, &mut picker, &choices[..1])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(picker.shown[0].0[0].key, picker.shown[3].0[0].key);
+        assert_eq!(backend.calls.len(), 3);
+    }
+
+    #[test]
+    fn settings_forged_fields_values_and_wrong_ack_sets_are_rejected() {
+        for steps in [
+            vec![select(&["font_size; touch x"])],
+            vec![select(&["font_size"]), select(&["16"])],
+        ] {
+            let mut backend = FakeBackend::new(
+                true,
+                vec![(request("familiar.list", None, 0), Ok(settings_page()))],
+            );
+            let (choices, _) = catalog(&mut backend).unwrap();
+            assert!(settings(&mut backend, &mut Script::new(steps), &choices[..1]).is_err());
+            assert_eq!(backend.calls.len(), 1);
+        }
+        let ids = vec!["a".into(), "b".into()];
+        for data in [
+            json!({}),
+            json!({"updated":["a"]}),
+            json!({"updated":["a","a"]}),
+            json!({"updated":["a","c"]}),
+            json!({"updated":["a","b","c"]}),
+        ] {
+            assert!(validate_updated_ids(&data, &ids).is_err(), "{data}");
+        }
+        validate_updated_ids(&json!({"updated":["b","a"]}), &ids).unwrap();
     }
 
     fn native_server(
@@ -983,6 +1415,31 @@ mod tests {
             }
         });
         (dir, path, server)
+    }
+
+    #[test]
+    fn native_settings_rechecks_generation_without_repins_or_writes() {
+        let ok = |data| json!({"version":1,"ok":true,"data":data});
+        let probe = json!({"version":1,"type":"companion.service"});
+        let (dir, path, server) = native_server(vec![
+            (probe.clone(), ok(service_info("old"))),
+            (
+                json!({"version":1,"type":"familiar.list","offset":0,"service_instance":"old"}),
+                ok(settings_page()),
+            ),
+            (probe, ok(service_info("replacement"))),
+        ]);
+        let mut backend = NativeBackend {
+            path: &path,
+            pinned_instance: None,
+        };
+        let (choices, _) = catalog(&mut backend).unwrap();
+        let mut picker = Script::new(vec![select(&["font_size"]), select(&["value:2"])]);
+        let error = settings(&mut backend, &mut picker, &choices[..2]).unwrap_err();
+        assert!(error.to_string().contains("service instance changed"));
+        assert_eq!(backend.pinned_instance.as_deref(), Some("old"));
+        assert!(!dir.path().join("service.log").exists());
+        server.join().unwrap();
     }
 
     #[test]
@@ -1037,6 +1494,7 @@ mod tests {
             json!({"version":1,"type":"familiar.attach","items":[item("a", "one")]}),
             json!({"version":1,"type":"familiar.close","ids":["a"]}),
             json!({"version":1,"type":"familiar.go-to-mouse","ids":["a"]}),
+            json!({"version":1,"type":"familiar.settings","ids":["a"],"patch":{"font_size":16}}),
             json!({"version":1,"type":"companion.reveal","familiars":["a"],"service_instance":"forged"}),
         ];
         let mut replies = vec![(
@@ -1672,6 +2130,7 @@ mod tests {
                 label: "Preset | Djinn [djinn]".into(),
             },
             capabilities: vec!["open".into()],
+            settings: None,
         };
         assert!(
             execute(

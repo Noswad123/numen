@@ -181,11 +181,34 @@ mod tests {
         assert!(mailbox.post(vec![crate::activity::FamiliarPresentation {
             id: "main".into(),
             preset: "djinn".into(),
+            settings: crate::protocol::FamiliarSettings::default(),
             presentation: Presentation::default(),
         }]));
         assert!(!mailbox.post(vec![]));
         assert_eq!(mailbox.take(), Some(vec![]));
         assert!(mailbox.take().is_none());
+    }
+
+    #[test]
+    fn registry_mailbox_keeps_complete_coalesced_settings() {
+        use crate::{activity::FamiliarPresentation, protocol::FamiliarSettings};
+        let mailbox = Mailbox::default();
+        let mut view = FamiliarPresentation {
+            id: "new".into(),
+            preset: "djinn".into(),
+            settings: FamiliarSettings::default(),
+            presentation: Presentation::default(),
+        };
+        assert!(mailbox.post(vec![view.clone()]));
+        let original = view.clone();
+        view.settings.font_size = 24.0;
+        assert_ne!(view, original);
+        assert!(!mailbox.post(vec![view.clone()]));
+        view.settings.sprite_scale = 1.5;
+        assert!(!mailbox.post(vec![view.clone()]));
+        view.settings.bubble_duration = 0.25;
+        assert!(!mailbox.post(vec![view.clone()]));
+        assert_eq!(mailbox.take(), Some(vec![view]));
     }
 
     #[test]

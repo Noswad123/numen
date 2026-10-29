@@ -26,7 +26,11 @@ use serde_json::json;
 
 use crate::{
     activity::{FamiliarPresentation, Presentation, SourceId, Store},
-    protocol::{self, Activity, ActivityState, Event, MAX_LINE, MAX_SOURCES, Request},
+    diagnostics::RuntimeDiagnostics,
+    protocol::{
+        self, Activity, ActivityState, Event, FamiliarSettings, MAX_LINE, MAX_SOURCES, Request,
+        SettingsPatch,
+    },
 };
 
 const TICK: Duration = Duration::from_millis(25);
@@ -46,12 +50,17 @@ struct TargetedControls {
 }
 
 struct WorkerConfig {
+    diagnostics: RuntimeDiagnostics,
+    settings_support: bool,
+    defaults: FamiliarSettings,
     targeted: TargetedControls,
     bootstrap_main: bool,
     service_instance: String,
 }
 
 struct ControlContext {
+    diagnostics: RuntimeDiagnostics,
+    settings_support: bool,
     targeted: TargetedControls,
     multi: bool,
     service_instance: String,
@@ -305,6 +314,7 @@ fn connect_bounded(path: &Path) -> io::Result<UnixStream> {
 }
 
 pub struct Server {
+    diagnostics: RuntimeDiagnostics,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     _socket: SocketOwner,
@@ -320,6 +330,10 @@ pub struct FocusControl {
 enum FamiliarCommand {
     Next(String),
     Close(String),
+    Settings {
+        id: String,
+        patch: protocol::SettingsPatch,
+    },
 }
 
 #[derive(Clone)]
@@ -341,6 +355,21 @@ impl FamiliarControl {
             .try_send(FamiliarCommand::Close(id.into()))
             .context("queue familiar close")
     }
+
+    /// Queue a patch for exactly one familiar without blocking the GUI.
+    /// Success means queue acceptance, not a committed change. Unsupported
+    /// settings or an unknown/closed ID are logged and discarded by the worker.
+    /// Display checkmarks only from the authoritative on_views settings snapshot.
+    pub fn settings(&self, id: &str, patch: SettingsPatch) -> Result<()> {
+        protocol::validate_id(id)?;
+        patch.validate()?;
+        self.sender
+            .try_send(FamiliarCommand::Settings {
+                id: id.into(),
+                patch,
+            })
+            .context("queue familiar settings")
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +382,10 @@ impl FocusControl {
 }
 
 impl Server {
+    pub(crate) fn diagnostics(&self) -> RuntimeDiagnostics {
+        self.diagnostics.clone()
+    }
+
     pub fn familiar_control(&self) -> FamiliarControl {
         FamiliarControl {
             sender: self.focus.sender.clone(),
@@ -467,6 +500,7 @@ impl Server {
     /// Callbacks run on the worker and must promptly enqueue bounded UI work.
     /// Quit is scheduled after its ACK is flushed and the peer closes, or after
     /// 500 ms if the peer stays open. The UI owns event-loop exit and server drop.
+    #[cfg(test)]
     pub fn start_graphical(
         path: &Path,
         on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
@@ -489,6 +523,31 @@ impl Server {
         )
     }
 
+    /// Enables live per-familiar settings with immutable defaults for future opens.
+    pub fn start_graphical_with_settings(
+        path: &Path,
+        on_views: impl Fn(Vec<FamiliarPresentation>) + Send + 'static,
+        on_reveal: impl Fn(Option<Vec<String>>) + Send + 'static,
+        on_go_to_mouse: Option<Box<GoToMouse>>,
+        on_quit: impl Fn() + Send + 'static,
+        bootstrap_main: bool,
+        settings: FamiliarSettings,
+    ) -> Result<Self> {
+        Self::start_inner_with_settings(
+            path,
+            |_| {},
+            None,
+            Some(Box::new(on_views)),
+            TargetedControls {
+                reveal: Some(Box::new(on_reveal)),
+                go_to_mouse: on_go_to_mouse,
+                quit: Some(Box::new(on_quit)),
+            },
+            bootstrap_main,
+            Some(settings),
+        )
+    }
+
     fn start_inner(
         path: &Path,
         on_change: impl Fn(Presentation) + Send + 'static,
@@ -497,6 +556,28 @@ impl Server {
         targeted: TargetedControls,
         bootstrap_main: bool,
     ) -> Result<Self> {
+        Self::start_inner_with_settings(
+            path,
+            on_change,
+            on_reveal,
+            on_views,
+            targeted,
+            bootstrap_main,
+            None,
+        )
+    }
+
+    fn start_inner_with_settings(
+        path: &Path,
+        on_change: impl Fn(Presentation) + Send + 'static,
+        on_reveal: Option<Box<dyn Fn() + Send>>,
+        on_views: Option<Box<dyn Fn(Vec<FamiliarPresentation>) + Send>>,
+        targeted: TargetedControls,
+        bootstrap_main: bool,
+        settings: Option<FamiliarSettings>,
+    ) -> Result<Self> {
+        let defaults = settings.unwrap_or_default();
+        defaults.validate()?;
         private_parent(path, true)?;
         match fs::symlink_metadata(path) {
             Ok(_) => {
@@ -530,6 +611,8 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let (sender, receiver) = mpsc::sync_channel(32);
+        let diagnostics = RuntimeDiagnostics::new(on_views.is_some());
+        let worker_diagnostics = diagnostics.clone();
         let worker = thread::Builder::new()
             .name("numen-ipc".into())
             .spawn(move || {
@@ -541,6 +624,9 @@ impl Server {
                     on_reveal,
                     on_views,
                     WorkerConfig {
+                        diagnostics: worker_diagnostics,
+                        settings_support: settings.is_some(),
+                        defaults,
                         targeted,
                         bootstrap_main,
                         service_instance,
@@ -548,6 +634,7 @@ impl Server {
                 )
             })?;
         Ok(Self {
+            diagnostics,
             stop,
             worker: Some(worker),
             _socket: owner,
@@ -594,6 +681,8 @@ impl Client {
             changed,
             on_reveal,
             &ControlContext {
+                diagnostics: RuntimeDiagnostics::new(false),
+                settings_support: false,
                 targeted: TargetedControls::default(),
                 multi: false,
                 service_instance: "test-service".into(),
@@ -689,6 +778,10 @@ impl Client {
                             "graphical": multi,
                             "lifecycle": multi,
                             "navigation": targeted.go_to_mouse.is_some(),
+                            "settings": multi && controls.settings_support,
+                            "familiar_count": store.familiar_count(),
+                            "source_count": store.source_count(),
+                            "diagnostics": controls.diagnostics.snapshot(),
                         })));
                     }
                     Event::Status { offset, familiar } => {
@@ -744,9 +837,14 @@ impl Client {
                             for row in rows {
                                 if !multi {
                                     row["capabilities"] = json!([]);
-                                } else if targeted.go_to_mouse.is_some() {
-                                    row["capabilities"] =
-                                        json!(["info", "attach", "close", "go-to-mouse"]);
+                                } else {
+                                    let caps = row["capabilities"].as_array_mut().unwrap();
+                                    if targeted.go_to_mouse.is_some() {
+                                        caps.push(json!("go-to-mouse"));
+                                    }
+                                    if controls.settings_support {
+                                        caps.push(json!("settings"));
+                                    }
                                 }
                             }
                         }
@@ -762,6 +860,13 @@ impl Client {
                         }
                         go_to_mouse(ids.clone());
                         return Ok(Some(json!({"moving":ids})));
+                    }
+                    Event::Settings { ids, patch } => {
+                        ensure!(
+                            multi && controls.settings_support,
+                            "settings requires live graphical settings support"
+                        );
+                        return Ok(Some(json!({"updated":store.settings(&ids, patch)?})));
                     }
                     Event::Targets { offset, familiar } => {
                         return Ok(Some(store.targets(offset, familiar.as_deref())?));
@@ -856,20 +961,21 @@ fn run(
     config: WorkerConfig,
 ) {
     let WorkerConfig {
+        diagnostics,
+        settings_support,
+        defaults,
         targeted,
         bootstrap_main,
         service_instance,
     } = config;
     let controls = ControlContext {
+        diagnostics,
+        settings_support,
         targeted,
         multi: on_views.is_some(),
         service_instance,
     };
-    let mut store = if bootstrap_main {
-        Store::default()
-    } else {
-        Store::empty()
-    };
+    let mut store = Store::with_settings(bootstrap_main, defaults);
     let mut previous = Presentation::default();
     on_change(previous.clone());
     let mut previous_views = store.presentations(Instant::now());
@@ -912,6 +1018,15 @@ fn run(
                         store.close(&[id]).map(|_| ())
                     } else {
                         Err(anyhow::anyhow!("no graphical familiar"))
+                    }
+                }
+                FamiliarCommand::Settings { id, patch } => {
+                    if controls.multi && controls.settings_support {
+                        store.settings(&[id], patch).map(|_| ())
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "settings requires live graphical settings support"
+                        ))
                     }
                 }
             };
@@ -983,6 +1098,109 @@ struct Ack {
     data: Option<serde_json::Value>,
 }
 
+// Validate uniqueness before Value can discard duplicate metadata, including in
+// unknown optional fields. Each object owns its own key set; arrays recurse too.
+struct UniqueValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("JSON with unique object keys")
+            }
+
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(
+                self,
+                value: i64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(
+                self,
+                value: f64,
+            ) -> std::result::Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueValue(number.into()))
+                    .ok_or_else(|| E::custom("invalid JSON number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueValue(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueValue(values.into()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut object: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = object.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate JSON object key"));
+                    }
+                    let UniqueValue(value) = object.next_value()?;
+                    values.insert(key, value);
+                }
+                Ok(UniqueValue(values.into()))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn parse_ack(response: &[u8]) -> Result<Ack> {
+    ensure!(response.len() <= MAX_LINE, "oversized Numen acknowledgment");
+    let UniqueValue(value) =
+        serde_json::from_slice(response).context("invalid Numen acknowledgment")?;
+    serde_json::from_value(value).context("invalid Numen acknowledgment")
+}
+
 fn connect_private(path: &Path) -> Result<UnixStream> {
     private_parent(path, false)?;
     let metadata = socket_metadata(path)?;
@@ -1015,6 +1233,7 @@ pub fn control(path: &Path, request: serde_json::Value) -> Result<serde_json::Va
                 | Event::Attach { .. }
                 | Event::Close { .. }
                 | Event::GoToMouse { .. }
+                | Event::Settings { .. }
         ),
         "expected companion control request"
     );
@@ -1113,7 +1332,7 @@ impl Publisher {
                 Err(e) => return Err(e).context("read Numen acknowledgment (500 ms timeout)"),
             }
         }
-        let ack: Ack = serde_json::from_slice(&response).context("invalid Numen acknowledgment")?;
+        let ack = parse_ack(&response)?;
         ensure!(
             ack.version == protocol::VERSION,
             "unsupported Numen acknowledgment version"
@@ -1138,6 +1357,322 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("events.sock");
         (dir, path)
+    }
+
+    #[test]
+    fn invalid_startup_settings_do_not_create_a_listener() {
+        let (_dir, path) = fixture();
+        assert!(
+            Server::start_graphical_with_settings(
+                &path,
+                |_| {},
+                |_| {},
+                None,
+                || {},
+                true,
+                FamiliarSettings {
+                    sprite_scale: f64::NAN,
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn settings_gui_queue_validates_before_enqueue_and_preserves_close() {
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let handle = FamiliarControl { sender };
+        let patch = SettingsPatch {
+            font_size: Some(24.0),
+            ..Default::default()
+        };
+        assert!(handle.settings("bad/id", patch).is_err());
+        assert!(handle.settings("main", SettingsPatch::default()).is_err());
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(
+                handle
+                    .settings(
+                        "main",
+                        SettingsPatch {
+                            font_size: Some(invalid),
+                            ..Default::default()
+                        },
+                    )
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        handle.close("main").unwrap();
+        for _ in 0..31 {
+            handle.settings("main", patch).unwrap();
+        }
+        assert!(handle.clone().settings("main", patch).is_err());
+        assert!(handle.next("main").is_err());
+        assert!(matches!(receiver.try_recv().unwrap(), FamiliarCommand::Close(id) if id == "main"));
+        for _ in 0..31 {
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                FamiliarCommand::Settings { id, patch: queued } if id == "main" && queued == patch
+            ));
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(receiver);
+        assert!(handle.settings("main", patch).is_err());
+    }
+
+    #[test]
+    fn settings_gui_queue_updates_canonical_store_and_complete_selected_snapshot() {
+        let (_dir, path) = fixture();
+        let (tx, views) = mpsc::channel();
+        let defaults = FamiliarSettings {
+            sprite_scale: 0.75,
+            font_size: 18.0,
+            bubble_duration: 3.0,
+        };
+        let server = Server::start_graphical_with_settings(
+            &path,
+            move |v| tx.send(v).unwrap(),
+            |_| {},
+            None,
+            || {},
+            true,
+            defaults,
+        )
+        .unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+        producer
+            .update("a", 1, ActivityState::Working, false, None)
+            .unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        producer
+            .update("b", 1, ActivityState::Working, false, None)
+            .unwrap();
+        control(&path, json!({"version":1,"type":"familiar.open","items":[{"id":"second","source":"test","activity":"b"}]})).unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        producer
+            .update_with_summary("b", 2, ActivityState::Failed, false, None, Some("Keep cue"))
+            .unwrap();
+        let before = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert!(before[1].presentation.cue.is_some());
+        let list_before = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+        let patch = SettingsPatch {
+            font_size: Some(24.0),
+            bubble_duration: Some(2.5),
+            ..Default::default()
+        };
+        server.familiar_control().settings("second", patch).unwrap();
+        let after = views.recv_timeout(IO_TIMEOUT).unwrap();
+        let mut expected = before;
+        expected[1].settings = patch.apply(defaults);
+        assert_eq!(after, expected);
+        let mut expected_list = list_before;
+        expected_list["familiars"][1]["settings"] = json!(patch.apply(defaults));
+        assert_eq!(
+            control(&path, json!({"version":1,"type":"familiar.list"})).unwrap(),
+            expected_list
+        );
+        producer.heartbeat().unwrap();
+        assert!(views.try_recv().is_err());
+    }
+
+    #[test]
+    fn settings_gui_queue_ignores_closed_and_unknown_ids_without_resurrection() {
+        let (_dir, path) = fixture();
+        let (tx, views) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let server = Server::start_graphical_with_settings(
+            &path,
+            move |v| {
+                let initial = !v.is_empty();
+                tx.send(v).unwrap();
+                if initial {
+                    gate.recv_timeout(REGISTER_TIMEOUT).unwrap();
+                }
+            },
+            |_| {},
+            None,
+            || {},
+            true,
+            FamiliarSettings::default(),
+        )
+        .unwrap();
+        views.recv_timeout(IO_TIMEOUT).unwrap();
+        let handle = server.familiar_control();
+        handle.close("main").unwrap();
+        let patch = SettingsPatch {
+            font_size: Some(24.0),
+            ..Default::default()
+        };
+        handle.settings("main", patch).unwrap();
+        handle.settings("missing", patch).unwrap();
+        release.send(()).unwrap();
+        assert!(views.recv_timeout(IO_TIMEOUT).unwrap().is_empty());
+        let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+        assert_eq!(list["familiars"], json!([]));
+        assert!(views.try_recv().is_err());
+    }
+
+    #[test]
+    fn settings_gui_queue_rejects_legacy_and_headless_workers() {
+        // Include settings-enabled but headless to test both worker gates.
+        for (multi, settings) in [(false, false), (true, false), (false, true)] {
+            let (_dir, path) = fixture();
+            let (release, gate) = mpsc::channel();
+            let server = Server::start_inner_with_settings(
+                &path,
+                move |_| gate.recv_timeout(REGISTER_TIMEOUT).unwrap(),
+                None,
+                multi.then(|| Box::new(|_| {}) as Box<dyn Fn(Vec<FamiliarPresentation>) + Send>),
+                TargetedControls::default(),
+                true,
+                settings.then(FamiliarSettings::default),
+            )
+            .unwrap();
+            server
+                .familiar_control()
+                .settings(
+                    "main",
+                    SettingsPatch {
+                        font_size: Some(24.0),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            release.send(()).unwrap();
+            let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+            assert_eq!(
+                list["familiars"][0]["settings"],
+                json!(FamiliarSettings::default())
+            );
+        }
+    }
+
+    #[test]
+    fn settings_socket_roundtrip_capabilities_and_constructor_gating() {
+        for mode in 0..4 {
+            for navigation in [false, true] {
+                let (_dir, path) = fixture();
+                let (tx, views) = mpsc::channel();
+                let on_views = move |v| {
+                    let _ = tx.send(v);
+                };
+                let nav: Option<Box<GoToMouse>> = navigation.then(|| {
+                    Box::new(|_| -> () { panic!("unexpected navigation") }) as Box<GoToMouse>
+                });
+                let defaults = FamiliarSettings {
+                    font_size: 18.0,
+                    ..Default::default()
+                };
+                let _server = match mode {
+                    0 => Server::start(&path, |_| {}),
+                    1 => Server::start_graphical(&path, on_views, |_| {}, nav, || {}, true),
+                    _ => Server::start_graphical_with_settings(
+                        &path,
+                        on_views,
+                        |_| {},
+                        nav,
+                        || {},
+                        mode == 2,
+                        defaults,
+                    ),
+                }
+                .unwrap();
+                let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+                producer
+                    .update("task", 1, ActivityState::Working, false, None)
+                    .unwrap();
+                if mode == 3 {
+                    assert_eq!(views.recv_timeout(IO_TIMEOUT).unwrap(), vec![]);
+                    control(&path, json!({"version":1,"type":"familiar.open","items":[{"id":"view","source":"test","activity":"task"}]})).unwrap();
+                }
+                let id = if mode == 3 { "view" } else { "main" };
+                let info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+                assert_eq!(info["settings"], mode >= 2);
+                assert_eq!(info["graphical"], mode != 0);
+                assert_eq!(info["familiar_count"], 1);
+                assert_eq!(info["source_count"], 1);
+                let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+                let caps = list["familiars"][0]["capabilities"].as_array().unwrap();
+                assert_eq!(caps.contains(&json!("settings")), mode >= 2);
+                assert_eq!(
+                    caps.contains(&json!("go-to-mouse")),
+                    mode != 0 && navigation
+                );
+                assert_eq!(
+                    list["familiars"][0]["settings"]["font_size"],
+                    if mode >= 2 { 18.0 } else { 12.0 }
+                );
+                let request = json!({"version":1,"type":"familiar.settings","ids":[id],"patch":{"font_size":24,"bubble_duration":2.5}});
+                if mode < 2 {
+                    assert!(
+                        control(&path, request)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settings requires live graphical settings support")
+                    );
+                    assert_eq!(
+                        control(&path, json!({"version":1,"type":"familiar.list"})).unwrap(),
+                        list
+                    );
+                    continue;
+                }
+                let mut stale = request.clone();
+                stale["service_instance"] = json!("stale-service");
+                assert!(
+                    control(&path, stale)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("service instance changed")
+                );
+                assert_eq!(
+                    control(&path, json!({"version":1,"type":"familiar.list"})).unwrap(),
+                    list
+                );
+                assert_eq!(
+                    control(&path, request.clone()).unwrap(),
+                    json!({"updated":[id]})
+                );
+                let mut latest = views.recv_timeout(IO_TIMEOUT).unwrap();
+                while latest
+                    .iter()
+                    .find(|v| v.id == id)
+                    .is_none_or(|v| v.settings.font_size != 24.0)
+                {
+                    latest = views.recv_timeout(IO_TIMEOUT).unwrap();
+                }
+                let selected = latest.iter().find(|v| v.id == id).unwrap();
+                assert_eq!(selected.settings.sprite_scale, defaults.sprite_scale);
+                assert_eq!(selected.settings.bubble_duration, 2.5);
+                // Controls on a registered producer connection remain controls.
+                assert_eq!(
+                    producer.exchange(request).unwrap(),
+                    Some(json!({"updated":[id]}))
+                );
+                producer
+                    .update("other", 1, ActivityState::Working, false, None)
+                    .unwrap();
+                control(&path, json!({"version":1,"type":"familiar.open","items":[{"id":"later","source":"test","activity":"other"}]})).unwrap();
+                let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
+                let later = list["familiars"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["id"] == "later")
+                    .unwrap();
+                assert_eq!(later["settings"], json!(defaults));
+                drop(producer);
+                control(&path, json!({"version":1,"type":"familiar.settings","ids":[id],"patch":{"sprite_scale":1.0}})).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -1312,6 +1847,7 @@ mod tests {
             json!({"type":"companion.next"}),
             json!({"type":"companion.reveal","familiars":["main"]}),
             json!({"type":"familiar.go-to-mouse","ids":["main"]}),
+            json!({"type":"familiar.settings","ids":["main"],"patch":{"font_size":16}}),
             json!({"type":"companion.quit"}),
             json!({"type":"companion.service"}),
             json!({"type":"companion.status"}),
@@ -1363,12 +1899,14 @@ mod tests {
                 quit_flushed: None,
             };
             let controls = ControlContext {
+                diagnostics: RuntimeDiagnostics::new(true),
                 targeted: TargetedControls {
                     reveal: Some(Box::new(|_| panic!("stale reveal"))),
                     go_to_mouse: Some(Box::new(|_| panic!("stale navigation"))),
                     quit: Some(Box::new(|| panic!("stale quit"))),
                 },
                 multi: true,
+                settings_support: true,
                 service_instance: "current-service".into(),
             };
             packet["version"] = 1.into();
@@ -1434,7 +1972,7 @@ mod tests {
             protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
             assert_eq!(
                 info,
-                json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false})
+                json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"familiar_count":usize::from(bootstrap_main),"source_count":0,"diagnostics":_server.diagnostics().snapshot()})
             );
             let mut peer = Publisher {
                 stream: connect_private(&path).unwrap(),
@@ -1684,7 +2222,9 @@ mod tests {
                 ..TargetedControls::default()
             };
             let controls = ControlContext {
+                diagnostics: RuntimeDiagnostics::new(true),
                 targeted,
+                settings_support: false,
                 multi: true,
                 service_instance: "test-service".into(),
             };
@@ -1744,7 +2284,7 @@ mod tests {
             let request = json!({"version":1,"type":"companion.service"});
             let info = control(&path, request.clone()).unwrap();
             protocol::validate_id(info["service_instance"].as_str().unwrap()).unwrap();
-            let expected = json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":mode >= 2,"lifecycle":mode >= 2,"navigation":mode == 3});
+            let mut expected = json!({"api_version":1,"service_instance":info["service_instance"],"pid":std::process::id(),"graphical":mode >= 2,"lifecycle":mode >= 2,"navigation":mode == 3,"settings":false,"familiar_count":1,"source_count":0,"diagnostics":_server.diagnostics().snapshot()});
             assert_eq!(info, expected);
             let mut peer = Publisher {
                 stream: connect_private(&path).unwrap(),
@@ -1760,9 +2300,100 @@ mod tests {
                 Some(expected.clone())
             );
             let mut producer = Publisher::connect(&path, "test", "one").unwrap();
+            expected["source_count"] = json!(1);
             assert_eq!(producer.exchange(request).unwrap(), Some(expected));
             producer.heartbeat().unwrap();
         }
+    }
+
+    #[test]
+    fn service_diagnostics_live_handle_preserves_generation_and_capabilities() {
+        use crate::{
+            diagnostics::{ShortcutReason, ShortcutState, ShortcutStatus},
+            hotkey::Shortcut,
+        };
+        let (_dir, path) = fixture();
+        let server = Server::start_with_navigation(&path, |_| {}, |_| {}, |_| {}).unwrap();
+        let handle = server.diagnostics();
+        let request = json!({"version":1,"type":"companion.service"});
+        let initial = control(&path, request.clone()).unwrap();
+        assert_eq!(
+            initial["diagnostics"]["hotkeys"]["option_i"]["reason"],
+            "not_reported"
+        );
+        for (state, reason) in [
+            (
+                ShortcutState::Uninitialized,
+                Some(ShortcutReason::RegistrationPending),
+            ),
+            (ShortcutState::Registered, None),
+        ] {
+            handle.set_hotkey(Shortcut::Reveal, ShortcutStatus { state, reason });
+            let info = control(&path, request.clone()).unwrap();
+            let mut expected = initial.clone();
+            expected["diagnostics"] = json!(handle.snapshot());
+            assert_eq!(info, expected);
+            assert_eq!(info["navigation"], true);
+            assert_eq!(
+                info["diagnostics"]["hotkeys"]["option_m"]["reason"],
+                "not_reported"
+            );
+        }
+    }
+
+    #[test]
+    fn service_counts_registered_identities_not_connections_and_unavailable_familiars() {
+        let (_dir, path) = fixture();
+        let _server = Server::start_with_familiars_config(&path, |_| {}, |_| {}, false).unwrap();
+        let request = json!({"version":1,"type":"companion.service"});
+        let mut unregistered = Publisher {
+            stream: connect_private(&path).unwrap(),
+        };
+        assert_eq!(
+            unregistered.exchange(request.clone()).unwrap().unwrap()["source_count"],
+            0
+        );
+        let mut first = Publisher::connect(&path, "test", "one").unwrap();
+        let _second = Publisher::connect(&path, "test", "two").unwrap();
+        first
+            .update("task", 1, ActivityState::Working, false, None)
+            .unwrap();
+        control(&path, json!({"version":1,"type":"familiar.open","items":[{"source":"test","instance":"one","activity":"task"}]})).unwrap();
+        let info = control(&path, request.clone()).unwrap();
+        assert_eq!(info["source_count"], 2);
+        assert_eq!(info["familiar_count"], 1);
+        first.remove("task", 2).unwrap();
+        let info = control(&path, request.clone()).unwrap();
+        assert_eq!(info["familiar_count"], 1);
+        assert_eq!(info["source_count"], 2);
+        control(
+            &path,
+            json!({"version":1,"type":"familiar.close","ids":["familiar-1"]}),
+        )
+        .unwrap();
+        assert_eq!(control(&path, request).unwrap()["familiar_count"], 0);
+    }
+
+    #[test]
+    fn service_complete_ack_fits_with_maximally_escaped_executable() {
+        let (_dir, path) = fixture();
+        let _server = Server::start(&path, |_| {}).unwrap();
+        let mut info = control(&path, json!({"version":1,"type":"companion.service"})).unwrap();
+        let mut snapshot = RuntimeDiagnostics::new(false).snapshot();
+        snapshot.executable = Some("\"\\".repeat(512));
+        snapshot.build.target = "t".repeat(256);
+        snapshot.build.profile = "p".repeat(256);
+        snapshot.hotkeys.option_i = crate::diagnostics::ShortcutStatus {
+            state: crate::diagnostics::ShortcutState::Unavailable,
+            reason: Some(crate::diagnostics::ShortcutReason::PointerInitializationFailed),
+        };
+        snapshot.hotkeys.option_m = snapshot.hotkeys.option_i;
+        info["diagnostics"] = json!(snapshot);
+        info["service_instance"] = json!("s".repeat(96));
+        info["familiar_count"] = json!(protocol::MAX_FAMILIARS);
+        info["source_count"] = json!(MAX_SOURCES);
+        let ack = json!({"version":1,"ok":true,"data":info});
+        assert!(serde_json::to_vec(&ack).unwrap().len() < MAX_LINE);
     }
 
     #[test]
@@ -1811,8 +2442,10 @@ mod tests {
             &mut |_, _| panic!("service query must not recompute presentations"),
             None,
             &ControlContext {
+                diagnostics: RuntimeDiagnostics::new(true),
                 targeted: TargetedControls::default(),
                 multi: true,
+                settings_support: false,
                 service_instance: "test-service".into(),
             }
         ));
@@ -1821,7 +2454,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&response).unwrap(),
-            json!({"version":1,"ok":true,"data":{"api_version":1,"service_instance":"test-service","pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false}})
+            json!({"version":1,"ok":true,"data":{"api_version":1,"service_instance":"test-service","pid":std::process::id(),"graphical":true,"lifecycle":true,"navigation":false,"settings":false,"familiar_count":1,"source_count":1,"diagnostics":RuntimeDiagnostics::new(true).snapshot()}})
         );
         assert_eq!(client.source, Some(id.clone()));
         assert_eq!(store.presentations(now), before);
@@ -2056,7 +2689,9 @@ mod tests {
             &mut |_, _| {},
             None,
             &ControlContext {
+                diagnostics: RuntimeDiagnostics::new(true),
                 targeted,
+                settings_support: false,
                 multi: true,
                 service_instance: "test-service".into(),
             }
@@ -2108,6 +2743,7 @@ mod tests {
         assert_eq!(
             initial,
             vec![FamiliarPresentation {
+                settings: FamiliarSettings::default(),
                 id: "main".into(),
                 preset: "djinn".into(),
                 presentation: Presentation::default()
@@ -2948,6 +3584,61 @@ mod tests {
             None
         ));
         assert!(!client.step(&mut store, now + REGISTER_TIMEOUT, &mut |_, _| {}, None));
+    }
+
+    #[test]
+    fn ack_rejects_duplicate_keys_at_every_depth_without_echoing_peer_keys() {
+        for response in [
+            r#"{"version":0,"version":1,"ok":true}"#,
+            r#"{"version":1,"ok":false,"ok":true}"#,
+            r#"{"version":1,"ok":true,"data":{},"data":{}}"#,
+            r#"{"version":1,"ok":true,"data":{"pid":0,"pid":123}}"#,
+            r#"{"version":1,"ok":true,"data":{"diagnostics":{"executable":"bad\npath","executable":"/safe"}}}"#,
+            r#"{"version":1,"ok":true,"data":{"diagnostics":{"build":{"target":"bad","target":"safe"}}}}"#,
+            r#"{"version":1,"ok":true,"data":{"diagnostics":{"hotkeys":{"option_i":{"state":"disabled","state":"registered"}}}}}"#,
+            r#"{"version":1,"ok":true,"data":{"diagnostics":{"hotkeys":{"option_m":{"reason":"headless","reason":null}}}}}"#,
+            r#"{"version":1,"ok":true,"data":{"rows":[{"secret-peer-key":0,"secret-peer-key":1}]}}"#,
+            r#"{"version":1,"ok":true,"unknown":[[ {"key":1,"k\u0065y":2} ]]}"#,
+        ] {
+            let error = parse_ack(response.as_bytes()).err().unwrap();
+            let message = format!("{error:#}");
+            assert!(message.contains("duplicate JSON object key"));
+            assert!(!message.contains("secret-peer-key"));
+            assert!(!message.contains("bad\\npath"));
+            assert!(!message.contains("/safe"));
+        }
+    }
+
+    #[test]
+    fn ack_accepts_unique_optional_fields_and_independent_objects_but_stays_bounded() {
+        let response = br#"{"version":1,"ok":true,"data":{"rows":[{"key":1},{"key":2}],"nested":{"key":null},"key":true,"numbers":[-1,1.25,18446744073709551615],"text":"safe"},"unknown":{"key":false}}"#;
+        let ack = parse_ack(response).unwrap();
+        assert_eq!(ack.version, 1);
+        assert!(ack.ok);
+        let expected: serde_json::Value = serde_json::from_slice(response).unwrap();
+        assert_eq!(ack.data, Some(expected["data"].clone()));
+        assert!(parse_ack(&vec![b' '; MAX_LINE + 1]).is_err());
+        let deep = format!(
+            "{{\"version\":1,\"ok\":true,\"data\":{}0{}}}",
+            "[".repeat(128),
+            "]".repeat(128)
+        );
+        assert!(parse_ack(deep.as_bytes()).is_err());
+        assert!(parse_ack(br#"{"version":1,"ok":true} {}"#).is_err());
+    }
+
+    #[test]
+    fn publisher_rejects_late_duplicate_ack_as_invalid_not_offline() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+        peer.write_all(b"{\"version\":1,\"ok\":true}\n{\"version\":1,\"ok\":true,\"data\":{\"pid\":0,\"pid\":123}}\n").unwrap();
+        let mut publisher = Publisher { stream };
+        publisher.heartbeat().unwrap();
+        let error = publisher
+            .exchange(json!({"version":1,"type":"companion.service"}))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate JSON object key"));
+        assert!(!error.chain().any(|cause| cause.is::<io::Error>()));
     }
 
     #[test]

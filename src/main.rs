@@ -3,7 +3,11 @@ mod animation;
 mod assets;
 mod bootstrap;
 mod bubble;
+mod build_info;
+mod context_menu;
+mod diagnostics;
 mod display;
+mod doctor;
 mod hotkey;
 mod ipc;
 mod menu;
@@ -66,12 +70,20 @@ enum Command {
     Close(CloseOptions),
     /// Run selected familiars to the live mouse pointer and celebrate once on arrival.
     GoToMouse(CloseOptions),
+    /// Atomically update presentation settings for explicitly selected familiars.
+    Settings(SettingsOptions),
     /// Familiar-first terminal menu for Wisp or an interactive terminal.
     Menu(menu::MenuOptions),
     /// Print a Wisp launcher action, or install it explicitly with a backup.
     WispAction(wisp_action::ActionOptions),
     /// Inspect the running service's version, PID and graphical capabilities.
     ServiceInfo,
+    /// Report client/service build identity and shortcut readiness without changing state.
+    Doctor {
+        /// Emit a single machine-readable JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Gracefully stop the graphical service and its familiars, not source applications.
     Quit,
     /// Validate the bundled atlas and print clip information without opening a window.
@@ -97,7 +109,7 @@ pub struct RunOptions {
     /// Duration of a notification or on-demand reveal, in seconds.
     #[arg(long, default_value = "5", value_parser = parse_bubble_duration)]
     bubble_duration: Duration,
-    /// Do not register the macOS system-wide Option+I shortcut.
+    /// Do not register macOS system-wide Option+I or Option+M shortcuts (local controls remain).
     #[arg(long)]
     no_hotkey: bool,
     /// Installed Regular font family; defaults to SauceCodePro Nerd Font when available.
@@ -183,6 +195,42 @@ struct BubbleOptions {
 struct CloseOptions {
     #[arg(long, required = true, num_args = 1.., value_parser = parse_id)]
     familiar: Vec<String>,
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "Supply one or more setting flags. Unspecified settings and unselected familiars stay unchanged. Values are runtime-only."
+)]
+#[command(group(ArgGroup::new("patch").required(true).multiple(true)
+    .args(["sprite_scale", "font_size", "bubble_duration"])))]
+struct SettingsOptions {
+    /// Explicit 1–16 unique existing familiar IDs; there is no implicit all.
+    #[arg(long, required = true, num_args = 1..=16, value_parser = parse_id)]
+    familiar: Vec<String>,
+    /// Sprite-only scale, 0.25–2; independent of bubble text size.
+    #[arg(long, value_parser = parse_sprite_scale)]
+    sprite_scale: Option<f32>,
+    /// Bubble font size, 8–32 logical canvas units.
+    #[arg(long, value_parser = parse_font_size)]
+    font_size: Option<f32>,
+    /// Duration in seconds, 0.25–30; applies to future accepted reveals only.
+    #[arg(long, value_parser = parse_bubble_duration)]
+    bubble_duration: Option<Duration>,
+}
+
+impl SettingsOptions {
+    fn request(self) -> Result<serde_json::Value> {
+        protocol::validate_ids(&self.familiar)?;
+        let patch = protocol::SettingsPatch {
+            sprite_scale: self.sprite_scale.map(f64::from),
+            font_size: self.font_size.map(f64::from),
+            bubble_duration: self.bubble_duration.map(|value| value.as_secs_f64()),
+        };
+        let request = serde_json::json!({"version":1,"type":"familiar.settings",
+            "ids":self.familiar,"patch":patch});
+        protocol::Request::parse(&serde_json::to_vec(&request)?)?;
+        Ok(request)
+    }
 }
 
 #[derive(Args)]
@@ -554,6 +602,7 @@ fn main() -> Result<()> {
                 "version":1,"type":"companion.service",
             }),
         ),
+        Command::Doctor { json } => doctor::run(&socket_path(cli.socket)?, json),
         Command::Quit => print_control(
             socket_path(cli.socket)?,
             serde_json::json!({
@@ -604,6 +653,15 @@ fn main() -> Result<()> {
                 "version":1,"type":"familiar.go-to-mouse","ids":options.familiar,
             }),
         ),
+        Command::Settings(options) => {
+            let request = options.request()?;
+            let ids: Vec<String> = serde_json::from_value(request["ids"].clone())?;
+            let path = socket_path(cli.socket)?;
+            let data = ipc::control(&path, request)?;
+            menu::validate_updated_ids(&data, &ids)?;
+            println!("{}", serde_json::to_string_pretty(&data)?);
+            Ok(())
+        }
         Command::FontLicense => {
             print!("{}", typography::FALLBACK_FONT_LICENSE);
             Ok(())
@@ -655,6 +713,26 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_hotkey_help_names_both_global_chords_and_retains_local_controls() {
+        let help = Cli::command()
+            .find_subcommand_mut("run")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("Option+I or Option+M"));
+        assert!(help.contains("local controls remain"));
+        let Command::Run(options) = Cli::try_parse_from(["numen", "run", "--no-hotkey"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected run");
+        };
+        assert!(options.no_hotkey);
+        assert!(Cli::try_parse_from(["numen", "go-to-mouse"]).is_err());
+        assert!(Cli::try_parse_from(["numen", "go-to-mouse", "--all"]).is_err());
+    }
 
     #[test]
     fn accepts_defaults_and_diagnostic_options() {
@@ -833,6 +911,32 @@ mod tests {
             vec!["numen", "go-to-mouse"],
         ] {
             assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn settings_accepts_every_nonempty_patch_subset_and_sixteen_ids() {
+        for mask in 1..8 {
+            let mut args = vec!["numen".to_owned(), "settings".into(), "--familiar".into()];
+            args.extend((0..16).map(|n| format!("f{n}")));
+            for (bit, flag, value) in [
+                (1, "--sprite-scale", "0.5"),
+                (2, "--font-size", "16"),
+                (4, "--bubble-duration", "5"),
+            ] {
+                if mask & bit != 0 {
+                    args.extend([flag.into(), value.into()]);
+                }
+            }
+            let Command::Settings(options) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected settings");
+            };
+            let request = options.request().unwrap();
+            assert_eq!(request["ids"].as_array().unwrap().len(), 16);
+            let patch = request["patch"].as_object().unwrap();
+            assert_eq!(patch.contains_key("sprite_scale"), mask & 1 != 0);
+            assert_eq!(patch.contains_key("font_size"), mask & 2 != 0);
+            assert_eq!(patch.contains_key("bubble_duration"), mask & 4 != 0);
         }
     }
 

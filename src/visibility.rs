@@ -29,6 +29,11 @@ impl BubbleVisibility {
         }
     }
 
+    /// Changes only the lifetime of future accepted reveals, not current deadlines.
+    pub fn set_duration(&mut self, duration: Duration) {
+        self.duration = duration;
+    }
+
     /// Returns whether a notification was accepted, not whether layout changed.
     pub fn observe(&mut self, view: &Presentation, now: Instant) -> bool {
         self.expire(now);
@@ -111,6 +116,65 @@ mod tests {
 
     fn policy() -> BubbleVisibility {
         BubbleVisibility::new(true, false, LIFETIME)
+    }
+
+    #[test]
+    fn duration_edits_only_affect_future_accepted_reveals() {
+        let now = Instant::now();
+        let shorter = Duration::from_millis(250);
+        let longer = Duration::from_secs(30);
+        let mut p = policy();
+        p.set_duration(shorter);
+        assert!(!p.visible(now));
+        assert_eq!(p.deadline(), None);
+        assert!(p.observe(&view(), now));
+        let end = now + shorter;
+        let text = p.last_text.clone();
+        p.set_duration(longer);
+        assert_eq!(p.deadline(), Some(end));
+        assert_eq!(p.last_text, text);
+        assert!(p.has_following);
+        assert!(p.visible(end - Duration::from_nanos(1)));
+        assert!(p.expire(end));
+        let quiet = p.quiet_until;
+        p.set_duration(shorter);
+        assert_eq!(p.quiet_until, quiet);
+        assert_eq!(p.last_text, text);
+        assert!(!p.visible(end));
+        let mut changed = view();
+        changed.following.as_mut().unwrap().summary = Some("quiet update".into());
+        assert!(!p.observe(&changed, end));
+        p.set_duration(longer);
+        assert!(!p.observe(&changed, end + QUIET_PERIOD));
+        assert!(p.reveal(end));
+        assert_eq!(p.deadline(), Some(end + longer));
+        // Shortening an already visible reveal must not shorten it either.
+        p.set_duration(shorter);
+        assert_eq!(p.deadline(), Some(end + longer));
+        assert!(p.reveal(end));
+        assert_eq!(p.deadline(), Some(end + shorter));
+    }
+
+    #[test]
+    fn duration_edits_preserve_always_and_disabled_policies() {
+        let now = Instant::now();
+        for enabled in [false, true] {
+            for always in [false, true] {
+                let mut p = BubbleVisibility::new(enabled, always, LIFETIME);
+                p.observe(&view(), now);
+                let deadline = p.deadline();
+                let text = p.last_text.clone();
+                p.set_duration(Duration::from_millis(250));
+                assert_eq!(p.deadline(), deadline);
+                assert_eq!(p.last_text, text);
+                assert_eq!(p.visible(now), enabled);
+                assert_eq!(p.reveal(now), enabled);
+                if !enabled || always {
+                    assert_eq!(p.deadline(), None);
+                    assert_eq!(p.visible(now + LIFETIME), enabled && always);
+                }
+            }
+        }
     }
 
     fn view() -> Presentation {

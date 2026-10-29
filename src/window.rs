@@ -11,7 +11,7 @@ use pixels::wgpu::{BlendState, Color, CompositeAlphaMode};
 use pixels::{Pixels, PixelsBuilder, ScalingMode, SurfaceTexture};
 use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -22,8 +22,10 @@ use crate::activity::{FamiliarPresentation, Presentation};
 use crate::animation::{Animation, Player};
 use crate::assets::{DEFAULT_CHARACTER_ID, DEFAULT_CHARACTER_NAME, SpriteAtlas};
 use crate::bubble;
+use crate::context_menu::{self, Action};
+use crate::diagnostics::{RuntimeDiagnostics, ShortcutReason, ShortcutState, ShortcutStatus};
 use crate::display::{LiveDisplay, Mailbox};
-use crate::hotkey::GlobalRevealHotkey;
+use crate::hotkey::{GlobalHotkey, Shortcut};
 use crate::ipc::{FamiliarControl, Server};
 #[cfg(test)]
 use crate::motion::{FRAME_INTERVAL, SpriteMask};
@@ -31,10 +33,133 @@ use crate::motion::{
     Facing, MotionClock, NativeMotion, Navigator, Point, PursuitStep, RasterMask, SpriteGeometry,
 };
 use crate::pointer::{self, PointerReader};
+use crate::protocol::FamiliarSettings;
 use crate::typography::Typeface;
 use crate::visibility::BubbleVisibility;
 
 const DEMO_INTERVAL: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct ClickGesture {
+    cursor: Option<PhysicalPosition<f64>>,
+    pressed: Option<(PhysicalPosition<f64>, f64)>,
+    held: bool,
+    native_drag_active: bool,
+    click_eligible: bool,
+}
+
+impl ClickGesture {
+    fn press(&mut self, scale: f64) {
+        self.held = true;
+        self.native_drag_active = false;
+        self.pressed = self
+            .cursor
+            .filter(|p| p.x.is_finite() && p.y.is_finite())
+            .filter(|_| scale.is_finite() && scale > 0.0)
+            .map(|p| (p, scale));
+        self.click_eligible = self.pressed.is_some();
+    }
+
+    fn moved(&mut self, position: PhysicalPosition<f64>, button_down: bool) -> bool {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            self.cancel_click();
+            return false;
+        }
+        self.cursor = Some(position);
+        if let Some((start, scale)) = self.pressed
+            && (position.x - start.x).hypot(position.y - start.y) / scale >= 5.0
+        {
+            self.pressed = None;
+            self.click_eligible = false;
+            return self.held && button_down && !self.native_drag_active;
+        }
+        false
+    }
+
+    fn release(&mut self) -> Option<PhysicalPosition<f64>> {
+        let position = (self.held && self.click_eligible && !self.native_drag_active)
+            .then_some(self.cursor)
+            .flatten();
+        self.finish();
+        position
+    }
+
+    fn cancel_click(&mut self) {
+        self.click_eligible = false;
+        self.cursor = None;
+    }
+
+    fn poll_release(&mut self, button_down: bool) -> bool {
+        // Physical mouse-up can precede delivery of the queued click release.
+        if self.held && !button_down && (self.native_drag_active || !self.click_eligible) {
+            self.finish();
+            return true;
+        }
+        false
+    }
+
+    fn finish(&mut self) {
+        self.pressed = None;
+        self.held = false;
+        self.native_drag_active = false;
+        self.click_eligible = false;
+    }
+
+    fn clear(&mut self) {
+        self.finish();
+        self.cursor = None;
+    }
+}
+
+#[derive(Default, Clone)]
+struct PopupLifecycle {
+    cancelled: Arc<AtomicBool>,
+    target: Arc<Mutex<Option<String>>>,
+}
+
+impl PopupLifecycle {
+    fn post(
+        &self,
+        snapshot: Vec<FamiliarPresentation>,
+        mailbox: &Mailbox<Vec<FamiliarPresentation>>,
+    ) -> bool {
+        let target = self.target.lock().unwrap_or_else(|e| e.into_inner());
+        if target
+            .as_ref()
+            .is_some_and(|id| !snapshot.iter().any(|v| &v.id == id))
+        {
+            self.cancelled.store(true, Ordering::Release);
+        }
+        // Serialize publication with begin so a removal cannot fall between the
+        // root's latest-snapshot drain and registration of the tracked target.
+        mailbox.post(snapshot)
+    }
+
+    fn begin(&self, id: &str) {
+        let mut target = self.target.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancelled.store(false, Ordering::Release);
+        *target = Some(id.to_owned());
+    }
+
+    fn end(&self) {
+        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+struct MenuRequest {
+    familiar: String,
+    window_id: WindowId,
+    window: Arc<Window>,
+    position: PhysicalPosition<f64>,
+}
+
+fn familiar_settings(options: &RunOptions) -> FamiliarSettings {
+    FamiliarSettings {
+        sprite_scale: f64::from(options.sprite_scale),
+        font_size: f64::from(options.font_size),
+        bubble_duration: options.bubble_duration.as_secs_f64(),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum AppEvent {
@@ -56,6 +181,101 @@ impl RevealNotifier {
             self.pending.take();
         }
     }
+}
+
+#[derive(Clone)]
+struct NavigationNotifier {
+    pending: Arc<RevealMailbox>,
+    proxy: EventLoopProxy<AppEvent>,
+}
+
+impl NavigationNotifier {
+    fn request(&self, targets: Option<Vec<String>>) {
+        if self.pending.post(targets) && self.proxy.send_event(AppEvent::GoToMouse).is_err() {
+            self.pending.take();
+        }
+    }
+}
+
+fn register_shortcuts<T>(
+    options: &RunOptions,
+    pointer_available: bool,
+    live: bool,
+    platform_supported: bool,
+    reporter: Option<&RuntimeDiagnostics>,
+    mut register: impl FnMut(Shortcut) -> Result<T>,
+) -> [Option<T>; 2] {
+    let shortcuts = [Shortcut::Reveal, Shortcut::GoToMouse];
+    let statuses = shortcuts.map(|shortcut| {
+        let (state, reason) = if options.no_hotkey {
+            (ShortcutState::Disabled, ShortcutReason::NoHotkey)
+        } else if shortcut == Shortcut::Reveal && options.no_bubble {
+            (ShortcutState::Disabled, ShortcutReason::NoBubble)
+        } else if !platform_supported {
+            (
+                ShortcutState::Unsupported,
+                ShortcutReason::UnsupportedPlatform,
+            )
+        } else if shortcut == Shortcut::GoToMouse && !pointer_available {
+            if options.manual || options.demo || !live {
+                (ShortcutState::Unsupported, ShortcutReason::UnsupportedMode)
+            } else {
+                (
+                    ShortcutState::Unavailable,
+                    ShortcutReason::PointerInitializationFailed,
+                )
+            }
+        } else {
+            (
+                ShortcutState::Uninitialized,
+                ShortcutReason::RegistrationPending,
+            )
+        };
+        let status = ShortcutStatus {
+            state,
+            reason: Some(reason),
+        };
+        if let Some(reporter) = reporter {
+            reporter.set_hotkey(shortcut, status);
+        }
+        status
+    });
+    // Publish both gates before entering OS registration, without retaining a lock.
+    shortcuts.map(|shortcut| {
+        let index = match shortcut {
+            Shortcut::Reveal => 0,
+            Shortcut::GoToMouse => 1,
+        };
+        if statuses[index].reason != Some(ShortcutReason::RegistrationPending) {
+            return None;
+        }
+        let (guard, status) = match register(shortcut) {
+            Ok(guard) => {
+                info!(?shortcut, "Global shortcut registered");
+                (
+                    Some(guard),
+                    ShortcutStatus {
+                        state: ShortcutState::Registered,
+                        reason: None,
+                    },
+                )
+            }
+            Err(error) => {
+                warn!(?shortcut, %error, "Global shortcut unavailable; CLI and local shortcut remain available");
+                (
+                    None,
+                    ShortcutStatus {
+                        state: ShortcutState::Unavailable,
+                        reason: Some(ShortcutReason::RegistrationFailed),
+                    },
+                )
+            }
+        };
+        if let Some(reporter) = reporter {
+            reporter.set_hotkey(shortcut, status);
+        }
+        guard
+    })
 }
 
 #[derive(Default)]
@@ -128,63 +348,68 @@ pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Re
         proxy: proxy.clone(),
     };
     let ipc_reveal = reveal.clone();
-    let navigation_pending = app.navigation_pending.clone();
-    let navigation_proxy = proxy.clone();
+    let navigation = NavigationNotifier {
+        pending: app.navigation_pending.clone(),
+        proxy: proxy.clone(),
+    };
+    let ipc_navigation = navigation.clone();
     let quit_proxy = proxy.clone();
-    let quit_pending = Arc::new(AtomicBool::new(false));
+    let quit_pending = app.quit_pending.clone();
+    let popup_views = app.popup.clone();
+    let popup_quit = app.popup.clone();
     let server = socket
         .map(|path| {
             let on_views = move |view| {
-                if mailbox.post(view) {
+                if popup_views.post(view, &mailbox) {
                     let _ = proxy.send_event(AppEvent::ActivityChanged);
                 }
             };
             let on_reveal = move |ids| ipc_reveal.request(ids);
             let on_go_to_mouse = if app.pointer.is_some() {
-                Some(Box::new(move |ids| {
-                    if navigation_pending.post(Some(ids))
-                        && navigation_proxy.send_event(AppEvent::GoToMouse).is_err()
-                    {
-                        navigation_pending.take();
-                    }
-                }) as Box<dyn Fn(Vec<String>) + Send>)
+                Some(Box::new(move |ids| ipc_navigation.request(Some(ids)))
+                    as Box<dyn Fn(Vec<String>) + Send>)
             } else {
                 None
             };
-            let server = Server::start_graphical(
+            let server = Server::start_graphical_with_settings(
                 path,
                 on_views,
                 on_reveal,
                 on_go_to_mouse,
                 move || {
+                    popup_quit.cancelled.store(true, Ordering::Release);
                     if !quit_pending.swap(true, Ordering::AcqRel) {
                         let _ = quit_proxy.send_event(AppEvent::QuitService);
                     }
                 },
                 !app.options.empty,
+                familiar_settings(&app.options),
             )?;
             info!(socket = %path.display(), "Local activity listener ready");
             Ok::<_, anyhow::Error>(server)
         })
         .transpose()?;
     app.control = server.as_ref().map(Server::familiar_control);
-    let hotkey = if !app.options.no_bubble && !app.options.no_hotkey {
-        match GlobalRevealHotkey::register(move || reveal.request(None)) {
-            Ok(registration) => {
-                info!("Global Option+I reveal shortcut registered");
-                Some(registration)
-            }
-            Err(error) => {
-                warn!(%error, "Global shortcut unavailable; use `numen bubbles` or local Option+I instead");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    app.global_hotkey_registered = hotkey.is_some();
+    let diagnostics = server.as_ref().map(Server::diagnostics);
+    let hotkeys = register_shortcuts(
+        &app.options,
+        app.pointer.is_some(),
+        app.live,
+        cfg!(target_os = "macos"),
+        diagnostics.as_ref(),
+        |shortcut| {
+            let reveal = reveal.clone();
+            let navigation = navigation.clone();
+            GlobalHotkey::register(shortcut, move || match shortcut {
+                Shortcut::Reveal => reveal.request(None),
+                Shortcut::GoToMouse => navigation.request(None),
+            })
+        },
+    );
+    app.global_hotkey_registered = hotkeys[0].is_some();
+    app.global_navigation_registered = hotkeys[1].is_some();
     let result = event_loop.run_app(&mut app);
-    drop(hotkey);
+    drop(hotkeys);
     drop(server);
     result?;
     info!("Numen event loop closed");
@@ -249,16 +474,24 @@ struct FamiliarView {
     modifiers: ModifiersState,
     hidden_position: Option<PhysicalPosition<i32>>,
     global_hotkey_registered: bool,
+    global_navigation_registered: bool,
+    navigation_available: bool,
     navigation: Option<Navigation>,
     motion_clock: MotionClock,
     native_motion: NativeMotion,
     raster: Option<CachedRaster>,
     scene_dirty: bool,
+    gesture: ClickGesture,
+    drag_start: Option<context_menu::DragStart>,
+    menu_open: bool,
+    settings: FamiliarSettings,
+    deferred_settings: Option<FamiliarSettings>,
 }
 
 impl FamiliarView {
     fn new(id: String, atlas: Arc<SpriteAtlas>, options: RunOptions) -> Self {
         let now = Instant::now();
+        let settings = familiar_settings(&options);
         let mut display = LiveDisplay::default();
         let mut visibility = BubbleVisibility::new(
             !options.no_bubble,
@@ -300,12 +533,58 @@ impl FamiliarView {
             modifiers: ModifiersState::empty(),
             hidden_position: None,
             global_hotkey_registered: false,
+            global_navigation_registered: false,
+            navigation_available: false,
             navigation: None,
             motion_clock: MotionClock::default(),
             native_motion: NativeMotion::default(),
             raster: None,
             scene_dirty: true,
+            gesture: ClickGesture::default(),
+            drag_start: None,
+            menu_open: false,
+            settings,
+            deferred_settings: None,
         }
+    }
+
+    fn apply_settings(&mut self, settings: FamiliarSettings) -> Result<()> {
+        self.settings = settings;
+        if self.geometry_held() {
+            self.deferred_settings = Some(settings);
+            return Ok(());
+        }
+        self.deferred_settings = None;
+        let sprite_scale = settings.sprite_scale as f32;
+        let font_size = settings.font_size as f32;
+        let duration = Duration::from_secs_f64(settings.bubble_duration);
+        let old_scale = self.options.sprite_scale;
+        let layout_changed = old_scale != sprite_scale;
+        let paint_changed = layout_changed || self.options.font_size != font_size;
+        let changed = paint_changed || self.options.bubble_duration != duration;
+        self.options.sprite_scale = sprite_scale;
+        self.options.font_size = font_size;
+        self.options.bubble_duration = duration;
+        self.visibility.set_duration(duration);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_sprite_scale(sprite_scale);
+            renderer.set_font_size(font_size);
+        }
+        if paint_changed {
+            self.scene_dirty = true;
+            if layout_changed {
+                self.raster = None;
+                self.layout(self.bubble_visible, old_scale)?;
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        if changed {
+            debug!(familiar = %self.id, sprite_scale, font_size,
+                bubble_duration = duration.as_secs_f64(), "Familiar settings applied");
+        }
+        Ok(())
     }
 
     fn initialize(
@@ -384,17 +663,24 @@ impl FamiliarView {
             familiar = %self.id,
             character = DEFAULT_CHARACTER_ID,
             animation = self.player.animation().label(),
-            "{DEFAULT_CHARACTER_NAME} ready; Option+I/bubbles, Tab/next conversation, 1–9/manual, L/live, Space/pause, right-click/cycle, Esc/Q/quit"
+            navigation_shortcut = self.navigation_available.then_some("Option+M/go to mouse"),
+            "{DEFAULT_CHARACTER_NAME} ready; click/menu (macOS), drag/move, Option+I/bubbles, Tab/next conversation, 1–9/manual, L/live, Space/pause, Esc/Q/Close familiar"
         );
         Ok(())
     }
 
     fn fail(&mut self, _event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        self.gesture.clear();
+        self.drag_start = None;
+        self.menu_open = false;
         self.cancel_navigation("view failed");
         self.error = Some(error);
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop) {
+        info!(familiar = %self.id, "Close familiar requested");
+        self.gesture.clear();
+        self.drag_start = None;
         self.cancel_navigation("close requested");
         if self.focus_control.is_some() {
             self.close_requested = true;
@@ -426,6 +712,14 @@ impl FamiliarView {
     }
 
     fn keyboard(&mut self, event_loop: &ActiveEventLoop, code: KeyCode) {
+        if self.local_navigation(
+            code,
+            self.window
+                .as_ref()
+                .is_some_and(|window| window.has_focus()),
+        ) {
+            return;
+        }
         match code {
             KeyCode::KeyC if self.modifiers.control_key() => event_loop.exit(),
             KeyCode::Escape | KeyCode::KeyQ => self.close(event_loop),
@@ -454,14 +748,7 @@ impl FamiliarView {
                 self.reveal_bubbles(event_loop);
             }
             KeyCode::Space => {
-                self.paused = !self.paused;
-                self.last_tick = Instant::now();
-                self.resume_navigation(self.last_tick);
-                self.next_demo = self.last_tick + DEMO_INTERVAL;
-                info!(paused = self.paused, "Animation pause toggled");
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.set_paused(!self.paused);
             }
             _ => {
                 if let Some(animation) = animation_for_key(code) {
@@ -472,6 +759,89 @@ impl FamiliarView {
                 }
             }
         }
+    }
+
+    fn local_navigation(&mut self, code: KeyCode, focused: bool) -> bool {
+        if focused
+            && local_navigation_shortcut(
+                code,
+                self.modifiers,
+                self.global_navigation_registered,
+                self.navigation_available,
+            )
+        {
+            self.start_navigation(Instant::now());
+            return true;
+        }
+        false
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.last_tick = Instant::now();
+        self.resume_navigation(self.last_tick);
+        self.next_demo = self.last_tick + DEMO_INTERVAL;
+        info!(paused, "Animation pause changed");
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn menu_request(&self, position: PhysicalPosition<f64>) -> Option<MenuRequest> {
+        let window = self.window.clone()?;
+        Some(MenuRequest {
+            familiar: self.id.clone(),
+            window_id: window.id(),
+            window,
+            position,
+        })
+    }
+
+    fn end_interaction(&mut self, now: Instant) {
+        self.gesture.finish();
+        self.drag_start = None;
+        self.last_tick = now;
+        self.resume_navigation(now);
+    }
+
+    fn release_click(&mut self, now: Instant) -> Option<PhysicalPosition<f64>> {
+        let position = self.gesture.release();
+        // Preserve the captured local coordinate across the root's snapshot drain.
+        self.menu_open = position.is_some();
+        self.end_interaction(now);
+        position
+    }
+
+    fn finish_menu(&mut self, now: Instant) -> Result<()> {
+        self.menu_open = false;
+        self.end_interaction(now);
+        self.flush_geometry(now)
+    }
+
+    fn geometry_held(&self) -> bool {
+        self.gesture.held || self.menu_open
+    }
+
+    fn flush_geometry(&mut self, now: Instant) -> Result<()> {
+        if self.geometry_held() {
+            return Ok(());
+        }
+        if let Some(settings) = self.deferred_settings.take() {
+            self.apply_settings(settings)?;
+        }
+        self.sync_visibility(now)
+    }
+
+    fn poll_interaction(&mut self, now: Instant, button_down: bool) {
+        if self.gesture.poll_release(button_down) {
+            self.end_interaction(now);
+        }
+    }
+
+    fn commit_drag(&mut self) {
+        self.gesture.native_drag_active = true;
+        self.cancel_navigation("native drag");
+        self.hidden_position = None;
     }
 
     fn drawable(&self) -> bool {
@@ -486,7 +856,9 @@ impl FamiliarView {
     }
 
     fn motion_eligible(&self) -> bool {
-        self.seeking() && self.animation_eligible(self.native_geometry_valid())
+        !self.geometry_held()
+            && self.seeking()
+            && self.animation_eligible(self.native_geometry_valid())
     }
 
     fn animation_eligible(&self, native_valid: bool) -> bool {
@@ -738,25 +1110,53 @@ impl FamiliarView {
     }
 
     fn sync_visibility(&mut self, now: Instant) -> Result<()> {
+        if self.geometry_held() {
+            return Ok(());
+        }
         let show = self.visibility.visible(now);
         if show == self.bubble_visible {
             return Ok(());
         }
         let old_show = self.bubble_visible;
         self.scene_dirty = true;
+        self.raster = None;
         self.bubble_visible = show;
+        self.layout(old_show, self.options.sprite_scale)?;
+        info!(familiar = %self.id, visible = show, "Bubble visibility changed");
+        Ok(())
+    }
+
+    fn layout(&mut self, old_show: bool, old_scale: f32) -> Result<()> {
+        let show = self.bubble_visible;
         if let Some(window) = self.window.clone() {
             let position = window.outer_position().ok();
             let physical_scale = self.options.scale * window.scale_factor();
+            let old_size = window.inner_size().into();
+            let new_size = layout_size(show, self.options.sprite_scale, physical_scale);
             let anchored = position.map(|origin| {
-                anchored_position(
+                resized_position(
                     origin,
-                    old_show,
-                    show,
-                    self.options.sprite_scale,
-                    physical_scale,
+                    (old_size, old_show, old_scale),
+                    (new_size, show, self.options.sprite_scale),
                 )
             });
+            if old_scale != self.options.sprite_scale {
+                self.hidden_position = self.hidden_position.map(|origin| {
+                    resized_position(
+                        origin,
+                        (
+                            layout_size(false, old_scale, physical_scale),
+                            false,
+                            old_scale,
+                        ),
+                        (
+                            layout_size(false, self.options.sprite_scale, physical_scale),
+                            false,
+                            self.options.sprite_scale,
+                        ),
+                    )
+                });
+            }
             // Restore the saved position, rather than interpreting a delayed
             // window-manager move as a user drag. A real drag clears the saved
             // anchor and commits the new sprite location instead.
@@ -765,32 +1165,27 @@ impl FamiliarView {
             } else {
                 self.hidden_position.or(anchored)
             };
-            let dimensions = bubble::dimensions(show, self.options.sprite_scale);
             let desired = desired.map(|desired| {
-                if show && let Some(monitor) = window.current_monitor() {
+                if (show || old_scale != self.options.sprite_scale)
+                    && let Some(monitor) = window.current_monitor()
+                {
                     return clamp_to_monitor(
                         desired,
                         monitor.position(),
                         monitor.size().into(),
-                        (
-                            f64::from(dimensions.0) * physical_scale,
-                            f64::from(dimensions.1) * physical_scale,
-                        ),
+                        (f64::from(new_size.0), f64::from(new_size.1)),
                     );
                 }
                 desired
             });
             // Resize/reposition only; never activate or focus on a notification.
-            let _ = window.request_inner_size(LogicalSize::new(
-                f64::from(dimensions.0) * self.options.scale,
-                f64::from(dimensions.1) * self.options.scale,
-            ));
+            let _ = window.request_inner_size(PhysicalSize::new(new_size.0, new_size.1));
             if let Some(desired) = desired {
                 window.set_outer_position(desired);
             }
-            if show {
+            if show && !old_show {
                 self.hidden_position = position;
-            } else {
+            } else if !show {
                 self.hidden_position = None;
             }
             let size = window.inner_size();
@@ -800,7 +1195,6 @@ impl FamiliarView {
                 framebuffer_width = self.frame_size.0, framebuffer_height = self.frame_size.1,
                 "Bubble layout applied");
         }
-        info!(familiar = %self.id, visible = show, "Bubble visibility changed");
         Ok(())
     }
 }
@@ -859,16 +1253,44 @@ impl FamiliarView {
         event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
-    ) {
+    ) -> Option<MenuRequest> {
         if self
             .window
             .as_ref()
             .is_none_or(|window| window.id() != window_id)
         {
-            return;
+            return None;
         }
         match event {
-            WindowEvent::CloseRequested => self.close(event_loop),
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.gesture.moved(
+                    position,
+                    context_menu::supported() && context_menu::left_button_down(),
+                ) && let Some(drag_start) = self.drag_start.take()
+                    && let Some(window) = self.window.clone()
+                {
+                    match drag_start.start(&window) {
+                        Ok(()) => self.commit_drag(),
+                        Err(error) => {
+                            warn!(%error, "Desktop does not support native window dragging");
+                        }
+                    }
+                }
+            }
+            WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. } => {
+                self.gesture.cancel_click();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if context_menu::supported() => {
+                let position = self.release_click(Instant::now());
+                if let Some(position) = position {
+                    return self.menu_request(position);
+                }
+            }
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => self.close(event_loop),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
@@ -884,6 +1306,20 @@ impl FamiliarView {
             } => {
                 match button {
                     MouseButton::Left => {
+                        if context_menu::supported() {
+                            if let Some(window) = &self.window {
+                                self.gesture.press(window.scale_factor());
+                                self.drag_start = match context_menu::capture_drag(window) {
+                                    Ok(drag_start) => Some(drag_start),
+                                    Err(error) => {
+                                        warn!(%error, "Could not capture native drag press");
+                                        None
+                                    }
+                                };
+                                self.resume_navigation(Instant::now());
+                            }
+                            return None;
+                        }
                         self.cancel_navigation("native drag");
                         // Explicit dragging commits the current expanded
                         // location; do not snap back to its pre-notification anchor.
@@ -897,6 +1333,15 @@ impl FamiliarView {
                         }
                     }
                     MouseButton::Right => {
+                        if context_menu::supported() {
+                            if self.gesture.held {
+                                return None;
+                            }
+                            let position = self.gesture.cursor;
+                            self.menu_open = position.is_some();
+                            self.end_interaction(Instant::now());
+                            return position.and_then(|position| self.menu_request(position));
+                        }
                         self.cycle();
                         self.reveal_bubbles(event_loop);
                     }
@@ -905,15 +1350,24 @@ impl FamiliarView {
             }
             WindowEvent::Resized(size) => {
                 // Do not catch up hours of animation after a zero-sized window restores.
-                self.last_tick = Instant::now();
-                self.resume_navigation(self.last_tick);
-                self.next_demo = self.last_tick + DEMO_INTERVAL;
+                // Ordinary layout edits must not reset a running pursuit or clip.
+                if size.width == 0
+                    || size.height == 0
+                    || self.frame_size.0 == 0
+                    || self.frame_size.1 == 0
+                {
+                    self.last_tick = Instant::now();
+                    self.resume_navigation(self.last_tick);
+                    self.next_demo = self.last_tick + DEMO_INTERVAL;
+                }
                 if size.width == 0 || size.height == 0 {
-                    return;
+                    self.frame_size = (0, 0);
+                    self.raster = None;
+                    return None;
                 }
                 if let Err(error) = self.resize(size.width, size.height) {
                     self.fail(event_loop, error);
-                    return;
+                    return None;
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -943,7 +1397,7 @@ impl FamiliarView {
                         && let Err(error) = self.resize(size.width, size.height)
                     {
                         self.fail(event_loop, error);
-                        return;
+                        return None;
                     }
                 }
                 if let (Some(pixels), Some(renderer)) = (&mut self.pixels, &mut self.renderer) {
@@ -968,6 +1422,7 @@ impl FamiliarView {
             }
             _ => {}
         }
+        None
     }
 
     fn tick(
@@ -976,8 +1431,17 @@ impl FamiliarView {
         now: Instant,
         cursor: Option<Point>,
     ) -> Option<Instant> {
+        if context_menu::supported() && self.gesture.held {
+            // AppKit can finish dragging without delivering a winit release.
+            self.poll_interaction(now, context_menu::left_button_down());
+        }
+        if self.geometry_held() {
+            self.last_tick = now;
+            self.resume_navigation(now);
+            return Some(now + Duration::from_millis(20));
+        }
         self.visibility.expire(now);
-        if let Err(error) = self.sync_visibility(now) {
+        if let Err(error) = self.flush_geometry(now) {
             self.fail(event_loop, error);
             return None;
         }
@@ -1054,12 +1518,15 @@ struct App {
     live: bool,
     initial_snapshot: bool,
     global_hotkey_registered: bool,
+    global_navigation_registered: bool,
     exit_at: Option<Instant>,
     error: Option<anyhow::Error>,
     // Failed native views stay suppressed until the registry acknowledges removal.
     failed: BTreeSet<String>,
     pending_close: BTreeSet<String>,
     submitted_close: BTreeSet<String>,
+    popup: PopupLifecycle,
+    quit_pending: Arc<AtomicBool>,
 }
 
 impl App {
@@ -1079,11 +1546,14 @@ impl App {
             live,
             initial_snapshot: true,
             global_hotkey_registered: false,
+            global_navigation_registered: false,
             exit_at: None,
             error: None,
             failed: BTreeSet::new(),
             pending_close: BTreeSet::new(),
             submitted_close: BTreeSet::new(),
+            popup: PopupLifecycle::default(),
+            quit_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1110,7 +1580,7 @@ impl App {
         Ok(())
     }
 
-    // Reconcile registry state without creating native windows or touching the GPU.
+    // Apply complete registry settings before creating any new native windows.
     fn stage_snapshot(
         &mut self,
         snapshot: Vec<FamiliarPresentation>,
@@ -1145,7 +1615,14 @@ impl App {
                 let mut view = FamiliarView::new(id.clone(), self.atlas.clone(), options);
                 view.focus_control = self.control.clone();
                 view.global_hotkey_registered = self.global_hotkey_registered;
+                view.global_navigation_registered = self.global_navigation_registered;
+                view.navigation_available = self.pointer.is_some();
                 self.views.insert(id.clone(), view);
+            }
+            if let Some(view) = self.views.get_mut(&id)
+                && let Err(error) = view.apply_settings(familiar.settings)
+            {
+                view.error = Some(error);
             }
             updates.push((id, familiar.presentation));
         }
@@ -1167,6 +1644,9 @@ impl App {
             .map(next_position);
         for (id, presentation) in updates {
             if let Some(view) = self.views.get_mut(&id) {
+                if view.error.is_some() {
+                    continue;
+                }
                 let created = view.window.is_none();
                 if view.window.is_none() {
                     if let Err(error) =
@@ -1262,11 +1742,12 @@ impl App {
     }
 
     fn apply_navigation(&mut self) {
-        // This mailbox is only posted with Some(ids), never a broadcast.
-        let targets = reveal_targets(self.navigation_pending.take(), std::iter::empty());
+        // Resolve broadcasts here, after the newest registry snapshot, not in callbacks.
+        let targets = reveal_targets(self.navigation_pending.take(), self.views.keys().cloned());
         let now = Instant::now();
         for id in targets {
             if !self.pending_close.contains(&id)
+                && !self.submitted_close.contains(&id)
                 && !self.failed.contains(&id)
                 && let Some(view) = self.views.get_mut(&id)
             {
@@ -1274,6 +1755,151 @@ impl App {
             }
         }
     }
+
+    fn menu_target(&self, id: &str, window_id: WindowId) -> Option<&FamiliarView> {
+        self.views.get(id).filter(|view| {
+            menu_target_valid(
+                window_id,
+                view.window.as_ref().map(|window| window.id()),
+                view.close_requested
+                    || self.pending_close.contains(id)
+                    || self.submitted_close.contains(id),
+                view.error.is_some() || self.failed.contains(id),
+            )
+        })
+    }
+
+    fn show_menu(&mut self, event_loop: &ActiveEventLoop, request: MenuRequest) {
+        // Publish the target before draining snapshots: removal racing this drain
+        // must either invalidate the target here or cancel native tracking.
+        self.popup.begin(&request.familiar);
+        if let Some(snapshot) = self.mailbox.take() {
+            self.reconcile(event_loop, snapshot);
+        }
+        let context = self
+            .menu_target(&request.familiar, request.window_id)
+            .map(|view| context_menu::Context {
+                paused: view.paused,
+                bubbles: !view.options.no_bubble,
+                navigation: view.navigation_available && self.pointer.is_some(),
+                settings: self.control.as_ref().map(|_| view.settings),
+            });
+        let result = if let Some(context) =
+            context.filter(|_| !event_loop.exiting() && !self.quit_pending.load(Ordering::Acquire))
+        {
+            info!(familiar = %request.familiar, "Familiar menu opened");
+            let cancelled = self.popup.cancelled.clone();
+            // The helper is bounded by tracking, not the deadline. Waking it on
+            // return avoids delaying an explicit Quit Numen selection.
+            std::thread::scope(|scope| {
+                let (done, receiver) = std::sync::mpsc::channel::<()>();
+                if let Some(deadline) = self.exit_at {
+                    let cancelled = cancelled.clone();
+                    scope.spawn(move || {
+                        if matches!(
+                            receiver
+                                .recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            cancelled.store(true, Ordering::Release);
+                        }
+                    });
+                }
+                let result =
+                    context_menu::show(&request.window, request.position, context, cancelled);
+                let _ = done.send(());
+                result
+            })
+        } else {
+            Ok(None)
+        };
+        self.popup.end();
+        // Rebase every pursuit, since native tracking blocked all Rust ticks.
+        let now = Instant::now();
+        for view in self.views.values_mut() {
+            view.last_tick = now;
+            view.resume_navigation(now);
+        }
+        if let Some(snapshot) = self.mailbox.take() {
+            self.reconcile(event_loop, snapshot);
+        }
+        if let Some(view) = self.views.get_mut(&request.familiar)
+            && view
+                .window
+                .as_ref()
+                .is_some_and(|window| window.id() == request.window_id)
+            && let Err(error) = view.finish_menu(now)
+        {
+            view.fail(event_loop, error);
+        }
+        if self.quit_pending.load(Ordering::Acquire)
+            || self.exit_at.is_some_and(|deadline| now >= deadline)
+        {
+            event_loop.exit();
+            return;
+        }
+        match result {
+            Ok(Some(action)) => {
+                info!(familiar = %request.familiar, ?action, "Familiar menu action selected");
+                self.dispatch_menu(event_loop, &request.familiar, request.window_id, action)
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "Could not show familiar menu"),
+        }
+    }
+
+    fn dispatch_menu(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: &str,
+        window_id: WindowId,
+        action: Action,
+    ) {
+        let Some(action) =
+            validated_menu_action(Some(action), self.menu_target(id, window_id).is_some())
+        else {
+            return;
+        };
+        // Service-wide actions do not depend on the clicked familiar surviving.
+        if action.is_service() {
+            info!("Quit Numen requested; closing graphical service");
+            event_loop.exit();
+            return;
+        }
+        if event_loop.exiting() {
+            return;
+        }
+        let view = self.views.get_mut(id).expect("validated menu target");
+        match action {
+            Action::RevealStatus if !view.options.no_bubble => view.reveal_bubbles(event_loop),
+            Action::GoToMouse if view.navigation_available && self.pointer.is_some() => {
+                view.start_navigation(Instant::now())
+            }
+            Action::SetPaused(paused) => view.set_paused(paused),
+            Action::Settings(patch) => {
+                if let Some(control) = &self.control
+                    && let Err(error) = control.settings(id, patch)
+                {
+                    warn!(%id, %error, "Could not queue familiar settings");
+                }
+            }
+            Action::CloseFamiliar => view.close(event_loop),
+            _ => {}
+        }
+    }
+}
+
+fn menu_target_valid(
+    requested: WindowId,
+    current: Option<WindowId>,
+    closing: bool,
+    failed: bool,
+) -> bool {
+    current == Some(requested) && !closing && !failed
+}
+
+fn validated_menu_action(action: Option<Action>, target_valid: bool) -> Option<Action> {
+    action.filter(|action| action.is_service() || target_valid)
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -1297,6 +1923,7 @@ impl ApplicationHandler<AppEvent> for App {
                 vec![FamiliarPresentation {
                     id: "main".into(),
                     preset: DEFAULT_CHARACTER_ID.into(),
+                    settings: familiar_settings(&self.options),
                     presentation: Presentation::default(),
                 }],
             );
@@ -1342,14 +1969,20 @@ impl ApplicationHandler<AppEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if let Some(view) = self.views.values_mut().find(|view| {
-            view.window
-                .as_ref()
-                .is_some_and(|window| window.id() == window_id)
-        }) {
-            view.window_event(event_loop, window_id, event);
-        }
+        let request = self
+            .views
+            .values_mut()
+            .find(|view| {
+                view.window
+                    .as_ref()
+                    .is_some_and(|window| window.id() == window_id)
+            })
+            .and_then(|view| view.window_event(event_loop, window_id, event));
         self.handle_errors(event_loop);
+        if let Some(request) = request {
+            self.show_menu(event_loop, request);
+            self.handle_errors(event_loop);
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1474,6 +2107,46 @@ fn local_reveal_shortcut(
     !global_registered && code == KeyCode::KeyI && modifiers == ModifiersState::ALT
 }
 
+fn local_navigation_shortcut(
+    code: KeyCode,
+    modifiers: ModifiersState,
+    global_registered: bool,
+    pointer_available: bool,
+) -> bool {
+    pointer_available
+        && !global_registered
+        && code == KeyCode::KeyM
+        && modifiers == ModifiersState::ALT
+}
+
+fn layout_size(show: bool, sprite_scale: f32, physical_scale: f64) -> (u32, u32) {
+    let dimensions = bubble::dimensions(show, sprite_scale);
+    (
+        (f64::from(dimensions.0) * physical_scale).round().max(1.0) as u32,
+        (f64::from(dimensions.1) * physical_scale).round().max(1.0) as u32,
+    )
+}
+
+fn resized_position(
+    origin: PhysicalPosition<i32>,
+    old: ((u32, u32), bool, f32),
+    new: ((u32, u32), bool, f32),
+) -> PhysicalPosition<i32> {
+    // Integer physical raster anchors avoid cumulative rounding drift. The feet
+    // stay planted when either sprite scale or bubble visibility changes.
+    let anchor = |(size, show, scale)| {
+        let (x0, _, x1, y1) = bubble::SpriteProjection::new(size, show, scale).bounds;
+        (((x0 + x1) as f64 / 2.0).round(), y1 as f64)
+    };
+    let old = anchor(old);
+    let new = anchor(new);
+    PhysicalPosition::new(
+        (f64::from(origin.x) + old.0 - new.0).round() as i32,
+        (f64::from(origin.y) + old.1 - new.1).round() as i32,
+    )
+}
+
+#[cfg(test)]
 fn anchored_position(
     origin: PhysicalPosition<i32>,
     old_show: bool,
@@ -1481,23 +2154,18 @@ fn anchored_position(
     sprite_scale: f32,
     physical_scale: f64,
 ) -> PhysicalPosition<i32> {
-    let full = bubble::dimensions(true, sprite_scale);
-    let sprite = bubble::dimensions(false, sprite_scale);
-    let offset = |show| {
-        if show {
-            (
-                (f64::from(full.0) - 192.0 * f64::from(sprite_scale)) / 2.0 * physical_scale,
-                f64::from(full.1 - sprite.1) * physical_scale,
-            )
-        } else {
-            (0.0, 0.0)
-        }
-    };
-    let old = offset(old_show);
-    let new = offset(new_show);
-    PhysicalPosition::new(
-        (f64::from(origin.x) + old.0 - new.0).round() as i32,
-        (f64::from(origin.y) + old.1 - new.1).round() as i32,
+    resized_position(
+        origin,
+        (
+            layout_size(old_show, sprite_scale, physical_scale),
+            old_show,
+            sprite_scale,
+        ),
+        (
+            layout_size(new_show, sprite_scale, physical_scale),
+            new_show,
+            sprite_scale,
+        ),
     )
 }
 
@@ -1522,6 +2190,404 @@ fn clamp_to_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn click_release_slop_and_drag_are_dpi_independent() {
+        for scale in [1.0, 1.5, 2.0, 3.0] {
+            let mut gesture = ClickGesture::default();
+            assert_eq!(gesture.release(), None);
+            gesture.press(scale);
+            assert_eq!(gesture.release(), None);
+            let origin = PhysicalPosition::new(20.0, 30.0);
+            assert!(!gesture.moved(origin, true));
+            gesture.press(scale);
+            let nearby = PhysicalPosition::new(origin.x + 2.9 * scale, origin.y + 4.0 * scale);
+            assert!(!gesture.moved(nearby, true));
+            assert_eq!(gesture.release(), Some(nearby));
+            assert_eq!(gesture.release(), None);
+            // Repeated clicks need no intervening cursor event.
+            gesture.press(scale);
+            assert_eq!(gesture.release(), Some(nearby));
+            gesture.press(scale);
+            assert!(gesture.moved(
+                PhysicalPosition::new(nearby.x + 5.1 * scale, nearby.y),
+                true
+            ));
+            assert!(gesture.pressed.is_none());
+            assert_eq!(gesture.release(), None);
+            assert!(!gesture.moved(origin, true));
+            assert_eq!(gesture.release(), None);
+        }
+        let mut exact = ClickGesture::default();
+        exact.moved(PhysicalPosition::new(0.0, 0.0), true);
+        exact.press(2.0);
+        assert!(exact.moved(PhysicalPosition::new(6.0, 8.0), true));
+        assert_eq!(exact.release(), None);
+    }
+
+    #[test]
+    fn focus_loss_cursor_leave_and_invalid_input_cannot_be_clicks() {
+        for _reason in [
+            "focus loss",
+            "cursor leave",
+            "view deletion",
+            "view failure",
+        ] {
+            let mut gesture = ClickGesture::default();
+            gesture.moved(PhysicalPosition::new(10.0, 10.0), true);
+            gesture.press(2.0);
+            gesture.clear();
+            assert_eq!(gesture.release(), None);
+            gesture.press(2.0);
+            assert!(gesture.pressed.is_none());
+        }
+        let mut gesture = ClickGesture::default();
+        gesture.moved(PhysicalPosition::new(0.0, 0.0), true);
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            gesture.press(scale);
+            assert_eq!(gesture.release(), None);
+        }
+        gesture.press(1.0);
+        assert!(!gesture.moved(PhysicalPosition::new(f64::NAN, 0.0), true));
+        assert_eq!(gesture.release(), None);
+    }
+
+    #[test]
+    fn physical_mouse_up_poll_preserves_click_until_queued_release() {
+        let mut view = test_view();
+        let now = Instant::now();
+        let anchor = PhysicalPosition::new(10.0, 10.0);
+        view.gesture.moved(anchor, true);
+        view.gesture.press(1.0);
+        view.poll_interaction(now, false);
+        assert!(view.gesture.held);
+        assert!(view.gesture.click_eligible);
+        assert!(!view.menu_open);
+        assert_eq!(view.release_click(now), Some(anchor));
+        assert!(view.menu_open);
+        assert!(!view.gesture.held);
+    }
+
+    #[test]
+    fn mouse_up_position_crossing_slop_never_drags_or_opens_menu() {
+        let mut view = test_view();
+        let now = Instant::now();
+        view.start_navigation(now);
+        view.hidden_position = Some(PhysicalPosition::new(42, 51));
+        view.gesture.moved(PhysicalPosition::new(10.0, 10.0), true);
+        view.gesture.press(1.0);
+        // Winit may deliver the mouse-up coordinate before MouseInput::Released.
+        assert!(!view.gesture.moved(PhysicalPosition::new(16.0, 10.0), false));
+        assert!(!view.gesture.click_eligible);
+        assert!(!view.gesture.native_drag_active);
+        assert_eq!(view.release_click(now), None);
+        assert!(!view.menu_open);
+        assert!(view.seeking());
+        assert_eq!(view.hidden_position, Some(PhysicalPosition::new(42, 51)));
+    }
+
+    #[test]
+    fn edge_leave_and_focus_loss_cancel_click_but_keep_drag_origin() {
+        for focus_lost in [false, true] {
+            let mut gesture = ClickGesture::default();
+            gesture.moved(PhysicalPosition::new(1.0, 10.0), true);
+            gesture.press(1.0);
+            assert!(!gesture.moved(PhysicalPosition::new(-1.0, 10.0), true));
+            gesture.cancel_click();
+            if focus_lost {
+                gesture.cancel_click();
+            }
+            assert!(gesture.held);
+            assert!(gesture.pressed.is_some());
+            assert!(gesture.moved(PhysicalPosition::new(-5.0, 10.0), true));
+            assert_eq!(gesture.release(), None);
+        }
+    }
+
+    #[test]
+    fn native_drag_holds_layout_until_polled_release_without_release_event() {
+        let mut view = test_view();
+        let now = Instant::now();
+        view.start_navigation(now);
+        view.hidden_position = Some(PhysicalPosition::new(42, 51));
+        view.gesture.moved(PhysicalPosition::new(10.0, 10.0), true);
+        view.gesture.press(1.0);
+        assert!(view.gesture.moved(PhysicalPosition::new(16.0, 10.0), true));
+        // The native adapter has accepted the original-down token and returned.
+        view.commit_drag();
+        assert!(view.navigation.is_none());
+        assert_eq!(view.hidden_position, None);
+        assert!(view.gesture.native_drag_active);
+        assert!(view.gesture.pressed.is_none());
+        view.gesture.cancel_click();
+        assert!(view.geometry_held());
+        let old = familiar_settings(&view.options);
+        let updated = FamiliarSettings {
+            sprite_scale: 1.0,
+            font_size: 20.0,
+            ..old
+        };
+        view.apply_settings(updated).unwrap();
+        assert!(view.visibility.reveal(now));
+        view.poll_interaction(now, true);
+        view.flush_geometry(now).unwrap();
+        assert_eq!(familiar_settings(&view.options), old);
+        assert!(!view.bubble_visible);
+        assert_eq!(view.settings, updated);
+        view.poll_interaction(now + Duration::from_millis(20), false);
+        assert!(!view.geometry_held());
+        assert!(!view.gesture.native_drag_active);
+        view.flush_geometry(now).unwrap();
+        assert_eq!(familiar_settings(&view.options), updated);
+        assert!(view.bubble_visible);
+        assert_eq!(view.release_click(now), None);
+    }
+
+    #[test]
+    fn menu_keeps_release_coordinates_valid_across_newest_snapshot_resize() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let mut snapshot = familiar("main");
+        snapshot.settings.sprite_scale = 2.0;
+        app.stage_snapshot(vec![snapshot.clone()]);
+        let now = Instant::now();
+        let view = app.views.get_mut("main").unwrap();
+        let old = familiar_settings(&view.options);
+        let old_size = layout_size(false, view.options.sprite_scale, 1.0);
+        let anchor = PhysicalPosition::new(f64::from(old_size.0 - 1), f64::from(old_size.1 - 1));
+        view.gesture.moved(anchor, true);
+        view.gesture.press(1.0);
+        snapshot.settings.sprite_scale = 0.25;
+        view.apply_settings(snapshot.settings).unwrap();
+        assert_eq!(view.release_click(now), Some(anchor));
+        assert!(view.menu_open);
+        assert!(!view.gesture.held);
+        // The root drains a newer complete snapshot before native tracking.
+        snapshot.settings.font_size = 24.0;
+        app.stage_snapshot(vec![snapshot.clone()]);
+        let view = app.views.get_mut("main").unwrap();
+        view.flush_geometry(now).unwrap();
+        assert_eq!(view.settings, snapshot.settings);
+        assert_eq!(familiar_settings(&view.options), old);
+        assert_eq!(layout_size(false, view.options.sprite_scale, 1.0), old_size);
+        // A post-tracking snapshot also stays deferred until finish_menu.
+        snapshot.settings.bubble_duration = 9.0;
+        app.stage_snapshot(vec![snapshot.clone()]);
+        let view = app.views.get_mut("main").unwrap();
+        assert_eq!(familiar_settings(&view.options), old);
+        view.finish_menu(now).unwrap();
+        assert_eq!(familiar_settings(&view.options), snapshot.settings);
+        let new_size = layout_size(false, view.options.sprite_scale, 1.0);
+        assert!(anchor.x > f64::from(new_size.0));
+        assert!(anchor.y > f64::from(new_size.1));
+    }
+
+    #[test]
+    fn menu_retains_exact_custom_settings_before_and_after_render_conversion() {
+        let mut view = test_view();
+        view.menu_open = true;
+        let canonical = FamiliarSettings {
+            sprite_scale: 0.500000001,
+            ..view.settings
+        };
+        view.apply_settings(canonical).unwrap();
+        assert_eq!(view.deferred_settings, Some(canonical));
+        for tracking in [true, false] {
+            if !tracking {
+                view.finish_menu(Instant::now()).unwrap();
+            }
+            assert_eq!(view.options.sprite_scale, 0.5);
+            assert_eq!(view.settings, canonical);
+            let catalog = context_menu::entries(context_menu::Context {
+                paused: view.paused,
+                bubbles: true,
+                navigation: false,
+                settings: Some(view.settings),
+            });
+            let context_menu::Entry::Submenu {
+                entries: fields, ..
+            } = &catalog[3]
+            else {
+                panic!("settings submenu missing")
+            };
+            let context_menu::Entry::Submenu {
+                entries: values, ..
+            } = &fields[0]
+            else {
+                panic!("sprite settings missing")
+            };
+            assert_eq!(values.len(), 5);
+            assert!(
+                values[..4]
+                    .iter()
+                    .all(|entry| matches!(entry, context_menu::Entry::Item { checked: false, .. }))
+            );
+            assert!(
+                matches!(&values[4], context_menu::Entry::Item { label, checked: true, action: None, .. } if label == "Custom (0.500000001)")
+            );
+        }
+    }
+
+    #[test]
+    fn menu_actions_fail_closed_but_quit_is_service_wide() {
+        let current = WindowId::from(1);
+        let stale = WindowId::from(2);
+        for (window, closing, failed) in [
+            (None, false, false),
+            (Some(stale), false, false),
+            (Some(current), true, false),
+            (Some(current), false, true),
+        ] {
+            let valid = menu_target_valid(current, window, closing, failed);
+            assert!(!valid);
+            for action in [
+                Action::CloseFamiliar,
+                Action::RevealStatus,
+                Action::GoToMouse,
+                Action::SetPaused(true),
+                Action::Settings(crate::protocol::SettingsPatch {
+                    font_size: Some(16.0),
+                    ..Default::default()
+                }),
+            ] {
+                assert_eq!(validated_menu_action(Some(action), valid), None);
+            }
+            assert_eq!(
+                validated_menu_action(Some(Action::QuitNumen), valid),
+                Some(Action::QuitNumen)
+            );
+        }
+        assert!(menu_target_valid(current, Some(current), false, false));
+        assert_eq!(
+            validated_menu_action(Some(Action::CloseFamiliar), true),
+            Some(Action::CloseFamiliar)
+        );
+        assert_eq!(validated_menu_action(None, true), None);
+    }
+
+    #[test]
+    fn popup_cancels_only_for_target_removal_or_quit_and_resets_between_menus() {
+        let popup = PopupLifecycle::default();
+        let mailbox = Mailbox::default();
+        popup.begin("clicked");
+        popup.post(vec![familiar("clicked"), familiar("other")], &mailbox);
+        assert!(!popup.cancelled.load(Ordering::Acquire));
+        let mut changed = familiar("clicked");
+        changed.presentation = source(crate::protocol::ActivityState::Working, Some(7));
+        popup.post(vec![changed], &mailbox);
+        assert!(!popup.cancelled.load(Ordering::Acquire));
+        popup.post(vec![familiar("other")], &mailbox);
+        assert!(popup.cancelled.load(Ordering::Acquire));
+        popup.end();
+        assert!(popup.target.lock().unwrap().is_none());
+        popup.begin("other");
+        assert!(!popup.cancelled.load(Ordering::Acquire));
+        // Same signal written by the server's service-wide quit callback.
+        popup.cancelled.store(true, Ordering::Release);
+        assert!(popup.cancelled.load(Ordering::Acquire));
+        popup.end();
+        popup.begin("other");
+        assert!(!popup.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dismissed_click_preserves_manual_pause_cue_anchor_and_pursuit() {
+        let mut view = test_view();
+        view.start_navigation(Instant::now());
+        view.paused = true;
+        view.latest_view = source(crate::protocol::ActivityState::Waiting, Some(19));
+        view.display.manual(Animation::Review);
+        view.hidden_position = Some(PhysicalPosition::new(42, 51));
+        let presentation = view.latest_view.clone();
+        let animation = view.player.animation();
+        let demo = view.next_demo;
+        let visible = view.bubble_visible;
+        let settings = view.settings;
+        view.gesture.moved(PhysicalPosition::new(10.0, 10.0), true);
+        view.gesture.press(2.0);
+        assert!(view.release_click(Instant::now()).is_some());
+        assert!(view.menu_open);
+        view.finish_menu(Instant::now()).unwrap();
+        assert_eq!(validated_menu_action(None, true), None);
+        assert!(view.seeking());
+        assert!(view.paused);
+        assert!(view.display.is_manual());
+        assert_eq!(view.latest_view, presentation);
+        assert_eq!(view.player.animation(), animation);
+        assert_eq!(view.next_demo, demo);
+        assert_eq!(view.bubble_visible, visible);
+        assert_eq!(view.settings, settings);
+        assert_eq!(view.hidden_position, Some(PhysicalPosition::new(42, 51)));
+        view.set_paused(false);
+        assert!(!view.paused);
+        assert!(view.seeking());
+    }
+
+    #[test]
+    fn settings_and_visibility_layout_wait_until_click_anchor_is_released() {
+        let mut view = test_view();
+        let old = familiar_settings(&view.options);
+        view.gesture.moved(PhysicalPosition::new(10.0, 10.0), true);
+        view.gesture.press(2.0);
+        let updated = FamiliarSettings {
+            font_size: 20.0,
+            ..old
+        };
+        view.apply_settings(updated).unwrap();
+        assert_eq!(familiar_settings(&view.options), old);
+        assert_eq!(view.deferred_settings, Some(updated));
+        let visible = view.bubble_visible;
+        view.sync_visibility(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(view.bubble_visible, visible);
+        view.end_interaction(Instant::now());
+        view.apply_settings(view.deferred_settings.unwrap())
+            .unwrap();
+        assert_eq!(familiar_settings(&view.options), updated);
+        assert!(view.deferred_settings.is_none());
+    }
+
+    #[test]
+    fn menu_settings_patch_uses_canonical_snapshot_without_optimistic_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private/menu.sock");
+        let (send, receive) = std::sync::mpsc::channel();
+        let initial = FamiliarSettings {
+            font_size: 13.0,
+            bubble_duration: 7.0,
+            ..Default::default()
+        };
+        let server = Server::start_graphical_with_settings(
+            &path,
+            move |snapshot| {
+                send.send(snapshot).unwrap();
+            },
+            |_| {},
+            None,
+            || {},
+            true,
+            initial,
+        )
+        .unwrap();
+        let snapshot = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        app.stage_snapshot(snapshot);
+        let patch = crate::protocol::SettingsPatch {
+            sprite_scale: Some(1.0),
+            ..Default::default()
+        };
+        server.familiar_control().settings("main", patch).unwrap();
+        assert_eq!(familiar_settings(&app.views["main"].options), initial);
+        let snapshot = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.stage_snapshot(snapshot);
+        assert_eq!(
+            familiar_settings(&app.views["main"].options),
+            FamiliarSettings {
+                sprite_scale: 1.0,
+                ..initial
+            }
+        );
+        drop(server);
+    }
 
     fn test_view() -> FamiliarView {
         FamiliarView::new(
@@ -2044,11 +3110,606 @@ mod tests {
         options
     }
 
+    #[test]
+    fn shortcut_diagnostics_cover_gates_pending_and_independent_results() {
+        for flags in 0..512 {
+            let flag = |bit| flags & (1 << bit) != 0;
+            let mut options = options();
+            options.no_hotkey = flag(0);
+            options.no_bubble = flag(1);
+            options.manual = flag(5);
+            options.demo = flag(6);
+            let pointer_available = flag(2);
+            let live = flag(3);
+            let platform_supported = flag(4);
+            let succeeded = [flag(7), flag(8)];
+            let mut expected = [Shortcut::Reveal, Shortcut::GoToMouse].map(|key| {
+                let (state, reason) = match key {
+                    _ if options.no_hotkey => (ShortcutState::Disabled, ShortcutReason::NoHotkey),
+                    Shortcut::Reveal if options.no_bubble => {
+                        (ShortcutState::Disabled, ShortcutReason::NoBubble)
+                    }
+                    _ if !platform_supported => (
+                        ShortcutState::Unsupported,
+                        ShortcutReason::UnsupportedPlatform,
+                    ),
+                    Shortcut::GoToMouse if !pointer_available => {
+                        if options.manual || options.demo || !live {
+                            (ShortcutState::Unsupported, ShortcutReason::UnsupportedMode)
+                        } else {
+                            (
+                                ShortcutState::Unavailable,
+                                ShortcutReason::PointerInitializationFailed,
+                            )
+                        }
+                    }
+                    _ => (
+                        ShortcutState::Uninitialized,
+                        ShortcutReason::RegistrationPending,
+                    ),
+                };
+                ShortcutStatus {
+                    state,
+                    reason: Some(reason),
+                }
+            });
+            let eligible =
+                expected.map(|status| status.reason == Some(ShortcutReason::RegistrationPending));
+            let diagnostics = RuntimeDiagnostics::new(true);
+            let reader = diagnostics.clone();
+            let mut attempted = [false; 2];
+            let guards = register_shortcuts(
+                &options,
+                pointer_available,
+                live,
+                platform_supported,
+                Some(&diagnostics),
+                |key| {
+                    // Reading from another thread also proves registration holds no diagnostics lock.
+                    let reader = reader.clone();
+                    let hotkeys = std::thread::spawn(move || reader.snapshot().hotkeys)
+                        .join()
+                        .unwrap();
+                    assert_eq!(
+                        [hotkeys.option_i, hotkeys.option_m],
+                        expected,
+                        "flags={flags}"
+                    );
+                    let index = usize::from(key == Shortcut::GoToMouse);
+                    assert!(eligible[index]);
+                    attempted[index] = true;
+                    expected[index] = if succeeded[index] {
+                        ShortcutStatus {
+                            state: ShortcutState::Registered,
+                            reason: None,
+                        }
+                    } else {
+                        ShortcutStatus {
+                            state: ShortcutState::Unavailable,
+                            reason: Some(ShortcutReason::RegistrationFailed),
+                        }
+                    };
+                    anyhow::ensure!(succeeded[index], "private simulated OS registration error");
+                    Ok(key)
+                },
+            );
+            let hotkeys = reader.snapshot().hotkeys;
+            assert_eq!(
+                [hotkeys.option_i, hotkeys.option_m],
+                expected,
+                "flags={flags}"
+            );
+            assert_eq!(attempted, eligible);
+            assert_eq!(
+                guards.map(|guard| guard.is_some()),
+                [eligible[0] && succeeded[0], eligible[1] && succeeded[1]]
+            );
+            assert!(
+                !serde_json::to_string(&reader.snapshot())
+                    .unwrap()
+                    .contains("private simulated")
+            );
+        }
+    }
+
+    #[test]
+    fn service_reports_injected_shortcuts_without_changing_navigation_capability() {
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+
+        for reveal_ok in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = temp.path().join("events.sock");
+            let options = options();
+            let server = Server::start_graphical_with_settings(
+                &path,
+                |_| {},
+                |_| {},
+                Some(Box::new(|_| {})),
+                || {},
+                true,
+                familiar_settings(&options),
+            )
+            .unwrap();
+            let service = || {
+                crate::ipc::control(&path, json!({"version": 1, "type": "companion.service"}))
+                    .unwrap()
+            };
+            let before = service();
+            let diagnostics = server.diagnostics();
+            assert_eq!(
+                diagnostics.snapshot().hotkeys.option_i.reason,
+                Some(ShortcutReason::NotReported)
+            );
+            assert_eq!(
+                diagnostics.snapshot().hotkeys.option_m.reason,
+                Some(ShortcutReason::NotReported)
+            );
+            let guards =
+                register_shortcuts(&options, true, true, true, Some(&diagnostics), |key| {
+                    let response = service();
+                    assert_eq!(response["navigation"], true);
+                    assert!(response.to_string().contains("registration_pending"));
+                    anyhow::ensure!((key == Shortcut::Reveal) == reveal_ok, "private collision");
+                    Ok(key)
+                });
+            let after = service();
+            let mut expected_service = before;
+            expected_service["diagnostics"] = json!(diagnostics.snapshot());
+            assert_eq!(after, expected_service);
+            assert_eq!(guards.map(|guard| guard.is_some()), [reveal_ok, !reveal_ok]);
+            let encoded = after.to_string();
+            assert!(encoded.contains("registered"));
+            assert!(encoded.contains("registration_failed"));
+            assert!(!encoded.contains("registration_pending"));
+            assert!(!encoded.contains("private collision"));
+        }
+    }
+
+    #[test]
+    fn shortcut_registration_gates_and_failures_are_independent() {
+        for no_hotkey in [false, true] {
+            for no_bubble in [false, true] {
+                for pointer_available in [false, true] {
+                    for reveal_ok in [false, true] {
+                        for navigation_ok in [false, true] {
+                            let mut options = options();
+                            options.no_hotkey = no_hotkey;
+                            options.no_bubble = no_bubble;
+                            let mut attempted = Vec::new();
+                            let guards = register_shortcuts(
+                                &options,
+                                pointer_available,
+                                true,
+                                true,
+                                None,
+                                |key| {
+                                    attempted.push(key);
+                                    let ok = match key {
+                                        Shortcut::Reveal => reveal_ok,
+                                        Shortcut::GoToMouse => navigation_ok,
+                                    };
+                                    anyhow::ensure!(ok, "simulated key collision");
+                                    Ok(key)
+                                },
+                            );
+                            let reveal_enabled = !no_hotkey && !no_bubble;
+                            let navigation_enabled = !no_hotkey && pointer_available;
+                            assert_eq!(attempted.contains(&Shortcut::Reveal), reveal_enabled);
+                            assert_eq!(
+                                attempted.contains(&Shortcut::GoToMouse),
+                                navigation_enabled
+                            );
+                            assert_eq!(guards[0].is_some(), reveal_enabled && reveal_ok);
+                            assert_eq!(guards[1].is_some(), navigation_enabled && navigation_ok);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_shortcuts_have_independent_exact_modifier_and_pointer_gates() {
+        for reveal_registered in [false, true] {
+            for navigation_registered in [false, true] {
+                for pointer_available in [false, true] {
+                    for modifiers in [
+                        ModifiersState::empty(),
+                        ModifiersState::ALT,
+                        ModifiersState::ALT | ModifiersState::SHIFT,
+                        ModifiersState::ALT | ModifiersState::CONTROL,
+                        ModifiersState::ALT | ModifiersState::SUPER,
+                    ] {
+                        for code in [KeyCode::KeyI, KeyCode::KeyM, KeyCode::KeyQ] {
+                            assert_eq!(
+                                local_reveal_shortcut(code, modifiers, reveal_registered),
+                                !reveal_registered
+                                    && code == KeyCode::KeyI
+                                    && modifiers == ModifiersState::ALT
+                            );
+                            assert_eq!(
+                                local_navigation_shortcut(
+                                    code,
+                                    modifiers,
+                                    navigation_registered,
+                                    pointer_available,
+                                ),
+                                pointer_available
+                                    && !navigation_registered
+                                    && code == KeyCode::KeyM
+                                    && modifiers == ModifiersState::ALT
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_navigation_only_changes_focused_view_and_keeps_pause() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        app.stage_snapshot(vec![familiar("focused"), familiar("other")]);
+        let view = app.views.get_mut("focused").unwrap();
+        view.navigation_available = true;
+        view.modifiers = ModifiersState::ALT;
+        view.options.no_hotkey = true;
+        view.paused = true;
+        view.display.manual(Animation::Waving);
+        assert!(!view.local_navigation(KeyCode::KeyM, false));
+        assert!(view.display.is_manual());
+        assert!(view.navigation.is_none());
+        assert!(view.local_navigation(KeyCode::KeyM, true));
+        assert!(view.seeking());
+        assert!(view.paused);
+        assert!(!view.display.is_manual());
+        view.apply_pursuit_step(PursuitStep::Arrived);
+        view.global_navigation_registered = true;
+        assert!(!view.local_navigation(KeyCode::KeyM, true));
+        assert!(matches!(view.navigation, Some(Navigation::Celebrating)));
+        assert!(app.views["other"].navigation.is_none());
+    }
+
+    #[test]
+    fn new_views_inherit_independent_registration_and_manual_demo_have_no_navigation() {
+        for reveal_registered in [false, true] {
+            for navigation_registered in [false, true] {
+                let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+                app.global_hotkey_registered = reveal_registered;
+                app.global_navigation_registered = navigation_registered;
+                app.stage_snapshot(vec![]);
+                app.stage_snapshot(vec![familiar("later")]);
+                assert_eq!(
+                    app.views["later"].global_hotkey_registered,
+                    reveal_registered
+                );
+                assert_eq!(
+                    app.views["later"].global_navigation_registered,
+                    navigation_registered
+                );
+                assert!(!app.views["later"].navigation_available);
+            }
+        }
+        for demo in [false, true] {
+            let mut options = options();
+            options.demo = demo;
+            options.manual = !demo;
+            let mut app = App::new(SpriteAtlas::load().unwrap(), options, false);
+            app.stage_snapshot(vec![familiar("preview")]);
+            let view = app.views.get_mut("preview").unwrap();
+            view.modifiers = ModifiersState::ALT;
+            assert!(!view.local_navigation(KeyCode::KeyM, true));
+            assert!(view.display.is_manual());
+            assert!(view.navigation.is_none());
+            let guards = register_shortcuts(
+                &app.options,
+                app.pointer.is_some(),
+                app.live,
+                true,
+                None,
+                |key| {
+                    assert_eq!(key, Shortcut::Reveal);
+                    Ok(())
+                },
+            );
+            assert!(guards[1].is_none());
+        }
+    }
+
+    #[test]
+    fn global_navigation_resolves_current_registry_and_skips_unavailable_views() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        app.stage_snapshot(vec![familiar("removed")]);
+        app.navigation_pending.post(None);
+        app.mailbox.post(vec![
+            familiar("new"),
+            familiar("closing"),
+            familiar("pending"),
+            familiar("submitted"),
+            familiar("failed"),
+            familiar("error"),
+        ]);
+        app.stage_snapshot(app.mailbox.take().unwrap());
+        app.views.get_mut("closing").unwrap().close_requested = true;
+        app.pending_close.insert("pending".into());
+        app.submitted_close.insert("submitted".into());
+        app.failed.insert("failed".into());
+        app.views.get_mut("error").unwrap().error = Some(anyhow::anyhow!("failed"));
+        app.views.get_mut("new").unwrap().paused = true;
+        app.apply_navigation();
+        assert!(!app.views.contains_key("removed"));
+        for (id, view) in &app.views {
+            assert_eq!(view.seeking(), id == "new", "{id}");
+        }
+        let view = app.views.get_mut("new").unwrap();
+        view.apply_pursuit_step(PursuitStep::Arrived);
+        assert!(matches!(view.navigation, Some(Navigation::Celebrating)));
+        app.navigation_pending.post(None);
+        app.apply_navigation();
+        assert!(app.views["new"].seeking());
+        assert!(app.views["new"].paused);
+        app.stage_snapshot(vec![]);
+        app.navigation_pending.post(None);
+        app.apply_navigation();
+        assert!(app.views.is_empty());
+        app.stage_snapshot(vec![familiar("later")]);
+        app.apply_navigation();
+        assert!(app.views["later"].navigation.is_none());
+        app.navigation_pending.post(None);
+        app.apply_navigation();
+        assert!(app.views["later"].seeking());
+    }
+
+    #[test]
+    fn navigation_mailbox_is_bounded_and_targeted_requests_never_broadcast() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let snapshot = (0..40).map(|n| familiar(&format!("f{n}"))).collect();
+        app.stage_snapshot(snapshot);
+        for n in 0..40 {
+            assert_eq!(
+                app.navigation_pending.post(Some(vec![format!("f{n}")])),
+                n == 0
+            );
+        }
+        assert_eq!(app.navigation_pending.0.lock().unwrap().len(), 32);
+        app.apply_navigation();
+        for n in 0..40 {
+            assert_eq!(app.views[&format!("f{n}")].seeking(), n >= 8);
+        }
+        app.navigation_pending.post(Some(vec![]));
+        app.apply_navigation();
+        assert!(!app.views["f0"].seeking());
+        app.navigation_pending
+            .post(Some((0..20).map(|n| format!("f{n}")).collect()));
+        assert_eq!(app.navigation_pending.take()[0].as_ref().unwrap().len(), 16);
+        app.navigation_pending.post(Some(vec!["f0".into()]));
+        app.stage_snapshot(vec![familiar("f0"), familiar("unrelated")]);
+        app.apply_navigation();
+        assert!(app.views["f0"].seeking());
+        assert!(app.views["unrelated"].navigation.is_none());
+    }
+
     fn familiar(id: &str) -> FamiliarPresentation {
         FamiliarPresentation {
             id: id.into(),
             preset: DEFAULT_CHARACTER_ID.into(),
+            settings: FamiliarSettings::default(),
             presentation: Presentation::default(),
+        }
+    }
+
+    #[test]
+    fn settings_update_only_selected_view_without_resetting_live_state() {
+        for manual in [false, true] {
+            for seeking in [false, true] {
+                let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+                let mut selected = familiar("selected");
+                selected.presentation = source(crate::protocol::ActivityState::Succeeded, Some(71));
+                app.stage_snapshot(vec![selected.clone(), familiar("other")]);
+                let view = app.views.get_mut("selected").unwrap();
+                view.latest_view = selected.presentation.clone();
+                view.source_animation(selected.presentation.clone());
+                if seeking {
+                    view.start_navigation(Instant::now());
+                    view.select(Animation::RunningLeft);
+                }
+                if manual {
+                    view.display.manual(Animation::Waving);
+                    view.select(Animation::Waving);
+                }
+                view.player.advance(Duration::from_millis(175), &view.atlas);
+                view.paused = true;
+                view.scene_dirty = false;
+                view.cache_raster(bubble::dimensions(false, view.options.sprite_scale));
+                view.renderer = Some(bubble::Renderer::new(
+                    Some(Typeface::bundled().unwrap()),
+                    12.0,
+                ));
+                let animation = view.player.animation();
+                let frame = view.player.frame_index();
+                let remaining = view.player.until_next_frame(&view.atlas);
+                let tick = view.last_tick;
+                let demo = view.next_demo;
+                let motion = view.motion_clock.deadline();
+                let deadline = view.visibility.deadline();
+                let atlas = view.atlas.clone();
+                let other = &app.views["other"];
+                let other_tick = other.last_tick;
+                let other_settings = familiar_settings(&other.options);
+                selected.settings = FamiliarSettings {
+                    sprite_scale: 1.375,
+                    font_size: 23.5,
+                    bubble_duration: 0.25,
+                };
+                app.stage_snapshot(vec![selected.clone(), familiar("other")]);
+                let view = app.views.get_mut("selected").unwrap();
+                assert_eq!(familiar_settings(&view.options), selected.settings);
+                assert!(view.scene_dirty);
+                assert!(view.raster.is_none());
+                assert!(view.renderer.is_some());
+                assert!(Arc::ptr_eq(&view.atlas, &atlas));
+                assert_eq!(view.latest_view, selected.presentation);
+                assert_eq!(view.latest_view.cue.as_ref().unwrap().id, 71);
+                assert_eq!(view.display.is_manual(), manual);
+                assert_eq!(view.display.update(selected.presentation.clone()), None);
+                assert_eq!(view.player.animation(), animation);
+                assert_eq!(view.player.frame_index(), frame);
+                assert_eq!(view.player.until_next_frame(&view.atlas), remaining);
+                assert!(view.paused);
+                assert_eq!(view.seeking(), seeking);
+                assert_eq!(view.motion_clock.deadline(), motion);
+                assert_eq!(view.last_tick, tick);
+                assert_eq!(view.next_demo, demo);
+                assert_eq!(view.visibility.deadline(), deadline);
+                view.scene_dirty = false;
+                view.cache_raster(bubble::dimensions(false, view.options.sprite_scale));
+                app.stage_snapshot(vec![selected, familiar("other")]);
+                assert!(!app.views["selected"].scene_dirty);
+                assert!(app.views["selected"].raster.is_some());
+                let other = &app.views["other"];
+                assert_eq!(familiar_settings(&other.options), other_settings);
+                assert_eq!(other.last_tick, other_tick);
+                assert!(!other.paused);
+                assert_eq!(other.player.animation(), Animation::Idle);
+                assert!(other.navigation.is_none());
+                assert_eq!(familiar_settings(&app.options), FamiliarSettings::default());
+            }
+        }
+    }
+
+    #[test]
+    fn newest_complete_snapshot_configures_new_view_before_native_initialization() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let mut new = familiar("new");
+        app.mailbox.post(vec![new.clone()]);
+        new.settings.font_size = 30.0;
+        app.mailbox.post(vec![new.clone()]);
+        new.settings.sprite_scale = 0.375;
+        new.settings.bubble_duration = 17.25;
+        app.mailbox.post(vec![new.clone()]);
+        app.stage_snapshot(app.mailbox.take().unwrap());
+        let view = app.views.get_mut("new").unwrap();
+        assert!(view.window.is_none());
+        assert!(view.renderer.is_none());
+        assert_eq!(familiar_settings(&view.options), new.settings);
+        let now = Instant::now();
+        assert!(view.visibility.reveal(now));
+        assert_eq!(
+            view.visibility.deadline(),
+            Some(now + Duration::from_secs_f64(17.25))
+        );
+        assert_eq!(
+            bubble::dimensions(false, view.options.sprite_scale),
+            (72, 78)
+        );
+    }
+
+    #[test]
+    fn settings_resize_requires_fresh_contact_without_restarting_running_pose() {
+        let mut view = test_view();
+        let now = Instant::now();
+        view.start_navigation(now);
+        view.prepare_running_pose(Facing::Right, Duration::ZERO);
+        view.player.advance(Duration::from_millis(175), &view.atlas);
+        let frame_index = view.player.frame_index();
+        let remaining = view.player.until_next_frame(&view.atlas);
+        view.cache_raster(bubble::dimensions(false, view.options.sprite_scale));
+        view.apply_settings(FamiliarSettings {
+            sprite_scale: 1.0,
+            ..FamiliarSettings::default()
+        })
+        .unwrap();
+        assert!(view.raster.is_none());
+        let frame = view.atlas.frame(Animation::RunningRight, frame_index);
+        let index = frame
+            .chunks_exact(4)
+            .enumerate()
+            .find(|(index, rgba)| index % 192 >= 96 && rgba[3] >= 32)
+            .unwrap()
+            .0;
+        let cursor = Point {
+            x: (index % 192) as f64 + 0.5,
+            y: (index / 192) as f64 + 0.5,
+        };
+        let step = view.plan_pursuit(
+            now,
+            cursor,
+            Point::default(),
+            (192, 208),
+            1.0,
+            Duration::ZERO,
+        );
+        assert!(matches!(step, PursuitStep::Move { .. }));
+        assert_eq!(view.player.animation(), Animation::RunningRight);
+        assert_eq!(view.player.frame_index(), frame_index);
+        assert_eq!(view.player.until_next_frame(&view.atlas), remaining);
+        assert!(view.seeking());
+        assert_eq!(
+            view.plan_pursuit(
+                now + FRAME_INTERVAL,
+                cursor,
+                Point::default(),
+                (192, 208),
+                1.0,
+                Duration::ZERO
+            ),
+            PursuitStep::Arrived
+        );
+    }
+
+    #[test]
+    fn resizing_preserves_physical_feet_across_visibility_scale_and_rounding() {
+        for density in [1.0, 1.25, 1.5, 2.0, 2.75] {
+            for scene in [1.0, 1.375] {
+                let physical = density * scene;
+                let layout = |show, scale| (layout_size(show, scale, physical), show, scale);
+                let initial = layout(false, 0.5);
+                let start = PhysicalPosition::new(-123, 456);
+                let mut position = start;
+                let mut old = initial;
+                for _ in 0..10 {
+                    for (show, scale) in [
+                        (true, 0.5),
+                        (true, 0.713),
+                        (false, 0.713),
+                        (false, 2.0),
+                        (true, 2.0),
+                        (true, 0.25),
+                        (false, 0.5),
+                    ] {
+                        let new = layout(show, scale);
+                        position = resized_position(position, old, new);
+                        assert_eq!(resized_position(position, new, initial), start);
+                        old = new;
+                    }
+                    assert_eq!(position, start, "repeated edits must not drift");
+                }
+                // A shown window may have been monitor-clamped. Its saved hidden
+                // origin must still be rebased to the new sprite's feet.
+                let saved = resized_position(start, initial, layout(false, 1.375));
+                assert_eq!(
+                    resized_position(saved, layout(false, 1.375), initial),
+                    start
+                );
+                let shown = resized_position(start, initial, layout(true, 0.5));
+                let clamped = clamp_to_monitor(
+                    shown,
+                    PhysicalPosition::new(0, 0),
+                    (1920, 1080),
+                    (
+                        f64::from(layout(true, 0.5).0.0),
+                        f64::from(layout(true, 0.5).0.1),
+                    ),
+                );
+                let edited = resized_position(clamped, layout(true, 0.5), layout(true, 1.375));
+                assert_eq!(
+                    resized_position(edited, layout(true, 1.375), layout(true, 0.5)),
+                    clamped
+                );
+                assert_ne!(saved, start, "hide must not restore the old-scale origin");
+            }
         }
     }
 

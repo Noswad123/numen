@@ -6,7 +6,9 @@ use std::{
 use anyhow::{Result, bail, ensure};
 use serde::Serialize;
 
-use crate::protocol::{Activity, ActivityState, Event, MAX_ACTIVITIES, MAX_SOURCES};
+use crate::protocol::{
+    Activity, ActivityState, Event, FamiliarSettings, MAX_ACTIVITIES, MAX_SOURCES, SettingsPatch,
+};
 
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const STATUS_PAGE_SIZE: usize = 4;
@@ -80,11 +82,12 @@ pub struct Presentation {
     pub following: Option<Following>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FamiliarPresentation {
     pub id: String,
     pub preset: String,
     pub presentation: Presentation,
+    pub settings: FamiliarSettings,
 }
 
 #[derive(Clone)]
@@ -104,10 +107,12 @@ pub(crate) struct Store {
     // Only explicit IDs and main need history; generated IDs use the counter.
     used_ids: std::collections::BTreeSet<String>,
     next_familiar: u64,
+    defaults: FamiliarSettings,
 }
 
 #[derive(Default)]
 struct Familiar {
+    settings: FamiliarSettings,
     cue: Option<(Cue, Instant)>,
     next_cue: u64,
     focus: Option<FocusTarget>,
@@ -116,11 +121,36 @@ struct Familiar {
 
 impl Default for Store {
     fn default() -> Self {
+        Self::with_settings(true, FamiliarSettings::default())
+    }
+}
+
+impl Store {
+    pub(crate) fn familiar_count(&self) -> usize {
+        self.familiars.len()
+    }
+
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub(crate) fn with_settings(bootstrap_main: bool, defaults: FamiliarSettings) -> Self {
         Self {
             sources: BTreeMap::new(),
-            familiars: BTreeMap::from([("main".into(), Familiar::default())]),
+            familiars: if bootstrap_main {
+                BTreeMap::from([(
+                    "main".into(),
+                    Familiar {
+                        settings: defaults,
+                        ..Familiar::default()
+                    },
+                )])
+            } else {
+                BTreeMap::new()
+            },
             used_ids: std::collections::BTreeSet::from(["main".into()]),
             next_familiar: 1,
+            defaults,
         }
     }
 }
@@ -138,6 +168,7 @@ fn selection(id: &SourceId, a: &Activity) -> Selection {
 }
 
 impl Store {
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             familiars: BTreeMap::new(),
@@ -381,6 +412,7 @@ impl Store {
             | Event::Open { .. }
             | Event::Attach { .. }
             | Event::GoToMouse { .. }
+            | Event::Settings { .. }
             | Event::Close { .. } => {
                 bail!("control is not a producer event")
             }
@@ -500,6 +532,7 @@ impl Store {
         let ids: Vec<_> = self.familiars.keys().cloned().collect();
         ids.into_iter()
             .map(|id| FamiliarPresentation {
+                settings: self.familiars[&id].settings,
                 presentation: self.presentation_for(&id, now),
                 id,
                 preset: "djinn".into(),
@@ -599,6 +632,7 @@ impl Store {
             pending.insert(
                 id.clone(),
                 Familiar {
+                    settings: self.defaults,
                     focus: Some(target),
                     focus_summary: selected.summary,
                     ..Familiar::default()
@@ -654,10 +688,24 @@ impl Store {
         Ok(ids.to_vec())
     }
 
+    pub fn settings(&mut self, ids: &[String], patch: SettingsPatch) -> Result<Vec<String>> {
+        crate::protocol::validate_ids(ids)?;
+        patch.validate()?;
+        for id in ids {
+            self.require_familiar(id)?;
+        }
+        for id in ids {
+            let familiar = self.familiars.get_mut(id).unwrap();
+            familiar.settings = patch.apply(familiar.settings);
+        }
+        Ok(ids.to_vec())
+    }
+
     pub fn list(&self, offset: usize) -> serde_json::Value {
         let rows: Vec<_> = self.familiars.iter().skip(offset).take(STATUS_PAGE_SIZE).map(|(id, f)| {
             let live = self.focused(id);
             let mut row = serde_json::json!({"id":id,"preset":"djinn","attachment":f.focus,"available":live.is_some(),"capabilities":["info","attach","close"]});
+            row["settings"] = serde_json::json!(f.settings);
             if let Some(summary) = live.as_ref().map(|s| &s.summary).unwrap_or(&f.focus_summary) { row["summary"] = summary.clone().into(); }
             row
         }).collect();
@@ -702,6 +750,120 @@ mod tests {
     use super::*;
     use crate::protocol::{AttachRequest, OpenRequest, TargetRequest};
 
+    #[test]
+    fn immutable_counts_include_unavailable_familiars_and_empty_registered_sources() {
+        let now = Instant::now();
+        let mut store = Store::empty();
+        assert_eq!((store.familiar_count(), store.source_count()), (0, 0));
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        store
+            .register(("a".into(), "two".into()), vec![], now)
+            .unwrap();
+        let opened = store.open(&[open_request("a")]).unwrap();
+        update(&mut store, "a", a(2, ActivityState::Failed), now).unwrap();
+        let deadline = store.familiars[&opened[0]].cue.as_ref().unwrap().1;
+        let before = store.presentations(now);
+        let list = store.list(0);
+        let immutable = &store;
+        for _ in 0..2 {
+            assert_eq!(
+                (immutable.familiar_count(), immutable.source_count()),
+                (1, 2)
+            );
+        }
+        assert_eq!(
+            store.familiars[&opened[0]].cue.as_ref().unwrap().1,
+            deadline
+        );
+        assert_eq!(store.sources[&id("a")].seen, now);
+        assert_eq!(store.list(0), list);
+        assert_eq!(store.presentations(now), before);
+        store.disconnect(&id("a"));
+        assert_eq!((store.familiar_count(), store.source_count()), (1, 1));
+        store.close(&opened).unwrap();
+        assert_eq!((store.familiar_count(), store.source_count()), (0, 1));
+        store.expire(now + SOURCE_TIMEOUT);
+        assert_eq!(store.source_count(), 0);
+    }
+
+    #[test]
+    fn settings_are_atomic_selected_only_and_preserve_cues_sources_and_defaults() {
+        let now = Instant::now();
+        let defaults = FamiliarSettings {
+            sprite_scale: 0.75,
+            font_size: 16.0,
+            bubble_duration: 3.0,
+        };
+        let mut s = Store::with_settings(true, defaults);
+        for who in ["a", "b", "c"] {
+            s.register(id(who), vec![a(1, ActivityState::Working)], now)
+                .unwrap();
+        }
+        let second = s.open(&[open_request("b")]).unwrap().remove(0);
+        let mut completed = a(2, ActivityState::Failed);
+        completed.summary = Some("Keep summary".into());
+        update(&mut s, "a", completed.clone(), now).unwrap();
+        let before = s.presentations(now);
+        let deadline = s.familiars["main"].cue.as_ref().unwrap().1;
+        let next_cue = s.familiars["main"].next_cue;
+        let patch = SettingsPatch {
+            font_size: Some(20.0),
+            ..Default::default()
+        };
+        for ids in [
+            vec![],
+            vec!["main".into(), "missing".into()],
+            vec!["main".into(), "main".into()],
+        ] {
+            assert!(s.settings(&ids, patch).is_err());
+            assert_eq!(s.presentations(now), before);
+        }
+        for invalid in [
+            SettingsPatch::default(),
+            SettingsPatch {
+                bubble_duration: Some(f64::NAN),
+                ..Default::default()
+            },
+        ] {
+            assert!(s.settings(&["main".into()], invalid).is_err());
+            assert_eq!(s.presentations(now), before);
+        }
+        for _ in 0..2 {
+            assert_eq!(s.settings(&["main".into()], patch).unwrap(), ["main"]);
+            assert_eq!(
+                s.presentation(now),
+                before.iter().find(|v| v.id == "main").unwrap().presentation
+            );
+            assert_eq!(s.familiars["main"].cue.as_ref().unwrap().1, deadline);
+            assert_eq!(s.familiars["main"].next_cue, next_cue);
+            assert_eq!(s.sources[&id("a")].seen, now);
+            assert_eq!(s.sources[&id("a")].records["task"].sequence, 2);
+            assert_eq!(
+                s.sources[&id("a")].records["task"].value,
+                Some(completed.clone())
+            );
+            assert_eq!(s.familiars[&second].settings, defaults);
+        }
+        let third = s.open(&[open_request("c")]).unwrap().remove(0);
+        assert_eq!(s.familiars[&third].settings, defaults);
+        s.disconnect(&id("b"));
+        let unavailable = s.presentation_for(&second, now);
+        s.settings(std::slice::from_ref(&second), patch).unwrap();
+        assert_eq!(s.presentation_for(&second, now), unavailable);
+        assert_eq!(s.list(0)["familiars"][0]["settings"]["font_size"], 20.0);
+        assert_eq!(s.expire(now + SOURCE_TIMEOUT), vec![id("a"), id("c")]);
+
+        let mut empty = Store::with_settings(false, defaults);
+        assert!(empty.presentations(now).is_empty());
+        empty
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let opened = empty.open(&[open_request("a")]).unwrap();
+        assert_eq!(empty.familiars[&opened[0]].settings, defaults);
+    }
+
     fn target(source: &str) -> TargetRequest {
         TargetRequest {
             source: source.into(),
@@ -739,6 +901,7 @@ mod tests {
             serde_json::json!({"type":"familiar.attach","items":[{"id":"main","source":"a","activity":"task"}]}),
             serde_json::json!({"type":"familiar.close","ids":["main"]}),
             serde_json::json!({"type":"familiar.go-to-mouse","ids":["main"]}),
+            serde_json::json!({"type":"familiar.settings","ids":["main"],"patch":{"font_size":16}}),
         ] {
             let mut packet = kind;
             packet["version"] = 1.into();
@@ -1126,17 +1289,38 @@ mod tests {
             })
             .collect();
         s.open(&items).unwrap();
+        let ids: Vec<_> = s.familiars.keys().cloned().collect();
+        s.settings(
+            &ids,
+            SettingsPatch {
+                sprite_scale: Some(0.25000000000000006),
+                font_size: Some(12.000000000000002),
+                bubble_duration: Some(0.25000000000000006),
+            },
+        )
+        .unwrap();
         let mut extra = items[0].clone();
         extra.id = None;
         extra.target.activity = activities[16].activity.clone();
         assert!(s.open(&[extra]).is_err());
         assert_eq!(s.familiars.len(), 16);
         for offset in [0, 4, 8, 12, 16, usize::MAX] {
-            for (page, key) in [
+            for (mut page, key) in [
                 (s.list(offset), "familiars"),
                 (s.targets(offset, None).unwrap(), "targets"),
             ] {
                 assert!(page[key].as_array().unwrap().len() <= 4);
+                if key == "familiars" {
+                    for row in page[key].as_array_mut().unwrap() {
+                        row["capabilities"] = serde_json::json!([
+                            "info",
+                            "attach",
+                            "close",
+                            "go-to-mouse",
+                            "settings"
+                        ]);
+                    }
+                }
                 let ack = serde_json::json!({"version":1,"ok":true,"data":page});
                 assert!(serde_json::to_vec(&ack).unwrap().len() <= crate::protocol::MAX_LINE);
             }

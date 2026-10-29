@@ -7,6 +7,100 @@ pub const MAX_SOURCES: usize = 16;
 pub const MAX_ACTIVITIES: usize = 32;
 pub const MAX_FAMILIARS: usize = 16;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FamiliarSettings {
+    pub sprite_scale: f64,
+    pub font_size: f64,
+    pub bubble_duration: f64,
+}
+
+impl Default for FamiliarSettings {
+    fn default() -> Self {
+        Self {
+            sprite_scale: 0.5,
+            font_size: 12.0,
+            bubble_duration: 5.0,
+        }
+    }
+}
+
+impl FamiliarSettings {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value, min, max) in [
+            ("sprite_scale", self.sprite_scale, 0.25, 2.0),
+            ("font_size", self.font_size, 8.0, 32.0),
+            ("bubble_duration", self.bubble_duration, 0.25, 30.0),
+        ] {
+            ensure!(
+                value.is_finite() && (min..=max).contains(&value),
+                "{name} must be finite and within {min}..={max}"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn setting_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error> {
+    f64::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq)]
+pub struct SettingsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprite_scale: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bubble_duration: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for SettingsPatch {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(default, deserialize_with = "setting_value")]
+            sprite_scale: Option<f64>,
+            #[serde(default, deserialize_with = "setting_value")]
+            font_size: Option<f64>,
+            #[serde(default, deserialize_with = "setting_value")]
+            bubble_duration: Option<f64>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let patch = Self {
+            sprite_scale: fields.sprite_scale,
+            font_size: fields.font_size,
+            bubble_duration: fields.bubble_duration,
+        };
+        patch.validate().map_err(serde::de::Error::custom)?;
+        Ok(patch)
+    }
+}
+
+impl SettingsPatch {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.sprite_scale.is_some()
+                || self.font_size.is_some()
+                || self.bubble_duration.is_some(),
+            "settings patch must not be empty"
+        );
+        self.apply(FamiliarSettings::default()).validate()
+    }
+
+    pub fn apply(&self, settings: FamiliarSettings) -> FamiliarSettings {
+        FamiliarSettings {
+            sprite_scale: self.sprite_scale.unwrap_or(settings.sprite_scale),
+            font_size: self.font_size.unwrap_or(settings.font_size),
+            bubble_duration: self.bubble_duration.unwrap_or(settings.bubble_duration),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct TargetRequest {
     pub source: String,
@@ -224,6 +318,11 @@ pub enum Event {
     Close { ids: Vec<String> },
     #[serde(rename = "familiar.go-to-mouse")]
     GoToMouse { ids: Vec<String> },
+    #[serde(rename = "familiar.settings")]
+    Settings {
+        ids: Vec<String>,
+        patch: SettingsPatch,
+    },
 }
 
 impl Request {
@@ -268,6 +367,10 @@ impl Request {
                 }
             }
             Event::FamiliarList { .. } => {}
+            Event::Settings { ids, patch } => {
+                validate_ids(ids)?;
+                patch.validate()?;
+            }
             Event::Close { ids } | Event::GoToMouse { ids } => validate_ids(ids)?,
             Event::Open { items } => {
                 ensure!(
@@ -326,6 +429,64 @@ fn validate_snapshot(activities: &[Activity]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_patch_rejects_null_unknown_empty_and_invalid_bounds() {
+        for patch in [
+            serde_json::json!({}),
+            serde_json::json!({"font_size":null}),
+            serde_json::json!({"font_size":12,"sprite_scale":null}),
+            serde_json::json!({"font_size":12,"unknown":1}),
+            serde_json::json!({"font_size":7.99}),
+            serde_json::json!({"sprite_scale":2.01}),
+            serde_json::json!({"bubble_duration":30.01}),
+            serde_json::json!({"bubble_duration":"5"}),
+        ] {
+            assert!(serde_json::from_value::<SettingsPatch>(patch).is_err());
+        }
+        for mask in 1..8 {
+            let mut patch = serde_json::json!({});
+            for (bit, key, value) in [
+                (1, "sprite_scale", 0.25),
+                (2, "font_size", 32.0),
+                (4, "bubble_duration", 30.0),
+            ] {
+                if mask & bit != 0 {
+                    patch[key] = value.into();
+                }
+            }
+            let packet = serde_json::json!({"version":1,"type":"familiar.settings","ids":["main"],"patch":patch});
+            assert!(Request::parse(&serde_json::to_vec(&packet).unwrap()).is_ok());
+            for ids in [
+                serde_json::json!([]),
+                serde_json::json!(["main", "main"]),
+                serde_json::json!(["bad/id"]),
+                serde_json::json!(vec!["a"; 17]),
+            ] {
+                let mut invalid = packet.clone();
+                invalid["ids"] = ids;
+                assert!(Request::parse(&serde_json::to_vec(&invalid).unwrap()).is_err());
+            }
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                SettingsPatch {
+                    font_size: Some(value),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        FamiliarSettings::default().validate().unwrap();
+        FamiliarSettings {
+            sprite_scale: 2.0,
+            font_size: 8.0,
+            bubble_duration: 0.25,
+        }
+        .validate()
+        .unwrap();
+    }
 
     #[test]
     fn service_precondition_is_optional_validated_and_distinct_from_producer_instance() {

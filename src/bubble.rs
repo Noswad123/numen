@@ -172,8 +172,20 @@ impl Renderer {
     }
 
     pub fn with_sprite_scale(mut self, scale: f32) -> Self {
-        self.sprite_scale = bounded_sprite_scale(scale);
+        self.set_sprite_scale(scale);
         self
+    }
+
+    pub fn set_sprite_scale(&mut self, scale: f32) {
+        self.sprite_scale = bounded_sprite_scale(scale);
+    }
+
+    pub fn set_font_size(&mut self, size: f32) {
+        self.font_size = if size.is_finite() {
+            size.clamp(8.0, 32.0)
+        } else {
+            12.0
+        };
     }
 
     /// `size` is the physical framebuffer size, not the logical window size.
@@ -480,6 +492,47 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutable_settings_repaint_at_actual_font_and_sprite_sizes() {
+        let face = Typeface::bundled().unwrap();
+        let mut renderer = Renderer::new(Some(face.fork()), 12.0).with_sprite_scale(0.5);
+        let sprite = [100, 80, 60, 255].repeat(SPRITE_WIDTH * SPRITE_HEIGHT);
+        let view = Presentation::default();
+        for density in [1.0, 1.375, 2.0] {
+            for (font, scale) in [(8.0, 0.25), (32.0, 2.0), (19.5, 0.713), (12.0, 0.5)] {
+                renderer.set_font_size(font);
+                renderer.set_sprite_scale(scale);
+                for show in [false, true] {
+                    let logical = dimensions(show, scale);
+                    let size = (
+                        (logical.0 as f32 * density).round() as u32,
+                        (logical.1 as f32 * density).round() as u32,
+                    );
+                    let mut actual = vec![0; size.0 as usize * size.1 as usize * 4];
+                    let mut expected = actual.clone();
+                    renderer.compose(&mut actual, size, &sprite, &view, None, show);
+                    Renderer::new(Some(face.fork()), font)
+                        .with_sprite_scale(scale)
+                        .compose(&mut expected, size, &sprite, &view, None, show);
+                    assert_eq!(actual, expected);
+                    let (x0, y0, x1, y1) = SpriteProjection::new(size, show, scale).bounds;
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let offset = (y * size.0 as usize + x) * 4;
+                            assert_eq!(&actual[offset..offset + 4], &[100, 80, 60, 255]);
+                        }
+                    }
+                    if show {
+                        renderer.set_font_size(if font == 32.0 { 8.0 } else { 32.0 });
+                        renderer.compose(&mut expected, size, &sprite, &view, None, show);
+                        assert_ne!(actual, expected, "font size must change the painted text");
+                        renderer.set_font_size(font);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn disjoint_pose_frames_use_only_the_current_compositor_alpha() {
