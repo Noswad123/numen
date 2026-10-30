@@ -187,7 +187,6 @@ To supply a summary from a diagnostic producer (select it explicitly if another 
 ## Related files
 
 - [`src/preferences.rs`](src/preferences.rs): strict saved logical-key records and bounded background I/O, separate from runtime selection.
-- [Roadmap](ROADMAP.md): delivered menu/bootstrap and remaining automatic adapters.
 - [`src/context_menu.rs`](src/context_menu.rs): declarative native actions and macOS adapter, separate from the fzf picker.
 - [Wisp](WISP.md): opt-in palette setup, menu controls, installer recovery and validation boundaries.
 - [README](README.md): commands, controls and pending acceptance checks.

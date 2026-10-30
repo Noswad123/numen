@@ -266,7 +266,7 @@ Only temporary test catalogs were installed; actual installed `wisp actions list
 ## Related files
 
 - [`src/preferences.rs`](src/preferences.rs): saved appearance/manual placement, distinct from the Wisp catalog installer.
-- [README](README.md), [Architecture](ARCHITECTURE.md), [Protocol](PROTOCOL.md), [Modes](MODES.md), [Roadmap](ROADMAP.md).
+- [README](README.md), [Architecture](ARCHITECTURE.md), [Protocol](PROTOCOL.md), [Modes](MODES.md).
 - [`src/context_menu.rs`](src/context_menu.rs): native GUI menu and typed actions, separate from the fzf/Wisp surface.
 - [`src/menu.rs`](src/menu.rs): picker, catalog, capability intersection and target batches.
 - [`src/bootstrap.rs`](src/bootstrap.rs): discovery and detached empty startup.

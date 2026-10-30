@@ -532,6 +532,8 @@ Confirmed publication-race fixes include private-quarantine/inode-verified backu
 
 ### Current user report and historical doctor validation status
 
+**Latest user acceptance:** “I verified that the app works as intended.” The normal desktop workflow is user-accepted; this is hands-on feedback, not additional automated or exhaustive hardware/failure testing.
+
 **USER-REPORTED current desktop familiar workflow working:** “I verified everything working fine.” This includes the relevant click/menu/settings/hotkey workflow; it is hands-on user feedback, not a new automated run or a claim that every checklist scenario below was exercised. Mixed-DPI/monitor crossings, real OS collision/failure cases, Wisp palette → Kitty/external handoff and other untested cases remain pending. Earlier statements below about manual acceptance describe the scope of those historical test runs, not a rejection of this current user report.
 
 **Confirmed final doctor validation: 307 passed — 270 binary unit + 7 build-fingerprint integration + 30 CLI tests; one existing visual-preview test ignored.** Formatting, strict all-target Clippy, offline locked tests/build and diff checks passed with the command-scoped macOS 26.5 SDK workaround. Contradictory known hotkey state/reason pairs and duplicate raw ACK keys were rejected in passing tests. Actual Cargo panic/debug-assertions override regression checks produced a different recorded build fingerprint with the same source fingerprint, then restored the baseline.
@@ -617,7 +619,6 @@ Tests cover CLI validation, atlas integrity, animation timing, protocol/store li
 
 - [`src/preferences.rs`](src/preferences.rs): strict saved document, path policy, bounded background writer and recovery; [`src/activity.rs`](src/activity.rs): logical-key records and binding epochs.
 - [`src/doctor.rs`](src/doctor.rs), [`src/diagnostics.rs`](src/diagnostics.rs), [`src/build_info.rs`](src/build_info.rs): report, live process facts and recorded comparison; [`build.rs`](build.rs), [`build_support.rs`](build_support.rs): embedded fingerprint inputs and limitations.
-- [Roadmap](ROADMAP.md): delivered menu/bootstrap foundation and remaining adapter coverage.
 - [Djinn adapter guide](../djinn/docs/numen.md): optional sibling integration, not a Numen dependency.
 - [Wisp](WISP.md): opt-in palette setup, menu flow, installer safety and recovery.
 - [Architecture](ARCHITECTURE.md): delivered service/renderer boundaries and next milestones.
