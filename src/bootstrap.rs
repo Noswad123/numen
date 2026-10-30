@@ -229,8 +229,12 @@ mod tests {
     }
 
     fn mock(path: &Path, data: serde_json::Value) -> thread::JoinHandle<()> {
-        let listener = UnixListener::bind(path).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        // Publish only after chmod: the asynchronous bootstrap test can probe
+        // immediately after bind, and must never observe an unsafe test socket.
+        let staged = path.with_file_name("ready.sock");
+        let listener = UnixListener::bind(&staged).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&staged, path).unwrap();
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream

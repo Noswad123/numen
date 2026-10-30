@@ -115,7 +115,7 @@ pub struct RunOptions {
     /// Duration of a notification or on-demand reveal, in seconds.
     #[arg(long, default_value = "5", value_parser = parse_bubble_duration)]
     bubble_duration: Duration,
-    /// Do not register macOS system-wide Option+I or Option+M shortcuts (local controls remain).
+    /// Do not register macOS system-wide Option+I, Option+M, or Option+C shortcuts (focused-window controls remain).
     #[arg(long)]
     no_hotkey: bool,
     /// Disable all saved-preference reads and writes; keep runtime settings available.
@@ -829,14 +829,14 @@ mod tests {
     }
 
     #[test]
-    fn no_hotkey_help_names_both_global_chords_and_retains_local_controls() {
+    fn no_hotkey_help_names_all_global_chords_and_retains_focused_controls() {
         let help = Cli::command()
             .find_subcommand_mut("run")
             .unwrap()
             .render_long_help()
             .to_string();
-        assert!(help.contains("Option+I or Option+M"));
-        assert!(help.contains("local controls remain"));
+        assert!(help.contains("Option+I, Option+M, or Option+C"));
+        assert!(help.contains("focused-window controls remain"));
         let Some(Command::Run(options)) = Cli::try_parse_from(["numen", "run", "--no-hotkey"])
             .unwrap()
             .command
@@ -846,6 +846,7 @@ mod tests {
         assert!(options.no_hotkey);
         assert!(Cli::try_parse_from(["numen", "go-to-mouse"]).is_err());
         assert!(Cli::try_parse_from(["numen", "go-to-mouse", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["numen", "go-to-corner"]).is_err());
     }
 
     #[test]

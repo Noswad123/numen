@@ -30,6 +30,8 @@ pub struct Snapshot {
 pub struct Hotkeys {
     pub option_i: ShortcutStatus,
     pub option_m: ShortcutStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_c: Option<ShortcutStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,8 +51,10 @@ impl ShortcutStatus {
             | (Unavailable, Some(RegistrationFailed | Headless))
             | (Uninitialized, Some(RegistrationPending | NotReported)) => true,
             (Disabled, Some(NoBubble)) => shortcut == Shortcut::Reveal,
-            (Unsupported, Some(UnsupportedMode))
-            | (Unavailable, Some(PointerInitializationFailed)) => shortcut == Shortcut::GoToMouse,
+            (Unsupported, Some(UnsupportedMode)) => {
+                matches!(shortcut, Shortcut::GoToMouse | Shortcut::GoToCorner)
+            }
+            (Unavailable, Some(PointerInitializationFailed)) => shortcut == Shortcut::GoToMouse,
             _ => false,
         }
     }
@@ -108,6 +112,7 @@ impl Snapshot {
             hotkeys: Hotkeys {
                 option_i: status,
                 option_m: status,
+                option_c: Some(status),
             },
             preferences: Some(crate::preferences::Status::disabled()),
         }
@@ -141,6 +146,7 @@ impl RuntimeDiagnostics {
         match shortcut {
             Shortcut::Reveal => snapshot.hotkeys.option_i = status,
             Shortcut::GoToMouse => snapshot.hotkeys.option_m = status,
+            Shortcut::GoToCorner => snapshot.hotkeys.option_c = Some(status),
         }
     }
 }
@@ -165,7 +171,7 @@ mod tests {
             Some(Headless),
             Some(UnsupportedMode),
         ];
-        for shortcut in [Shortcut::Reveal, Shortcut::GoToMouse] {
+        for shortcut in [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner] {
             let valid = [
                 vec![None],
                 if shortcut == Shortcut::Reveal {
@@ -173,7 +179,7 @@ mod tests {
                 } else {
                     vec![Some(NoHotkey)]
                 },
-                if shortcut == Shortcut::GoToMouse {
+                if matches!(shortcut, Shortcut::GoToMouse | Shortcut::GoToCorner) {
                     vec![Some(UnsupportedPlatform), Some(UnsupportedMode)]
                 } else {
                     vec![Some(UnsupportedPlatform)]
@@ -217,6 +223,7 @@ mod tests {
             assert_eq!(snapshot.version, 1);
             assert_eq!(snapshot.build, current());
             assert_eq!(snapshot.hotkeys.option_i, snapshot.hotkeys.option_m);
+            assert_eq!(snapshot.hotkeys.option_c, Some(snapshot.hotkeys.option_i));
             assert_eq!(
                 snapshot.hotkeys.option_i.reason,
                 Some(if graphical {
@@ -271,6 +278,20 @@ mod tests {
         diagnostics.set_hotkey(Shortcut::GoToMouse, pending);
         assert_eq!(diagnostics.snapshot().hotkeys.option_i, registered);
         assert_eq!(diagnostics.snapshot().hotkeys.option_m, pending);
+        diagnostics.set_hotkey(Shortcut::GoToCorner, registered);
+        assert_eq!(diagnostics.snapshot().hotkeys.option_c, Some(registered));
+        assert_eq!(diagnostics.snapshot().hotkeys.option_i, registered);
+        assert_eq!(diagnostics.snapshot().hotkeys.option_m, pending);
+        assert_eq!(before.hotkeys.option_c, Some(before.hotkeys.option_i));
+    }
+
+    #[test]
+    fn older_v1_without_corner_status_round_trips_without_adding_it() {
+        let mut value = serde_json::to_value(Snapshot::new(true)).unwrap();
+        value["hotkeys"].as_object_mut().unwrap().remove("option_c");
+        let snapshot: Snapshot = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(snapshot.hotkeys.option_c, None);
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), value);
     }
 
     #[test]

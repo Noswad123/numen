@@ -1,4 +1,4 @@
-//! System-wide Option+I reveal and Option+M go-to-mouse shortcuts.
+//! System-wide Option+I reveal, Option+M mouse, and Option+C corner shortcuts.
 //!
 //! Register after creating the main-thread winit event loop, and drop guards on
 //! that thread. Callbacks must only enqueue events, never block or move windows.
@@ -8,6 +8,7 @@
 pub enum Shortcut {
     Reveal,
     GoToMouse,
+    GoToCorner,
 }
 
 /// Independently owns one shortcut. Registration failure leaves others intact.
@@ -61,7 +62,7 @@ mod macos {
         },
     };
 
-    static HANDLERS: Mutex<Registry> = Mutex::new(Registry([None, None]));
+    static HANDLERS: Mutex<Registry> = Mutex::new(Registry([None, None, None]));
     static INSTALL_HANDLER: Once = Once::new();
 
     thread_local! {
@@ -75,6 +76,7 @@ mod macos {
             match self {
                 Self::Reveal => 0,
                 Self::GoToMouse => 1,
+                Self::GoToCorner => 2,
             }
         }
 
@@ -84,6 +86,7 @@ mod macos {
                 match self {
                     Self::Reveal => Code::KeyI,
                     Self::GoToMouse => Code::KeyM,
+                    Self::GoToCorner => Code::KeyC,
                 },
             )
         }
@@ -92,6 +95,7 @@ mod macos {
             match self {
                 Self::Reveal => "Option+I",
                 Self::GoToMouse => "Option+M",
+                Self::GoToCorner => "Option+C",
             }
         }
     }
@@ -120,7 +124,7 @@ mod macos {
     }
 
     // Fixed capacity, no callback ownership and no unbounded stale-ID growth.
-    struct Registry([Option<Weak<Handler>>; 2]);
+    struct Registry([Option<Weak<Handler>>; 3]);
 
     impl Registry {
         fn reserve(&mut self, shortcut: Shortcut, handler: &Arc<Handler>) -> Result<()> {
@@ -247,7 +251,7 @@ mod macos {
                         dispatch_global as fn(GlobalHotKeyEvent),
                     ));
                 });
-                // KeyI and KeyM use Carbon, never an event tap or input injection.
+                // These letter keys use Carbon, never an event tap or input injection.
                 manager.register(hotkey).with_context(|| {
                     format!(
                         "Could not register system-wide {}; another app may own it. \
@@ -308,18 +312,30 @@ mod macos {
         }
 
         #[test]
-        fn both_keys_interleave_and_latch_independently() {
-            let registry = Mutex::new(Registry([None, None]));
+        fn three_keys_interleave_and_latch_independently() {
+            let registry = Mutex::new(Registry([None, None, None]));
             let reveal = Arc::new(AtomicUsize::new(0));
             let mouse = Arc::new(AtomicUsize::new(0));
+            let corner = Arc::new(AtomicUsize::new(0));
             let _reveal = register_counter(&registry, Shortcut::Reveal, &reveal);
             let _mouse = register_counter(&registry, Shortcut::GoToMouse, &mouse);
+            let _corner = register_counter(&registry, Shortcut::GoToCorner, &corner);
             assert_ne!(
                 Shortcut::Reveal.hotkey().id(),
                 Shortcut::GoToMouse.hotkey().id()
             );
             assert_eq!(Shortcut::Reveal.hotkey().key, Code::KeyI);
             assert_eq!(Shortcut::GoToMouse.hotkey().key, Code::KeyM);
+            assert_eq!(Shortcut::GoToCorner.hotkey().key, Code::KeyC);
+            let shortcuts = [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner];
+            for shortcut in shortcuts {
+                assert_eq!(shortcut.hotkey().mods, Modifiers::ALT);
+                for other in shortcuts {
+                    if shortcut != other {
+                        assert_ne!(shortcut.hotkey().id(), other.hotkey().id());
+                    }
+                }
+            }
             for state in [HotKeyState::Pressed, HotKeyState::Released] {
                 dispatch(
                     &registry,
@@ -331,12 +347,15 @@ mod macos {
             }
             assert_eq!(reveal.load(Ordering::Relaxed), 0);
             assert_eq!(mouse.load(Ordering::Relaxed), 0);
+            assert_eq!(corner.load(Ordering::Relaxed), 0);
             for _ in 0..100 {
                 event(&registry, Shortcut::Reveal, HotKeyState::Pressed);
                 event(&registry, Shortcut::GoToMouse, HotKeyState::Pressed);
+                event(&registry, Shortcut::GoToCorner, HotKeyState::Pressed);
             }
             assert_eq!(reveal.load(Ordering::Relaxed), 1);
             assert_eq!(mouse.load(Ordering::Relaxed), 1);
+            assert_eq!(corner.load(Ordering::Relaxed), 1);
             dispatch(
                 &registry,
                 GlobalHotKeyEvent {
@@ -360,12 +379,21 @@ mod macos {
             event(&registry, Shortcut::Reveal, HotKeyState::Pressed);
             assert_eq!(reveal.load(Ordering::Relaxed), 2);
             assert_eq!(mouse.load(Ordering::Relaxed), 2);
+            event(&registry, Shortcut::GoToCorner, HotKeyState::Pressed);
+            assert_eq!(corner.load(Ordering::Relaxed), 1);
+            event(&registry, Shortcut::GoToCorner, HotKeyState::Released);
+            event(&registry, Shortcut::GoToCorner, HotKeyState::Pressed);
+            event(&registry, Shortcut::Reveal, HotKeyState::Pressed);
+            event(&registry, Shortcut::GoToMouse, HotKeyState::Pressed);
+            assert_eq!(corner.load(Ordering::Relaxed), 2);
+            assert_eq!(reveal.load(Ordering::Relaxed), 2);
+            assert_eq!(mouse.load(Ordering::Relaxed), 2);
         }
 
         #[test]
         fn failed_reservation_and_registration_preserve_other_owner() {
-            for first in [Shortcut::Reveal, Shortcut::GoToMouse] {
-                let registry = Mutex::new(Registry([None, None]));
+            for first in [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner] {
+                let registry = Mutex::new(Registry([None, None, None]));
                 let calls = Arc::new(AtomicUsize::new(0));
                 let _owner = register_counter(&registry, first, &calls);
                 assert!(
@@ -379,8 +407,14 @@ mod macos {
                 );
                 let other = match first {
                     Shortcut::Reveal => Shortcut::GoToMouse,
-                    Shortcut::GoToMouse => Shortcut::Reveal,
+                    Shortcut::GoToMouse => Shortcut::GoToCorner,
+                    Shortcut::GoToCorner => Shortcut::Reveal,
                 };
+                let third = [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner]
+                    .into_iter()
+                    .find(|key| *key != first && *key != other)
+                    .unwrap();
+                let _third = register_counter(&registry, third, &calls);
                 let captured = Arc::new(());
                 let retained = Arc::clone(&captured);
                 assert!(
@@ -408,16 +442,18 @@ mod macos {
                 );
                 event(&registry, first, HotKeyState::Pressed);
                 assert_eq!(calls.load(Ordering::Relaxed), 1);
+                event(&registry, third, HotKeyState::Pressed);
+                assert_eq!(calls.load(Ordering::Relaxed), 2);
                 let _retry = register_counter(&registry, other, &calls);
                 event(&registry, other, HotKeyState::Pressed);
-                assert_eq!(calls.load(Ordering::Relaxed), 2);
+                assert_eq!(calls.load(Ordering::Relaxed), 3);
             }
         }
 
         #[test]
         fn dropping_one_releases_callback_and_leaves_other_routing() {
-            for first in [Shortcut::Reveal, Shortcut::GoToMouse] {
-                let registry = Mutex::new(Registry([None, None]));
+            for first in [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner] {
+                let registry = Mutex::new(Registry([None, None, None]));
                 let captured = Arc::new(());
                 let retained = Arc::clone(&captured);
                 let owner = HandlerGuard::register(
@@ -432,39 +468,46 @@ mod macos {
                 let stale = Arc::downgrade(&owner.handler);
                 let other = match first {
                     Shortcut::Reveal => Shortcut::GoToMouse,
-                    Shortcut::GoToMouse => Shortcut::Reveal,
+                    Shortcut::GoToMouse => Shortcut::GoToCorner,
+                    Shortcut::GoToCorner => Shortcut::Reveal,
                 };
                 let calls = Arc::new(AtomicUsize::new(0));
                 let _other = register_counter(&registry, other, &calls);
+                let third = [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner]
+                    .into_iter()
+                    .find(|key| *key != first && *key != other)
+                    .unwrap();
+                let _third = register_counter(&registry, third, &calls);
                 drop(owner);
                 assert!(stale.upgrade().is_none());
                 assert_eq!(Arc::strong_count(&captured), 1);
                 event(&registry, first, HotKeyState::Pressed);
                 event(&registry, other, HotKeyState::Pressed);
-                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                event(&registry, third, HotKeyState::Pressed);
+                assert_eq!(calls.load(Ordering::Relaxed), 2);
             }
         }
 
         #[test]
         fn stale_cleanup_cannot_detach_replacement_and_dispatch_unlocks() {
-            let registry = Mutex::new(Registry([None, None]));
+            let registry = Mutex::new(Registry([None, None, None]));
             let calls = Arc::new(AtomicUsize::new(0));
-            let old = register_counter(&registry, Shortcut::Reveal, &calls);
+            let old = register_counter(&registry, Shortcut::GoToCorner, &calls);
             registry
                 .lock()
                 .unwrap()
-                .detach(Shortcut::Reveal, &old.handler);
-            let replacement = register_counter(&registry, Shortcut::Reveal, &calls);
+                .detach(Shortcut::GoToCorner, &old.handler);
+            let replacement = register_counter(&registry, Shortcut::GoToCorner, &calls);
             drop(old);
-            event(&registry, Shortcut::Reveal, HotKeyState::Pressed);
+            event(&registry, Shortcut::GoToCorner, HotKeyState::Pressed);
             assert_eq!(calls.load(Ordering::Relaxed), 1);
             let expired = Arc::downgrade(&replacement.handler);
             drop(replacement);
             assert!(registry.lock().unwrap().0.iter().all(Option::is_none));
             // An expired weak entry can be reclaimed without registry growth.
-            registry.lock().unwrap().0[Shortcut::Reveal.index()] = Some(expired);
-            let reclaimed = register_counter(&registry, Shortcut::Reveal, &calls);
-            event(&registry, Shortcut::Reveal, HotKeyState::Pressed);
+            registry.lock().unwrap().0[Shortcut::GoToCorner.index()] = Some(expired);
+            let reclaimed = register_counter(&registry, Shortcut::GoToCorner, &calls);
+            event(&registry, Shortcut::GoToCorner, HotKeyState::Pressed);
             assert_eq!(calls.load(Ordering::Relaxed), 2);
             drop(reclaimed);
             let registry = Arc::new(registry);

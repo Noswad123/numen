@@ -692,11 +692,19 @@ fn headless_discovery_reports_live_targets_but_no_lifecycle_capabilities() {
 
 // Keep lifecycle serialization independent of a graphical server and its callbacks.
 fn mock_bare(info: Value, open_reply: Option<Value>) -> (ExitStatus, String, String) {
+    mock_bare_command(info, open_reply, command)
+}
+
+fn mock_bare_command(
+    info: Value,
+    open_reply: Option<Value>,
+    launch: impl FnOnce(&Path) -> Command,
+) -> (ExitStatus, String, String) {
     let (dir, socket) = fixture();
     let server = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     server.set_nonblocking(true).unwrap();
-    let mut child = ChildGuard(command(&socket).spawn().unwrap());
+    let mut child = ChildGuard(launch(&socket).spawn().unwrap());
     let deadline = Instant::now() + LIMIT;
     let mut replies = vec![(
         json!({"version":1,"type":"companion.service"}),
@@ -1689,21 +1697,21 @@ fn wisp_action_prints_absolute_argv_without_writing_home_or_catalog() {
         let action = &actions[0];
         assert_eq!(action["id"].as_str(), Some("numen"));
         assert_eq!(action["title"].as_str(), Some("Numen"));
-        assert_eq!(action["kind"].as_str(), Some("summon"));
-        assert!(action.get("key").is_none());
+        assert_eq!(action["kind"].as_str(), Some("exec"));
+        assert_eq!(action["key"].as_str(), Some("n"));
         let argv: Vec<_> = action["command"]
             .as_array()
             .unwrap()
             .iter()
             .map(|part| part.as_str().unwrap())
             .collect();
-        assert_eq!(argv.len(), 4);
+        assert_eq!(argv.len(), 3);
         assert!(Path::new(argv[0]).is_absolute());
         assert_eq!(
             fs::canonicalize(argv[0]).unwrap(),
             fs::canonicalize(env!("CARGO_BIN_EXE_numen")).unwrap()
         );
-        assert_eq!(&argv[1..], &["--socket", socket.to_str().unwrap(), "menu"]);
+        assert_eq!(&argv[1..], &["--socket", socket.to_str().unwrap()]);
         assert!(!catalog.exists());
         assert!(!socket.exists());
         assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
@@ -1713,7 +1721,78 @@ fn wisp_action_prints_absolute_argv_without_writing_home_or_catalog() {
 }
 
 #[test]
+fn wisp_generated_command_hands_off_without_tty_fzf_or_gui_bootstrap() {
+    let data = json!({"opened":["familiar-42"]});
+    let (status, stdout, stderr) = mock_bare_command(
+        bare_service_info(),
+        Some(json!({"version":1,"ok":true,"data":data})),
+        |socket| {
+            let mut preview = ChildGuard(
+                command(socket)
+                    .arg("wisp-action")
+                    .stdin(Stdio::null())
+                    .env("PATH", socket.parent().unwrap())
+                    .spawn()
+                    .unwrap(),
+            );
+            let status = preview.wait_until(Instant::now() + LIMIT);
+            let (stdout, stderr) = preview.output();
+            assert!(status.success(), "{stderr}");
+            let value: toml::Value = toml::from_str(&stdout).unwrap();
+            let argv: Vec<_> = value["action"][0]["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| part.as_str().unwrap())
+                .collect();
+            assert_eq!(argv.len(), 3);
+            let mut launch = Command::new(argv[0]);
+            launch
+                .args(&argv[1..])
+                .current_dir(socket.parent().unwrap())
+                .env("HOME", socket.parent().unwrap())
+                .env("XDG_CONFIG_HOME", socket.parent().unwrap().join("config"))
+                .env("XDG_RUNTIME_DIR", socket.parent().unwrap())
+                .env("PATH", socket.parent().unwrap())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            launch
+        },
+    );
+    assert!(status.success(), "{stderr}");
+    assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), data);
+}
+
+#[test]
+fn wisp_action_rejects_expandable_paths_before_lookup_or_catalog_writes() {
+    let (dir, _) = fixture();
+    let socket = dir.path().join("$HOME.sock");
+    let catalog = dir.path().join("actions.toml");
+    let original = b"# untouched catalog\n";
+    fs::write(&catalog, original).unwrap();
+    for install in [false, true] {
+        let mut cmd = command(&socket);
+        cmd.arg("wisp-action").env("PATH", dir.path());
+        if install {
+            cmd.args(["--install", "--file"]).arg(&catalog);
+        }
+        let mut child = ChildGuard(cmd.spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert!(!status.success());
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("Wisp expands '$'"), "{stderr}");
+        assert_eq!(fs::read(&catalog).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(!socket.exists());
+    }
+}
+
+#[test]
 fn wisp_action_install_preserves_backup_is_idempotent_and_refuses_conflicts() {
+    use std::os::unix::fs::MetadataExt;
+
     let (dir, socket) = fixture();
     let home = dir.path().join("unused-home");
     let catalog = dir.path().join("actions.toml");
@@ -1765,14 +1844,69 @@ fn wisp_action_install_preserves_backup_is_idempotent_and_refuses_conflicts() {
     assert!(stdout.contains("already installed"), "{stdout}");
     assert_eq!(fs::read(&catalog).unwrap(), installed);
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), entries);
-    let conflict = b"# custom Numen\n[[action]]\nid = 'numen'\ncommand = ['different']\n";
-    fs::write(&catalog, conflict).unwrap();
-    let (status, _, stderr) = install();
-    assert!(!status.success());
-    assert!(stderr.contains("different numen action"), "{stderr}");
-    assert_eq!(fs::read(&catalog).unwrap(), conflict);
-    assert_eq!(fs::read(&backup).unwrap(), original);
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), entries);
+    let mut legacy = actions[1].clone();
+    legacy.as_table_mut().unwrap().remove("key");
+    legacy["kind"] = "summon".into();
+    legacy["command"]
+        .as_array_mut()
+        .unwrap()
+        .push("menu".into());
+    let legacy = toml::to_string(&toml::toml! { action = [legacy] }).unwrap();
+    let recovery_entries = || {
+        let mut entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                (
+                    entry.file_name(),
+                    fs::read(entry.path()).unwrap(),
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.mode(),
+                        metadata.uid(),
+                        metadata.gid(),
+                        metadata.len(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    ),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    };
+    let mut cases = vec![
+        (
+            "# custom Numen\n[[action]]\nid = 'numen'\ncommand = ['different']\n".to_owned(),
+            "different numen action",
+        ),
+        (legacy, "different numen action"),
+    ];
+    for key in ["n", "N", " n ", " N ", "\tn\t", " \tN\r\n"] {
+        let collision = format!("[[action]]\nid='other'\nkey={key:?}\ncommand=['hello']\n");
+        cases.push((
+            format!("{}\n{collision}", std::str::from_utf8(&installed).unwrap()),
+            "another action with key 'n'",
+        ));
+        cases.push((collision, "another action with key 'n'"));
+    }
+    for (conflict, diagnostic) in cases {
+        fs::write(&catalog, &conflict).unwrap();
+        let before = recovery_entries();
+        let (status, stdout, stderr) = install();
+        assert!(!status.success());
+        assert!(stdout.is_empty());
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert_eq!(recovery_entries(), before);
+        assert_eq!(fs::read(&catalog).unwrap(), conflict.as_bytes());
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(fs::read(&live_backup).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), entries);
+    }
     assert!(!home.exists());
     assert!(!socket.exists());
 }
@@ -1904,6 +2038,10 @@ fn service_info_reports_actual_headless_listener_pid_and_capabilities() {
     );
     assert_eq!(
         diagnostics["hotkeys"]["option_m"],
+        diagnostics["hotkeys"]["option_i"]
+    );
+    assert_eq!(
+        diagnostics["hotkeys"]["option_c"],
         diagnostics["hotkeys"]["option_i"]
     );
     let doctor = control(&socket, &["doctor", "--json"]);
@@ -2250,11 +2388,14 @@ fn doctor_rejects_contradictory_shortcut_states_and_per_key_reasons() {
         ("option_m", "disabled", "no_bubble"),
         ("option_i", "unavailable", "pointer_initialization_failed"),
         ("option_i", "unsupported", "unsupported_mode"),
+        ("option_c", "registered", "registration_failed"),
+        ("option_c", "disabled", "no_bubble"),
+        ("option_c", "unavailable", "pointer_initialization_failed"),
+        ("option_c", "unsupported", "registration_pending"),
     ] {
-        let reply = DOCTOR_ACK.replace(
-            &format!(r#""{key}":{{"state":"registered","reason":null}}"#),
-            &format!(r#""{key}":{{"state":"{state}","reason":"{reason}"}}"#),
-        );
+        let mut ack: Value = serde_json::from_str(DOCTOR_ACK).unwrap();
+        ack["data"]["diagnostics"]["hotkeys"][key] = json!({"state":state,"reason":reason});
+        let reply = ack.to_string();
         assert_ne!(reply, DOCTOR_ACK);
         let (status, stdout, stderr) = doctor_mock(Some(&reply), false);
         assert_eq!(status.code(), Some(1), "{reply}: {stderr}");
@@ -2263,6 +2404,65 @@ fn doctor_rejects_contradictory_shortcut_states_and_per_key_reasons() {
             stderr.contains("invalid service shortcut metadata"),
             "{stderr}"
         );
+    }
+}
+
+#[test]
+fn doctor_accepts_corner_status_and_keeps_older_v1_omission_unknown() {
+    let mut data = serde_json::from_str::<Value>(DOCTOR_ACK).unwrap()["data"].clone();
+    let older = doctor_data(&data);
+    assert_eq!(older["service_state"], "reachable");
+    assert!(
+        older["service"]["diagnostics"]["hotkeys"]
+            .get("option_c")
+            .is_none()
+    );
+    let (status, stdout, stderr) = doctor_mock(Some(DOCTOR_ACK), true);
+    assert!(status.success(), "{stderr}");
+    assert!(stdout.contains("Option+C: unknown (reason: not_reported)"));
+    for (state, reason) in [
+        ("registered", None),
+        ("disabled", Some("no_hotkey")),
+        ("unsupported", Some("unsupported_mode")),
+        ("unsupported", Some("unsupported_platform")),
+        ("unavailable", Some("registration_failed")),
+        ("unavailable", Some("headless")),
+        ("uninitialized", Some("registration_pending")),
+        ("uninitialized", Some("not_reported")),
+    ] {
+        let corner = json!({"state":state,"reason":reason});
+        data["diagnostics"]["hotkeys"]["option_c"] = corner.clone();
+        let report = doctor_data(&data);
+        assert_eq!(report["service_state"], "reachable");
+        assert_eq!(
+            report["service"]["diagnostics"]["hotkeys"]["option_c"],
+            corner
+        );
+        let reply = json!({"version":1,"ok":true,"data":data}).to_string();
+        let (status, stdout, stderr) = doctor_mock(Some(&reply), true);
+        assert!(status.success(), "{stderr}");
+        assert!(stdout.contains(&format!(
+            "Option+C: {state} (reason: {})",
+            reason.unwrap_or("none")
+        )));
+    }
+    for malformed in [
+        json!("private-corner-marker"),
+        json!({}),
+        json!({"state":"private-corner-marker","reason":null}),
+        json!({"state":"registered","reason":"private-corner-marker"}),
+        json!({"state":"registered","reason":42}),
+    ] {
+        data["diagnostics"]["hotkeys"]["option_c"] = malformed;
+        let reply = json!({"version":1,"ok":true,"data":data}).to_string();
+        let (status, stdout, stderr) = doctor_mock(Some(&reply), false);
+        assert_eq!(status.code(), Some(1), "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(
+            stderr.contains("invalid service diagnostics metadata"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("private-corner-marker"), "{stderr}");
     }
 }
 
@@ -2368,6 +2568,7 @@ fn doctor_compares_embedded_metadata_not_pid_path_or_package_version() {
     assert!(status.success(), "{stderr}");
     assert!(stdout.contains("Option+I: registered"));
     assert!(stdout.contains("Option+M: unavailable (reason: registration_failed)"));
+    assert!(stdout.contains("Option+C: unknown (reason: not_reported)"));
     assert!(stdout.contains("Comparison: unknown"));
     assert!(!stdout.contains("Comparison: older"));
 }
@@ -2380,8 +2581,7 @@ fn doctor_legacy_and_future_diagnostics_remain_unknown() {
     assert_eq!(legacy["build_comparison"], "unknown");
     assert_eq!(legacy["service"]["settings"], Value::Null);
     assert_eq!(legacy["service"]["diagnostics"], Value::Null);
-    data["diagnostics"] =
-        json!({"version":2,"executable":"bad\npath","hotkeys":{"option_i":{"state":"registered"}}});
+    data["diagnostics"] = json!({"version":2,"executable":"bad\npath","hotkeys":{"option_i":{"state":"registered"},"option_c":"bad"}});
     let future = doctor_data(&data);
     assert_eq!(future["service_state"], "unsupported_diagnostics");
     assert_eq!(future["build_comparison"], "unknown");
@@ -2392,6 +2592,7 @@ fn doctor_legacy_and_future_diagnostics_remain_unknown() {
     assert!(status.success(), "{stderr}");
     assert!(stdout.contains("Option+I: unknown"));
     assert!(stdout.contains("Option+M: unknown"));
+    assert!(stdout.contains("Option+C: unknown (reason: not_reported)"));
     assert!(!stdout.contains("disabled"));
     assert!(stdout.contains("legacy, or unsupported diagnostics leave comparison unknown"));
 }

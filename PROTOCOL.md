@@ -2,9 +2,20 @@
 
 ## Overview
 
+Wisp's default Numen action now uses `exec`, key **n**, and exactly
+`[absoluteExecutable, "--socket", absoluteSocket]` (no `menu`). Native **Palette**
+dispatches bare launch; it does not capture keys or enter compositor mode itself.
+Explicit `numen menu` remains a TTY flow requiring Wisp `run`/`summon`.
+This changes no Numen wire API; Wisp's secondary `wisp menu` uses the existing
+`run` request for older-daemon compatibility, not a new protocol or rename-only
+restart. See [canonical contract/status](WISP.md) for confirmed installations and
+native exec reuse smoke, confirmed authorized AeroSpace reload and remaining physical-input/focus limits.
+Earlier installation and CLI-palette evidence
+below is historical, not proof of the new native exec handoff.
+
 **Current contract: unattached-first.** Bare `numen` reuses/bootstrap-starts a GUI service and opens one unattached familiar, sealed to its `service_instance` and gated on `unattached_open`. Direct `numen open`/wire Open still require a running GUI. Production graphical Main and new unbound views never bind from source arrivals; exact existing pins keep their reconnect behavior. The historical attached-only Open design and user-UI Main auto-selection rule are **SUPERSEDED**; compatibility headless/test constructors retain the latter only.
 
-**Delivery confirmed:** the unattached-first debug binary is installed; installed help and fresh Djinn interop passed. Read-only doctor found the existing graphical service reachable with a different, older recorded build and left it untouched. One explicit user-chosen Numen restart is required to load new code, not Djinn. See [canonical evidence](README.md#unattached-first-validation-status) for fingerprints, fresh checks and prior 413-test/Clippy/build/native smoke results (not freshly rerun). Physical native menu selection and Wisp handoff remain manual; older reports below retain their historical scope.
+**Delivery confirmed:** the latest debug binary is installed; final installed registration/normal-cleanup and interop checks passed. Final read-only doctor found the default service `not_running` and started nothing; use bare `numen`, then Option+C. The earlier older-reachable-service report is historical. Only if an older service is running later is an explicit user-chosen Numen restart needed, never automatic replacement or a Djinn restart. See [canonical current evidence and manual limits](README.md#optionc-validation-and-deployment).
 
 Implemented additive local v1 API: newline-delimited JSON over a user-private Unix-domain socket. The first multi-familiar foundation is delivered and verified by automated checks and a three-view Metal smoke test. This is not a stable public SDK. Sources report semantic activity, not animations; an optional built-from-source Djinn interactive adapter publishes through this protocol without OS scanning. Graphical `run` supports lifecycle control; headless `listen` supports discovery/legacy selection, not GUI lifecycle.
 
@@ -91,7 +102,7 @@ The current wiring is complete without a root GUI snapshot service-stamp rewrite
 
 Production-adapter **NativePopupInputFree** fixtures passed: 4 choices **393 ms**, 512 choices **374 ms**, unavailable/0 choices **378 ms**, exit 0/no errors, including native build, pagination/tooltips and cancellation retention/cleanup. Timing was measured at `show` return before canceller join, requiring ≥250 ms to establish actual native tracking cancellation. The fixture uses a stub `FocusTarget` and exact preset table, not the service/root Store; full service contract coverage is pure/IPC. No OS input/item selection/drag/hotkeys/user-app controls occurred; physical **NativeChoiceSelected** remains pending, and prior user feedback does not verify it.
 
-**Historical picker installation:** the earlier installed-binary check observed `not_running` and passed 1 interop test / 46 assertions. This is not the latest service result; see [current installation, reachable-service diagnostics and fresh interop](README.md#unattached-first-validation-status). Physical selection remains manual.
+**Historical picker installation:** the earlier installed-binary check observed `not_running` and passed 1 interop test / 46 assertions. See [final installed checks and default-service status](README.md#optionc-validation-and-deployment) for current evidence. Physical selection remains manual.
 
 ### Runtime settings
 
@@ -122,7 +133,7 @@ Registry settings are independent of `Presentation` and retained in latest-only 
 {"version":1,"ok":true,"data":{"updated":["main"]}}
 ```
 
-CLI equivalent: `numen settings --familiar main --sprite-scale .5 --font-size 16 --bubble-duration 5`; any nonempty flag subset is valid. Rebuilding does not upgrade an older running service: explicitly run `numen quit`, then `numen menu` → Open existing chat once after deployment. No Djinn restart is needed; subsequent runtime edits need no restart. Never automatically quit/replace the user's service.
+CLI equivalent: `numen settings --familiar main --sprite-scale .5 --font-size 16 --bubble-duration 5`; any nonempty flag subset is valid. Rebuilding does not upgrade an older running service: after deployment, a user-chosen `numen quit`, then bare `numen` loads new code. Click Attach, or use advanced `numen menu` → Open attached… to restore chat preferences. No Djinn restart is needed; subsequent runtime edits need no restart. Never automatically quit/replace the user's service.
 
 ### Saved preferences
 
@@ -180,7 +191,7 @@ Publication-race fixes preserve externally changed backups through private-quara
 | `diagnostics` | `{version:1, executable, build, hotkeys, preferences?}`; independent diagnostics schema version. |
 | `diagnostics.executable` | Service's own executable path or null if unavailable/unsafe to report; bounded to 1024 UTF-8 bytes, control/bidi-free. |
 | `diagnostics.build` | `{version, fingerprint, source_fingerprint, target, profile}` embedded in the responding service, not read from a replacement executable on disk. |
-| `diagnostics.hotkeys` | `{option_i:{state,reason}, option_m:{state,reason}}`, actual live registration facts, not delivery guarantees. |
+| `diagnostics.hotkeys` | `{option_i:{state,reason}, option_m:{state,reason}, option_c?:{state,reason}}`, actual live registration facts, not delivery guarantees. |
 
 Wire names are snake_case. Allowlisted valid status/reason pairs (`reason` is null for registered):
 
@@ -188,9 +199,13 @@ Wire names are snake_case. Allowlisted valid status/reason pairs (`reason` is nu
 | --- | --- |
 | `registered` | null |
 | `disabled` | `no_hotkey`; `no_bubble` for I only |
-| `unsupported` | `unsupported_platform`; `unsupported_mode` for M only |
+| `unsupported` | `unsupported_platform`; `unsupported_mode` for M/C only |
 | `unavailable` | `registration_failed`, `headless`; `pointer_initialization_failed` for M only |
 | `uninitialized` | `registration_pending`, `not_reported` |
+
+`hotkeys.option_c` is additive and optional within diagnostics **version 1**. An older service omitting it remains reachable with C unknown/not_reported, not inferred disabled; when present, doctor validates its state/reason pair. `no_bubble` is valid only for I and `pointer_initialization_failed` only for M: C is independent of pointer initialization/sampling. Gate order is `no_hotkey`, I-only `no_bubble`, unsupported platform, M/C unsupported mode, M-only pointer failure, then registration pending/result. Global I/M/C register independently; `--no-hotkey` retains supported focused local I/M/C controls.
+
+Option+C is **hotkey-only**, with no corner wire request, CLI command or new advertised capability. `navigation` and `go-to-mouse` still describe the installed mouse callback, not C eligibility. See [canonical corner controls, data flow and evidence](README.md#random-corners-optionc).
 
 The service shares a live `RuntimeDiagnostics` handle (`Arc<Mutex<Snapshot>>`) with GUI registration. Queries copy its current snapshot, not frozen startup results. Logical counts come from the current Store. No raw argv, environment values, source identities or activity summaries enter this diagnostics payload. Build flags/compiler details are hashed, not exposed; [fingerprint coverage and exclusions](ARCHITECTURE.md#recorded-build-identity) apply.
 
@@ -218,7 +233,7 @@ Bare `numen` and offline menu **Open** / **Open attached…** may bootstrap deta
 
 `numen go-to-mouse --familiar ID1 ID2` sends `familiar.go-to-mouse` with `ids`, not `familiars`. The field is required and non-null: 1–16 distinct valid IDs, each existing at dispatch. Missing/empty arrays, duplicates, invalid IDs and unknown/closed IDs reject the entire request before any callback; there is no implicit all or partial delivery. Unsupported handlers (including headless and old `start_with_familiars`) reject with `go-to-mouse requires graphical navigation support`. Success is `{"version":1,"ok":true,"data":{"moving":["ID1","ID2"]}}`; no arrival/completion event or guarantee is implied. Like other controls, this requires no producer registration and does not refresh liveness or mutate bindings/activity state.
 
-Navigation delivery uses a bounded GUI queue (32 requests × 16 IDs), coalesces pending target sets, and applies the newest registry snapshot before starting views. Reissue restarts intent; a closing/failed view may disappear after acceptance. Current support is macOS only. Hard deadline gates bound fresh read-only pointer sampling and physics. Contact matches the compositor's physical sprite-alpha raster and requires actual native feedback against a held pose; predicted movement is not arrival. Success jumps once, then the latest attached emotes resume without expired cues or ongoing follow. No agent success is published. Space pauses motion/animation, not bubble deadlines; occlusion alone does not suspend pursuit or celebration. Actual native drag, digits, non-macOS right-cycle, L, Tab and close cancel without success; macOS menu opening/dismissal and reveal-all do not. See [coordinate details](ARCHITECTURE.md#navigation-and-coordinate-contract).
+Navigation delivery uses a shared ordered GUI queue (32 requests, targeted mouse sets bounded to 16 IDs), drops the oldest on overflow, and applies the newest registry snapshot before starting views. Targeted/broadcast mouse and broadcast corner requests retain dispatch order; the latest dispatched applicable intent replaces prior movement. Reissue restarts intent; a closing/failed view may disappear after acceptance. Current support is macOS only. Mouse pursuit uses hard deadline gates for fresh read-only pointer sampling and physics. Mouse contact matches the compositor's physical sprite-alpha raster and requires actual native feedback against a held pose; predicted movement is not arrival. Mouse success jumps once, then the latest attached emotes resume without expired cues or ongoing follow; corner arrival has no jump. No agent success is published. Space pauses motion/animation, not bubble deadlines; occlusion alone does not suspend pursuit or celebration. Actual native drag, digits, non-macOS right-cycle, L, Tab and close cancel without success; macOS menu opening/dismissal and reveal-all do not. See [coordinate details](ARCHITECTURE.md#navigation-and-coordinate-contract).
 
 Global **Option+M** is a GUI-only service-local broadcast, not a new wire request or permission to omit `ids`. Its callback queues all-current intent; the main GUI loop first applies the latest registry, then starts eligible views and skips closing/failed ones. With zero views it does nothing and remains registered for later Open. Focused local exact Alt+M moves only the focused view if global M registration failed/was disabled; successful global M suppresses local delivery independently of I. Both preserve pause and never request activation/focus. Pointer initialization failure, non-macOS and manual/demo sessions have no M/navigation support.
 
@@ -282,7 +297,7 @@ The GUI translates semantic states independently: external waiting → `review`,
 
 Visibility is local GUI policy, not a producer field. It starts hidden; first selection/new focus and selected status/summary changes show brief notifications (default five seconds). Initial empty No conversation, heartbeats, reason-only changes, cue expiry and background updates do not notify. Automatic changes while visible do not extend the deadline. After expiry, 750 ms quiet time suppresses automatic changes without queueing them; explicit reveal/new focus bypasses quiet time and refreshes the duration. Hide runs even when paused/occluded. `--bubble-duration` accepts finite 0.25–30 seconds; `--always-bubble` opts into persistent debug/preview display and conflicts with hard-disable `--no-bubble`.
 
-Global macOS Option+I (Alt+I) still reveals all current views; focused local fallback reveals that view. CLI `bubbles` supports all or a subset. Option+I and Option+M register independently once per process through one shared main-thread Carbon manager (`global-hotkey` 0.9), not all-keystroke capture/EventTap. One capture-free dispatcher has two weak targets and independent repeat latches until matching release. A collision warns nonfatally without disabling the other key; choose `--socket PATH` for CLI targeting. `--no-hotkey` disables both global registrations but retains focused local I/M and CLI controls where supported. `--no-bubble` skips only global I and ignores every reveal without redacting metadata; global M remains eligible. Chords may override OS shortcuts. Bounded private zero-view native registration and normal-exit cleanup passed all four [smoke cases](README.md#final-optionm-validation); collision handling was tested deterministically, not with real OS collisions. Actual OS presses/background-focus delivery and hotkey-driven motion remain unverified, with no synthetic OS keys, input taps, permission requests or existing-user-service control/restarts. Native unregister is best-effort; see [cleanup limitation](ARCHITECTURE.md#live-display-and-output).
+Global macOS Option+I reveals all current views; its focused local fallback reveals that view. CLI `bubbles` supports all or a subset. I/M/C register independently through one main-thread Carbon manager (`global-hotkey` 0.9), with three weak dispatcher slots and matching-release repeat latches, not EventTap/all-keystroke capture. Collisions are nonfatal and independent. `--no-hotkey` disables all three globals, retaining supported focused local I/M/C and existing CLI controls; `--no-bubble` disables I only, not M/C. Native unregister remains [best-effort](ARCHITECTURE.md#live-display-and-output). The older two-key [registration smoke](README.md#final-optionm-validation) is historical, not C registration/delivery evidence; see [current evidence and manual limits](README.md#optionc-validation-and-deployment).
 
 A latest-only mailbox coalesces presentations with one pending GUI wake; acceptance is not an animation queue. Manual expression override is separate from service selection: L resumes the current selected base without changing conversation or replaying a cue; Tab queues next-selection and resumes live control. Both require a live-enabled GUI session.
 

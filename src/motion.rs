@@ -214,6 +214,60 @@ pub struct Navigator {
 }
 
 impl Navigator {
+    /// Fixed foot-center pursuit. Arrival is based only on actual native feedback;
+    /// one physical pixel per axis tolerates fractional native quantization.
+    pub fn step_fixed(
+        &mut self,
+        now: Instant,
+        current: Point,
+        target: Point,
+        backing: f64,
+    ) -> PursuitStep {
+        let elapsed = now
+            .saturating_duration_since(self.last_tick)
+            .min(MAX_ELAPSED);
+        self.last_tick = now;
+        if ![current.x, current.y, target.x, target.y, backing]
+            .iter()
+            .all(|v| v.is_finite())
+            || backing <= 0.0
+        {
+            return PursuitStep::Blocked("invalid fixed target geometry");
+        }
+        let aim = Point {
+            x: target.x - current.x,
+            y: target.y - current.y,
+        };
+        let distance = aim.x.hypot(aim.y);
+        if !distance.is_finite() {
+            return PursuitStep::Blocked("fixed target vector is not representable");
+        }
+        if aim.x.abs() <= 1.0 / backing && aim.y.abs() <= 1.0 / backing {
+            return PursuitStep::Arrived;
+        }
+        match self.approach {
+            Some((previous, best, since)) if previous == target && distance >= best - 1e-6 => {
+                if now.saturating_duration_since(since) >= STALL_TIMEOUT {
+                    return PursuitStep::Blocked("fixed target has not converged for two seconds");
+                }
+            }
+            _ => self.approach = Some((target, distance, now)),
+        }
+        if aim.x < 0.0 {
+            self.facing = Facing::Left;
+        } else if aim.x > 0.0 {
+            self.facing = Facing::Right;
+        }
+        let travel = (self.speed * elapsed.as_secs_f64()).min(distance);
+        PursuitStep::Move {
+            delta: Point {
+                x: aim.x / distance * travel,
+                y: aim.y / distance * travel,
+            },
+            facing: self.facing,
+        }
+    }
+
     /// Nonfinite speeds use the minimum; finite speeds clamp to 40..=2000.
     pub fn new(speed: f64, now: Instant) -> Self {
         Self {
@@ -389,6 +443,93 @@ fn hit(cursor: Point, origin: Point, scale: f64, mask: Mask<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_targets_use_native_feedback_at_fractional_densities() {
+        for backing in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let start = Instant::now();
+            let mut nav = Navigator::new(2000.0, start);
+            let mut native = NativeMotion::default();
+            let mut current = Point {
+                x: -500.0,
+                y: -600.0,
+            };
+            let target = Point {
+                x: -201.37,
+                y: -105.23,
+            };
+            let mut arrived = false;
+            for frame in 0..180 {
+                match nav.step_fixed(start + FRAME_INTERVAL * frame, current, target, backing) {
+                    PursuitStep::Move { delta, .. } => {
+                        assert!(delta.x.hypot(delta.y) <= 100.0);
+                        current = native.request(current, delta, backing);
+                    }
+                    PursuitStep::Arrived => {
+                        assert!((current.x - target.x).abs() <= 1.0 / backing);
+                        assert!((current.y - target.y).abs() <= 1.0 / backing);
+                        arrived = true;
+                        break;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert!(arrived);
+        }
+    }
+
+    #[test]
+    fn fixed_stall_oscillation_resume_and_invalid_geometry() {
+        let start = Instant::now();
+        let mut nav = Navigator::new(2000.0, start);
+        let current = Point::default();
+        let target = Point { x: 10.25, y: 0.0 };
+        assert!(matches!(
+            nav.step_fixed(start, current, target, 2.0),
+            PursuitStep::Move { .. }
+        ));
+        assert!(matches!(
+            nav.step_fixed(start + STALL_TIMEOUT, current, target, 2.0),
+            PursuitStep::Blocked(_)
+        ));
+        nav.resume(start + Duration::from_secs(100));
+        assert_eq!(
+            movement(nav.step_fixed(start + Duration::from_secs(100), current, target, 2.0)).0,
+            Point::default()
+        );
+        for frame in 1..=130 {
+            let step = nav.step_fixed(
+                start + Duration::from_secs(100) + FRAME_INTERVAL * frame,
+                Point {
+                    x: if frame % 2 == 0 { -1.0 } else { 0.0 },
+                    y: 0.0,
+                },
+                target,
+                2.0,
+            );
+            if frame == 130 {
+                assert!(matches!(step, PursuitStep::Blocked(_)));
+            }
+        }
+        for backing in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                nav.step_fixed(start, current, target, backing),
+                PursuitStep::Blocked(_)
+            ));
+        }
+        assert!(matches!(
+            nav.step_fixed(
+                start,
+                current,
+                Point {
+                    x: f64::NAN,
+                    y: 0.0
+                },
+                1.0
+            ),
+            PursuitStep::Blocked(_)
+        ));
+    }
 
     #[test]
     fn hard_clocks_bound_pointer_and_physics_despite_one_hundred_early_events() {

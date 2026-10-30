@@ -37,6 +37,7 @@ struct Action {
     id: &'static str,
     title: &'static str,
     kind: &'static str,
+    key: &'static str,
     command: Vec<String>,
 }
 
@@ -50,22 +51,25 @@ fn stanza(executable: &Path, socket: &Path) -> Result<String> {
         executable.is_absolute() && socket.is_absolute(),
         "Wisp command paths must be absolute"
     );
-    let text = |path: &Path| {
-        path.to_str()
-            .map(str::to_owned)
-            .context("Wisp action paths must be valid UTF-8")
+    let text = |path: &Path| -> Result<String> {
+        let text = path
+            .to_str()
+            .context("Wisp action paths must be valid UTF-8")?;
+        // Wisp expands environment variables in every action argument, even
+        // though TOML and the terminal wrapper otherwise preserve argv quoting.
+        ensure!(
+            !text.contains('$'),
+            "Wisp expands '$' in command paths; use an executable and socket path without '$'"
+        );
+        Ok(text.to_owned())
     };
     toml::to_string(&Catalog {
         action: vec![Action {
             id: "numen",
             title: "Numen",
-            kind: "summon",
-            command: vec![
-                text(executable)?,
-                "--socket".into(),
-                text(socket)?,
-                "menu".into(),
-            ],
+            kind: "exec",
+            key: "n",
+            command: vec![text(executable)?, "--socket".into(), text(socket)?],
         }],
     })
     .context("serialize Wisp action")
@@ -285,6 +289,14 @@ fn append(original: &[u8], entry: &str) -> Result<Option<Vec<u8>>> {
                 .context("catalog `action` entries must be tables")?;
             if table.get("id").and_then(toml::Value::as_str) == Some("numen") {
                 matches.push(action);
+            } else {
+                ensure!(
+                    !table
+                        .get("key")
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|key| key.trim().eq_ignore_ascii_case("n")),
+                    "catalog already has another action with key 'n'; resolve it manually"
+                );
             }
         }
     }
@@ -575,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn argv_roundtrips_quoting_without_shell_or_key() {
+    fn argv_roundtrips_quoting_with_native_key_without_shell() {
         let binary = Path::new("/opt/space \"quote\"/new\nline\\numen");
         let socket = Path::new("/tmp/a b/\"events\".sock");
         let text = stanza(binary, socket).unwrap();
@@ -587,11 +599,24 @@ mod tests {
                 toml::Value::String(binary.to_str().unwrap().into()),
                 "--socket".into(),
                 socket.to_str().unwrap().into(),
-                "menu".into(),
             ]
         );
-        assert!(action.get("key").is_none());
-        assert_eq!(action["kind"].as_str(), Some("summon"));
+        assert_eq!(action["key"].as_str(), Some("n"));
+        assert_eq!(action["kind"].as_str(), Some("exec"));
+    }
+
+    #[test]
+    fn rejects_paths_that_wisp_would_expand() {
+        for (binary, socket) in [
+            ("/opt/$HOME/numen", "/tmp/private/events.sock"),
+            ("/opt/${HOME}/numen", "/tmp/private/events.sock"),
+            ("/opt/numen", "/tmp/$HOME/events.sock"),
+            ("/opt/numen", "/tmp/${HOME}/events.sock"),
+            ("/opt/numen", "/tmp/literal$/events.sock"),
+        ] {
+            let error = stanza(Path::new(binary), Path::new(socket)).unwrap_err();
+            assert!(error.to_string().contains("Wisp expands '$'"));
+        }
     }
 
     #[test]
@@ -636,6 +661,42 @@ mod tests {
             assert!(append(original.as_bytes(), &entry()).is_err());
         }
         assert!(append(&[0xff], &entry()).is_err());
+    }
+
+    #[test]
+    fn refuses_legacy_menu_and_key_collisions_before_recovery_writes() {
+        let mut legacy: toml::Value = toml::from_str(&entry()).unwrap();
+        let action = legacy["action"][0].as_table_mut().unwrap();
+        action.remove("key");
+        action.insert("kind".into(), "summon".into());
+        action["command"]
+            .as_array_mut()
+            .unwrap()
+            .push("menu".into());
+        let mut cases = vec![(toml::to_string(&legacy).unwrap(), "different numen action")];
+        for key in ["n", "N", " n ", " N ", "\tn\t", " \tN\r\n"] {
+            let collision = format!("[[action]]\nid='other'\nkey={key:?}\ncommand=['hello']\n");
+            cases.push((
+                format!("{}\n{collision}", entry()),
+                "another action with key 'n'",
+            ));
+            cases.push((collision, "another action with key 'n'"));
+        }
+        for (original, message) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("actions.toml");
+            fs::write(&path, &original).unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            let error = install(&path, &entry()).err().expect("must refuse");
+            assert!(error.to_string().contains(message), "{error:#}");
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+            assert!(same_metadata(&metadata, &fs::metadata(&path).unwrap()));
+            let entries: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(entries, vec!["actions.toml"]);
+        }
     }
 
     #[test]

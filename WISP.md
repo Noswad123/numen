@@ -10,13 +10,21 @@ Click **Attach to app / chat** for a supported live protocol app/chat or **Open 
 
 Root v1 `unattached_open` reflects actual multi-familiar support; legacy missing means false. Launcher/default fzf Open checks the flag and seals `service_instance`. An old service needs one explicit manual Numen restart after deployment, then `numen`, never auto-kill/replacement or a Djinn restart. No OS scan, dummy PIDs/sources or app launches. Unbound labels are **Unattached**, with bubble **Unattached familiar** / **Click for actions** / **Unattached**; Preview unchanged.
 
-**Delivery confirmed:** the unattached-first debug binary is installed; installed help and fresh Djinn interop passed. Read-only doctor found the existing graphical service reachable with a different, older recorded build and left it untouched. One explicit user-chosen Numen restart is required to load new code, not Djinn; no Wisp reinstallation is required. See [canonical evidence](README.md#unattached-first-validation-status) for fingerprints, fresh checks and prior 413-test/Clippy/build/native smoke results (not freshly rerun). Physical native menu selection and Wisp palette handoff remain manual. No home Wisp catalog changed; older reports below retain their historical scope.
+**Earlier unattached-first delivery:** the debug binary was installed and installed help/Djinn interop passed; read-only doctor found an older reachable service and left it untouched. See [historical evidence](README.md#unattached-first-validation-status). This does not establish installation or desktop acceptance of the Palette/direct-exec migration below.
 
-Numen owns the familiar-first fzf menu; Wisp's existing binary is already a generic launcher and needs **no source changes**. An optional Numen **Summon** action appears through the Wisp **palette** (`wisp palette`). The generated action has **no key**: no WM-prefix/static hint binding is automatically added.
+**Current Wisp contract:** the native prefix menu is user-facing **Palette**. Option+Space compositor bindings both show Palette and enter mode; **n → Numen** dispatches the generated direct `exec` action. It opens one unattached familiar, reuses/bootstrap-starts the graphical service, and repeated launches add independent views up to 16. Click **Attach to app / chat** for a supported live protocol target. This default needs neither Kitty nor fzf.
 
-Menu, installer, menu Open empty bootstrap and graceful graphical quit are delivered. **No actual home Wisp configuration was edited.** Installation below is an opt-in user command after delivery, not an action performed by this documentation update. No user profile or backups are automatically Git-committed.
+Numen's explicit `numen menu` remains an advanced familiar-first TTY/fzf interface, not the default launch. Wisp's explicit secondary `wisp menu` is its Kitty/fzf action selector; both Wisp interfaces share one catalog/dispatcher. Earlier Summon/no-key/terminal-default descriptions are superseded. This docs-only edit performs no setup, installation, restart, GUI controls or commits; [current local status](#wisp-integration-validation) distinguishes on-disk edits from deployment.
 
 ## API / Interfaces
+
+### Wisp Palette versus CLI menu
+
+- `wisp palette [show|close|text]` is the native passive helper (`show` by default). It never daemon-delegates, captures keys or enters mode itself. The compositor must also enter its Wisp mode/submap. `wisp hint` remains a compatibility alias.
+- Generated bindings show/close Palette; Space stays in mode and never auto-opens the CLI menu. Escape closes/cancels; action keys close Palette, dispatch `wisp action <id>` and leave mode.
+- CLI Menu selection calls `launchActionDirect(cfg, id)` **locally**, using its own resolved catalog—the one the picker displayed—not an ID-only request to a potentially different daemon catalog. The daemon may launch the Menu surface, but does not dispatch its selection. Standalone `wisp action` delegation policy, canonical resolution, overlay locks, failure recovery and exec supervision are unchanged.
+- `wisp menu` explicitly opens Kitty/fzf. Its client delegates through the stable existing request `run --id palette --title 'Wisp Menu' --path '' --dir '' --layout '' -- /usr/bin/env -- <client context assignments> <client self> _palette` (argv schematic). The wrapper carries the full client-resolved WISP context plus caller delegation/fzf settings, including explicit empties when unset. `/usr/bin/env` has first argument `--`, preventing target inference; the final executable is the client, not the daemon. This supports older/different-path daemons without changing the strict ordinary-child Hyprland context guard. The earlier direct-client-self-only payload is superseded. See [full context list](../wisp/README.md#api--interfaces). No new protocol or daemon restart is needed merely for the rename.
+- Internal `_palette`, surface ID `palette`, mode `run`, `WISP_HINT_*`, helper names and PID/overlay state intentionally remain unchanged. See [Wisp README](../wisp/README.md#actions-and-palette) for helper configuration and platform details.
 
 ### Native macOS menu is separate
 
@@ -30,9 +38,9 @@ Retarget keeps current appearance/location/pause/Preview/manual override/navigat
 
 **Main-agent checks confirmed: 386 passed (342 unit + 7 build-fingerprint + 37 CLI), one existing visual-preview test ignored**; formatting, strict all-target Clippy, offline `--locked` tests/build and diff checks passed with SDK 26.5. **NativePopupInputFree** production-adapter fixtures passed: 4 choices **393 ms**, 512 choices **374 ms**, unavailable/0 choices **378 ms**, exit 0/no errors. Native build, pagination/tooltips and cancellation retention/cleanup were covered. Time was measured at `show` return before canceller join, requiring ≥250 ms, not inferred from helper join delay. Stub `FocusTarget` and exact preset table were used, not the service/root Store; pure/IPC tests cover the full contract, combined memo bounds, target-only publication, unbound/stale generations and retarget/source-animation state preservation. Runtime reviewers reported no bugs after correcting the failed-state fixture to `attention: false`. Wiring is complete with one App service/control lifetime, applied-binding/memo comparison and worker service-instance guarding; no root snapshot service-stamp rewrite is required.
 
-No actual OS input/item selection/drag/hotkeys/user-app controls occurred in the picker fixtures. Physical **NativeChoiceSelected** remains manual; the USER-REPORTED older workflow does not verify it. **Historical picker installation:** the earlier installed-binary check observed `not_running` and passed 1 interop test / 46 assertions. This is not the latest service result; see [current installation, reachable-service diagnostics and fresh interop](README.md#unattached-first-validation-status). Home Wisp configuration remains untouched.
+No actual OS input/item selection/drag/hotkeys/user-app controls occurred in the picker fixtures. Physical **NativeChoiceSelected** remains manual; the USER-REPORTED older workflow does not verify it. **Historical picker installation:** the earlier installed-binary check observed `not_running` and passed 1 interop test / 46 assertions. See [earlier installation/interop evidence](README.md#unattached-first-validation-status). Home Wisp configuration was untouched by those fixtures, not by the later manual on-disk migration.
 
-The GUI familiar now has its own AppKit `NSMenu`: **normal left-click release** opens it, and **right-click** opens the same menu instead of Preview cycling. The terminal/fzf `numen menu` and Wisp Summon entry below remain unchanged and available; no Wisp reinstall/binding is needed. Digits **1–9** remain Preview controls. Non-macOS has no native menu and retains left-drag/right-cycle.
+The GUI familiar has its own AppKit `NSMenu`: **normal left-click release** opens it, and **right-click** opens the same menu instead of Preview cycling. This is separate from Wisp Palette and the advanced terminal/fzf `numen menu`. Digits **1–9** remain Preview controls. Non-macOS has no native menu and retains left-drag/right-cycle.
 
 Native actions are **Show status** (disabled by `--no-bubble`), **Go to mouse** (clicked view only, live pointer/navigation required), **Pause/Resume** (clicked view), **Settings**, **Close familiar**, and explicitly **Quit Numen (all familiars)**. Close uses the existing scoped retry path and last-close retains Numen; Quit performs normal service-wide root shutdown, never stopping Djinn. Q/Esc remain per-view close, not Quit. Sources cannot execute actions or auto-open the menu on updates.
 
@@ -51,17 +59,23 @@ Synchronous native tracking suspends Rust GUI ticks; a 25 ms AppKit timer cancel
 | `numen service-info` | Queries API version 1, PID, unique `service_instance`, and graphical/lifecycle/navigation booleans; control readiness, not GPU readiness. |
 | `numen quit` | Gracefully schedules global graphical service exit; does not stop source apps. |
 
-Generated TOML has `id = "numen"`, `title = "Numen"`, `kind = "summon"` and an argv array equivalent to:
+Generated TOML has `id = "numen"`, `title = "Numen"`, `kind = "exec"`, `key = "n"` and exactly three argv elements:
 
 ```text
-[absoluteExecutable, "--socket", absoluteResolvedSocket, "menu"]
+[absoluteExecutable, "--socket", absoluteResolvedSocket]
 ```
 
-Paths are captured from the current executable and resolved socket when generated. Leading `--socket` avoids Wisp's work-directory heuristic. There is no shell interpolation and **Numen need not be installed on PATH**. Regenerate if the binary or socket path changes; a different existing `numen` entry is refused for manual resolution. There is no `--replace` flag.
+Paths are captured from the current executable and resolved socket when generated. Leading `--socket` avoids Wisp's work-directory heuristic. The argv array preserves quoting, and **Numen need not be installed on PATH**. Wisp applies `os.ExpandEnv` to every action argument, so Numen rejects any `$` in the executable or socket path, including a literal dollar sign, before catalog lookup or writes. Use paths without `$`; TOML quoting does not disable that expansion. Regenerate if the binary or socket path changes; a different existing `numen` entry is refused for manual resolution. There is no `--replace` flag.
 
 ## Data Flow
 
-1. `wisp palette` → select **Numen** → Wisp Summon launches the terminal menu.
+Default: compositor Option+Space → show passive Palette **and** enter mode → **n** → close Palette / `wisp action numen` / exit mode → direct bare Numen → graphical service reuse or bounded empty bootstrap → one generation-sealed unattached Open → native view. Repeat to add views (16 total); click Attach for an explicit supported app/chat. No terminal intermediary or source execution is involved.
+
+### Advanced explicit terminal menu
+
+Launch `numen menu` in a terminal, or explicitly wrap it with Wisp `run`/`summon` (never the generated default `exec`):
+
+1. `wisp run --id numen-menu -- numen menu` → Numen's terminal menu.
 2. Select clearly labeled Running/Waiting familiar instances or Preset rows. Internal `familiar:` / `preset:` IDs keep the two types distinct. Tab multi-selects up to 16; Enter advances.
 3. Choose a command supported by **every** row. Presets offer Open and Open attached…; active familiars offer Info, Go to Mouse, Settings, Attach and Close as advertised. No-common-command selections get explanation/Back, never partial skipping.
 4. Open immediately submits unattached items. Only Open attached…/Attach chooses one target per selection from fresh connected-protocol pages, excluding other owners and earlier pending choices while allowing self-current. Empty lists offer Refresh/Back. There is no OS scan or blanket session discovery.
@@ -75,7 +89,9 @@ The menu pins the discovered `service_instance` and includes it on every discove
 
 On a live navigation-capable macOS service, **Option+M** sends all current eligible familiars in that service to the live pointer without activation/focus stealing. This is Numen's Carbon shortcut, not a Wisp catalog key. It works with zero views as a no-op and remains available after later Open. Familiars run left/right, stop on sprite contact, celebrate once and restore the latest attached source expression; no ongoing follow or source outcome is added. Pause is preserved and movement waits for resume. The callback only queues bounded intent; the main GUI loop resolves the latest registry and skips closing/failed views.
 
-Global Option+I reveal-all is unchanged. Independent I/M guards and repeat latches (until matching release) share one main-thread Carbon manager and a capture-free dispatcher with two weak targets. A collision warns without disabling the other key. `--no-hotkey` disables both global registrations, retaining focused local I/M and CLI controls; `--no-bubble` disables only global I, not M. Focused exact Alt+M moves only that view if global M is unregistered, suppressed when global M succeeds independently of I. No M/navigation is available after pointer initialization failure, on non-macOS or in manual/demo.
+Global Option+I reveal-all is unchanged. Independent **I/M/C** guards and matching-release latches share one main-thread Carbon manager and a capture-free dispatcher with three weak slots. Collisions do not disable other keys. `--no-hotkey` disables all three globals, retaining supported focused local I/M/C and existing CLI controls; `--no-bubble` disables I only. Focused exact Alt+M/Alt+C moves only that view when its global key is absent. M requires pointer initialization; C does not. Manual/demo and unsupported platforms have no M/C movement support.
+
+**Option+C is Numen's global random-corner control, not a Palette/catalog binding.** Each current eligible view runs to an independently sampled corner of its current usable display; no source/preference mutation or arrival celebration is added. See [canonical controls](README.md#random-corners-optionc) and [final installed registration/interop checks, 429-test/native evidence and manual limits](README.md#optionc-validation-and-deployment). Installed private C/M registration and normal release/reacquisition passed; physical delivery remains manual. Final installed doctor found the default service `not_running` and started nothing: use bare `numen`, then Option+C. If an older service is running later, only an explicit user-chosen Numen restart loads the new code; installation does not upgrade it in place. No user Numen controls were used. The authorized AeroSpace reload is already active, with main alt-c removed and shift-alt-c preserved; no further reload is needed.
 
 Broadcast is GUI-only and service-local, never cross-process: menu Go to Mouse still uses selected rows and CLI `go-to-mouse --familiar ID1 ID2` still requires explicit IDs. No wire implicit-all request was added. Native unregister is best-effort; see [cleanup limitation](ARCHITECTURE.md#live-display-and-output).
 
@@ -83,7 +99,7 @@ Merely entering menu/discovery never spawns or writes files. Choosing Open while
 
 ### Optional Djinn targets
 
-With an updated Djinn build, run plain `djinn` and open a Chat tab, `djinn -s REF`, or `djinn session chat REF`; discovery is on by default without an enablement export. An existing idle chat is eligible. Then choose Djinn preset → Open in Numen's menu. If Open bootstraps Numen, allow the adapter's default one-second reconnect retry and Refresh. Global dashboard/history do not publish new targets; only explicit current Chat selections and previously observed busy chats (plus bounded terminal retention) are reported, not all sessions or Djinn OS processes.
+With an updated Djinn build, run plain `djinn` and open a Chat tab, `djinn -s REF`, or `djinn session chat REF`; discovery is on by default without an enablement export. An existing idle chat is eligible. Then choose Djinn preset → **Open attached…** → the chat in Numen's menu. If Open attached… bootstraps Numen, allow the adapter's default one-second reconnect retry and Refresh. Plain **Open** creates an unattached familiar without a chat picker. Global dashboard/history do not publish new targets; only explicit current Chat selections and previously observed busy chats (plus bounded terminal retention) are reported, not all sessions or Djinn OS processes.
 
 `DJINN_NUMEN_DISABLED=1` explicitly opts out of reporting; legacy `DJINN_NUMEN=0` also works. Missing enablement/disablement defaults are true/false. Both accept exactly `true/yes/on/1/y` and `false/no/off/0/n`, case-sensitive without trimming. Malformed enablement becomes false, malformed disablement true; effective enablement is enable AND NOT disable in both CLI and backend. For a custom socket, set `DJINN_NUMEN_SOCKET` to the same absolute path captured by the action's Numen `--socket`; the adapter requires the existing private directory/endpoint. Defaults match Numen's XDG-runtime/UID-temporary path. Discovery neither starts Numen nor opens familiars, publishes history, reads raw prompts, changes Wisp/transcripts or makes model calls; Numen remains optional.
 
@@ -105,9 +121,9 @@ Field Back/Esc returns to commands; preset Back/Esc returns to fields. Ctrl-R di
 
 Edits affect the selected live views; production live services now also remember explicit appearance edits and completed manual drags. Original startup defaults remain immutable fallback values, even after editing Main or starting empty; saved style overrides them on explicit Open. Source bindings/cues/TTL, Preview, pause, player and navigation are preserved. Font/sprite edits redraw and resize around the physical foot-center where possible, including hidden-position restoration, without focus. Duration changes affect future accepted reveals/notifications only, not current deadlines, hidden visibility, quiet/history or disabled/always policies. Named profiles, character/variant picker, positioning controls and autostart remain future work.
 
-**After deploying the new binary, explicitly restart an older running Numen service once:** rebuilding alone cannot add Settings to it. When ready, run `numen quit`, then `numen menu` (use the rebuilt full path and same `--socket` as needed), then Djinn preset → Open to reattach the existing chat. No Djinn restart is needed; its adapter reconnects. Legacy services without quit support require manual stop. Nothing automatically quits/replaces the user's service. Once updated, runtime settings edits require no restart.
+**After deploying the new binary, explicitly restart an older running Numen service once:** rebuilding alone cannot add Settings to it. When ready, run `numen quit`, then `numen menu` (use the same `--socket` as needed), then Djinn preset → **Open attached…** → the existing chat. No Djinn restart is needed; its adapter reconnects. Legacy services without quit support require manual stop. Nothing automatically quits/replaces the user's service. Once updated, runtime settings edits require no restart.
 
-This same one-time user-explicit restart enables Option+M, the native click menu and saved preferences: use `~/Projects/numen/target/debug/numen quit`, then `~/Projects/numen/target/debug/numen menu` → Djinn preset → Open existing chat. An older Homebrew binary may not be current. Never restart automatically. No Djinn restart or Wisp reinstallation is required. The main agent confirmed the latest saved-preferences build installed into `~/.local/bin/numen`; no running user service was restarted or home preference files touched during development. Production live startup uses the preference path below.
+This same one-time user-explicit restart enables Option+M, the native click menu and saved preferences: use `numen quit`, then `numen menu` → Djinn preset → **Open attached…** → the existing chat. These commands assume `numen` resolves to the updated installed binary in `~/.local/bin`, not an older Homebrew binary. Never restart automatically. No Djinn restart or Wisp reinstallation is required. The main agent confirmed the latest saved-preferences build installed into `~/.local/bin/numen`; no running user service was restarted or home preference files touched during development. Production live startup uses the preference path below.
 
 ### Saved preferences and Wisp boundaries
 
@@ -125,6 +141,7 @@ ACKs/queue acceptance are not durable-save guarantees. `numen doctor [--json]` r
 
 ### Installer safety and recovery
 
+- No `--replace` or automatic legacy migration exists. An old `summon`, no-key or `menu` entry conflicts: review the preview and manually update the existing stanza, preserving unrelated edits. Another action whose key trims and ASCII-case-folds to `n` (for example `N`, ` n ` or tab-padded `n`) is rejected **before any writes**, even if an identical Numen entry is already present. Resolve that conflict manually; idempotence does not bypass the guard. The generated key remains exactly `n`.
 - Existing catalog must be a user-owned regular file; file symlinks, foreign/special files, malformed TOML, duplicate/conflicting Numen entries and catalogs exceeding 1 MiB are refused. A symlinked **parent directory is allowed**. If the catalog itself is a symlink, inspect it and explicitly pass its resolved regular-file target using `--file`; the installer does not follow it automatically.
 - Installation appends while preserving existing bytes/comments/other entries and permissions. An identical entry is a no-op. New catalogs use mode 0600. Missing parent directories are not created. Catalog path resolution supports `~/`, rejects unresolved `$` variables and does no shell evaluation.
 - On an existing-catalog change, output prints **Snapshot backup** (stable copy) and **Live inode backup (retains late editor writes)**. Snapshot file **and parent directory** are fsynced before displacement. The actual current catalog is renamed into the live-inode backup and rechecked against the baseline. The completed new file is published by **no-clobber hard link**, not blind rename.
@@ -141,38 +158,92 @@ Close removes only selected views; closing the last retains the service/hotkey. 
 
 ## Example usage
 
-For the default standalone workflow, use `numen`, then click Attach to app / chat or Open another familiar. Wisp setup below is optional; its Summon entry still invokes `menu`, not bare launch.
+For standalone use, run `numen`, then click Attach to app / chat or Open another familiar. Optional Wisp setup generates the same bare-launch behavior under native Palette key **n**.
 
-Use the full local debug-binary path; these are **manual setup commands**, not actions already performed:
+Use the intended updated Numen executable (absolute path if not installed); these are **manual setup commands**, not actions performed by this edit:
 
 ```sh
 # Inspect the catalog location (read-only):
 wisp actions path
 # Preview generated TOML only:
-~/Projects/numen/target/debug/numen wisp-action
+numen wisp-action
 # Opt in after reviewing the preview and installer safety above:
-~/Projects/numen/target/debug/numen wisp-action --install
+numen wisp-action --install
 # If needed, explicitly name the inspected resolved regular-file target:
-~/Projects/numen/target/debug/numen wisp-action --install --file /absolute/resolved/actions.toml
-# Read back, then exercise the actual palette handoff manually:
+numen wisp-action --install --file /absolute/resolved/actions.toml
+# Read back; review/generate compositor bindings separately:
 wisp actions list
-wisp palette
+wisp bindings aerospace # Or: wisp bindings hyprland
+# After explicitly applying/reloading reviewed bindings: Option+Space, then n.
+# Standalone rendering only, NOT key capture or mode entry:
+wisp palette show
+wisp palette close
 ```
 
 For a custom service socket, include global `--socket /absolute/private/events.sock` when generating/installing the action. Regenerate after moving the binary or changing that path and resolve any differing existing entry manually.
 
 ```sh
 # Direct interactive menu, without installing anything:
-~/Projects/numen/target/debug/numen menu
-~/Projects/numen/target/debug/numen menu --no-start
+numen menu
+numen menu --no-start
+# Explicit advanced TTY handoff (requires Kitty/fzf):
+wisp run --id numen-menu -- numen menu
 # Explicit empty startup is also available:
-~/Projects/numen/target/debug/numen run --empty
+numen run --empty
 # In another terminal:
-~/Projects/numen/target/debug/numen service-info
-~/Projects/numen/target/debug/numen quit
+numen service-info
+numen quit
 ```
 
-### Validation boundaries
+### Wisp integration validation
+
+**Final installation and direct-exec reuse smoke confirmed; authorized AeroSpace reload now confirmed.** The earlier pending-reload status below is superseded by the current local status. The following are supplied results, not commands rerun by this docs-only edit. The smoke used no user app/service restart or global input; the later authorized compositor reload is separate.
+
+#### Code and installed-command checks
+
+- Fresh Numen suite after the normalized-key guard fix: **417 passed (363 unit + 7 build-fingerprint + 47 CLI)**, one visual test ignored; formatting and strict offline locked Clippy green with command-scoped SDK 26.5. An earlier full attempt hit an unrelated fixture socket-permission failure; its unchanged rerun passed before the final guard-fix checks.
+- Wisp: `CGO_ENABLED=0 go test ./...` and `CGO_ENABLED=0 go vet ./...` green; **14 Python headless helper tests** and bash/zsh syntax checks passed.
+- Updated Wisp, native helper and completions installed via `CGO_ENABLED=0 make install`; updated debug Numen installed via the SDK 26.5 Cargo install workflow.
+- Installed opt-in Wisp/Numen integration: **1 pass**, verifying `exec`, key `n`, exact three-element argv/no `menu`, temporary installation/idempotence and resolution without a terminal. Installed Wisp help distinguishes Palette/Menu; `actions list` reports Numen `exec n`; `palette text` includes `n Numen`.
+- Installed `numen wisp-action --install --file ~/.config/wisp/actions.toml` reported **already installed**, idempotently with no writes.
+- After the final Menu selection fix, Wisp tests, vet, installation and the installed opt-in Numen integration (**1 pass**) were rerun successfully. Fake-daemon A/client-B tests cover the same ID with different exec commands and a B-only action, verifying local dispatch without a daemon action request. Independent final review: **READY**, no concrete blockers.
+- Final installed Djinn interoperability rerun: `NUMEN_TEST_BINARY=/Users/jdawson/.local/bin/numen bun test test/numen/interoperability.test.ts --timeout 30000` → **1 pass, 46 assertions**.
+
+#### Installed native exec smoke (reuse, not offline bootstrap)
+
+Final evidence after the Menu fix: `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/wn-ymim71uo/evidence.json`. The main agent reran `installed-wisp-numen-smoke.py` with `/opt/homebrew/bin/python3`; result **`passed: true`**. The earlier `wn-rxi8u_vo` run below is no longer the final smoke.
+
+- An owned private graphical service was **prestarted** with `--empty --no-hotkey --no-preferences --normal-window-level`. The actual installed generator produced an `exec`/`n`/three-argv action into a temporary catalog.
+- Palette `text`, `show`, default show and compatibility `hint` aliases agreed with `WISP_HINT_BACKEND=stdout`. This checks command/text parity, not native Palette rendering or key capture.
+- Two noninteractive actual `wisp action numen` calls, with `WISP_BACKEND=invalid` and an empty PATH directory (no Kitty/fzf), opened **one then two unattached native Metal views** on Apple M2 Pro in the same prestarted private service; sources, targets and activities remained zero.
+- Wisp's exec log recorded launch/completion for both calls; Store polling confirmed the Opens. Wisp's launch ACK alone means process start, not a committed Open or rendered view.
+- The test-owned service quit 0, removed its socket and left no test processes or preferences. This validates the installed direct-exec **reuse** path, not offline bare bootstrap, physical Option+Space/N delivery, native menu selection or focus acceptance.
+
+**Earlier smoke provenance only:** `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/wn-rxi8u_vo/evidence.json` recorded PID 37472, instance `37472-1793309709067776000-0`, and installed binary SHA-256 values Wisp `9c5b6147ebfab82f1c2492bb745cc059e1bf2c01ffcaaf569f9ee10a1b9cb416`, Numen `fe62bed17258bda3234d0008394dbd0c90faaada8f4e88a1ec82b551e5cf0df5`. These are not asserted as the final rerun's PID, instance or hashes.
+
+#### Local configuration, backups and remaining manual step
+
+The old Numen catalog entry and local dotfiles were manually migrated; AeroSpace's on-disk Wisp mode has `n`. Kitsune prefix Space explicitly preserves its CLI picker via `wisp menu`, unlike generated Wisp bindings whose Space stays in mode. The offline dotfiles contract test and `aerospace reload-config --dry-run --no-gui` passed.
+
+**Historical status, now superseded:** the migration initially deferred reload because unrelated music-workspace edits would also apply. The main agent subsequently performed the authorized actual AeroSpace reload: Palette key **n** is active, main-mode **alt-c** code-workspace binding is removed, and **alt-shift-c** move-to-code is preserved. Dotfiles `wisp-catalog` tests passed with that contract. **No further AeroSpace reload is needed.** Physical Option+Space → N, Option+C delivery, attachment and focus remain manual. This documentation edit reloads nothing. Rollback text: `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/numen-option-c-aerospace-rollback.txt`; review the whole configuration and release Numen's C registration before restoring the old binding.
+
+Full-text snapshots (not metadata-preserving backups) are `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/wisp-palette-before-{actions,aerospace,kitsune}.toml`, where braces name the three files. Prior installer `.numen-backup` / `.numen-displaced` artifacts remain untouched; do not confuse those with these text snapshots or discard their possible late edits.
+
+**Historical old Summon UI-to-wire evidence only — NOT proof of new native exec.** Private fixture `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/wh-FbeDK3/evidence.json` records the then-installed `~/.local/bin/wisp`: revision `ef423b4c3327a5d90289d6311adcb652e09d6345`, `vcs.modified=true`, **not** checkout HEAD `844cd1af5a51609f2db9d720c02b19cb3718d6c2`. It exercised the old outer CLI palette and real fzf, then a recorded fallback Kitty substitute executing the **original `/bin/sh -lc` wrapper**, real Numen menu and real fzf under a private PTY against a **mock private Numen UDS**. The fixture used checkout `target/debug/numen`, not installed Numen. In current terminology that outer CLI interface is `wisp menu`, not native Palette.
+
+- Cancel exited 0 with discovery only and no mutations. Open and repeat Open each sent exactly `{"version":1,"type":"familiar.open","items":[{"preset":"djinn"}],"service_instance":"fixed"}` with **no target**, reported `Accepted open: fixture-id`, and exited 0.
+- Metadata survived: `WISP_ID=numen`, `WISP_ROLE=summon`, title `wisp:numen: Numen`, layout `floating`. All three stdio streams were TTYs at 100×38; quoted/Unicode argv survived the wrapper.
+- The owned socket was mode 0600 in an owned 0700 parent; it was removed and child processes reaped. No fake fzf, global input, real Kitty/WM, user-app/service controls, preference changes or home catalog writes were used. There was **no graphical rendering**: desktop focus/reuse and actual Wisp palette → Kitty acceptance remain manual.
+
+Historically, Wisp's opt-in `cmd/wisp/numen_integration_test.go` passed with the then-installed Numen for the old no-key Summon argv, temporary install/idempotence and cwd/path handling; the Go suite also passed then. That old expectation is superseded by the current `exec`/`n`/three-argv test above. It skips unless `NUMEN_TEST_BINARY` names an absolute executable; see [Wisp testing](../wisp/README.md#numen-integration-test).
+
+Historical path-guard checks: **415 passed (362 unit + 7 build-fingerprint + 46 CLI)**, one visual-preview test ignored; formatting and strict offline locked all-target Clippy passed with scoped SDK 26.5. Unit tests reject dollar-containing executable/socket paths; CLI coverage verifies rejection before lookup/writes. The `$` guard is retained in the migration. These checks were not rerun by this docs-only edit.
+
+Historically, the path-guard build was installed at `/Users/jdawson/.local/bin/numen` using the scoped SDK 26.5 debug Cargo workflow. Installed preview and the then-current Wisp contract test passed; no running service was restarted. That installation is not evidence that the new migration is installed.
+
+**Historical home observation:** earlier read-only inspection found no Numen entry in `/Users/jdawson/.config/wisp/actions.toml` and changed nothing then. This is superseded by the current manually migrated on-disk entry above, not a statement about current machine state. All older no-home-edit claims below apply only to their original test runs.
+
+### Validation boundaries (historical)
 
 **Final saved-preferences main-agent confirmation:** 367 passed (323 unit + 7 build-fingerprint integration + 37 CLI), one existing visual-preview test ignored; formatting, strict all-target Clippy and offline locked tests/build green with the command-scoped SDK workaround. Five private Apple Metal GUI service cycles (`np-rFEeeD/evidence.json`, read-only `CGWindowBounds`) passed seeded style/native foot restore, durable style edits retaining placement, source-instance restart/explicit Open with no auto-views, durable Forget/current view unchanged, next-restart fallback/no Open write, corrupt-file preservation/runtime edit and full opt-out. Every service quit 0 and removed its socket. See [exact observed values](README.md#saved-preferences-validation-status).
 

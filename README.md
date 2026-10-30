@@ -3,7 +3,7 @@
 ![numen](img/numen.jpg)
 An independent, event-driven familiar that gives visible expression to what your tools are doing.
 
-**Status:** multi-familiar foundation, macOS Go to mouse/Option+M, runtime settings, native macOS familiar click menu, familiar-first fzf menu, opt-in Wisp action installer, menu Open empty-service bootstrap, graceful graphical quit, and read-only `doctor` diagnostics are implemented. Only the Djinn preset is available; targets come from connected protocol sources, including default-on discovery in updated supported Djinn interactive builds, not OS scanning. **USER-REPORTED:** “I verified everything working fine” confirms the current desktop familiar workflow, including relevant click/menu/settings/hotkey use, as working; this is not automated or exhaustive acceptance evidence. Mixed-DPI, Wisp palette/external handoff and other unexercised cases remain unverified. No actual home Wisp catalog was edited. See [Wisp setup and limitations](WISP.md).
+**Status:** multi-familiar foundation, macOS Go to mouse/Option+M and random corners/Option+C, runtime settings, native familiar click menu, advanced fzf menu, opt-in Wisp action installer, bounded empty-service bootstrap, graceful graphical quit and read-only `doctor` are implemented. Only the Djinn preset is available; targets come from connected protocol sources, not OS scanning. Prior USER-REPORTED working click/menu/settings/hotkey use is not exhaustive acceptance or proof of the new Wisp migration. See [Wisp setup, migration status and evidence boundaries](WISP.md).
 
 Numen means divine power or presence: an unseen, animating presence in the machine. The CLI spelling is `numen`; a local Cargo debug installation is supported below. General packaging and autostart remain future work.
 
@@ -11,13 +11,22 @@ Numen means divine power or presence: an unseen, animating presence in the machi
 
 ### Unattached-first workflow (current)
 
+Optional Wisp default: native **Palette** key **n** launches bare Numen via
+`exec`, with no terminal/fzf. `wisp palette` only renders the passive helper;
+Option+Space compositor bindings also enter mode. `wisp menu` is the secondary
+Kitty/fzf interface. See the canonical [Wisp guide](WISP.md) for the strict
+manual legacy migration, confirmed updated installations, 417-test results and
+installed native exec reuse smoke. The authorized AeroSpace reload is now confirmed:
+key **n** is active and main-mode **alt-c** is removed; **alt-shift-c** is preserved.
+No further reload is needed for these edits; physical key delivery/focus remain manual.
+
 Run **`numen`** to open **one unattached familiar**. It reuses the current graphical service or performs bounded detached `run --empty` bootstrap, then sends a `service_instance`-sealed Open after checking `unattached_open`. Repeating `numen` opens independent unattached familiars in the same service, up to **16 total**. `numen run` remains the foreground service with an unattached `main`; `run --empty` starts with zero views.
 
 Click a familiar to **Attach to app / chat** (a supported live protocol app/chat), or choose **Open another familiar** to create another unattached view. No OS process scan, dummy PID/source, application launch or source execution is involved. Production graphical Main and newly opened unbound views **never auto-attach** on registration, state, reconnect or expiry. Existing exact bound pins retain their reconnect/availability behavior. Legacy headless/test constructors alone retain the compatibility first-selection rule.
 
 Default fzf preset **Open** is immediate and unattached, with no target picker. **Open attached…** retains the target picker and restores remembered chat style/position. First manual Attach, like later Attach, preserves the current appearance/location and does **not** load destination preferences. Unattached settings/drags are runtime-only (no logical preference key); new explicit edits after attachment can remember that chat.
 
-**Deployment/evidence boundary:** the unattached-first debug binary is installed at `/Users/jdawson/.local/bin/numen`; installed help and fresh Djinn interoperability passed. Read-only doctor found the existing graphical service reachable with a different, older recorded build; it was left untouched. **One explicit user-chosen Numen restart is required to load the new code, not a Djinn restart.** A service missing `unattached_open` fails with a manual-restart error, never automatic replacement. See [canonical delivery evidence and manual limits](#unattached-first-validation-status).
+**Deployment/evidence boundary:** the latest debug binary is installed at `/Users/jdawson/.local/bin/numen`. The final read-only installed doctor check found the default service **`not_running`** and started nothing: use bare `numen`, then Option+C. The older reachable-service observation belongs to the **historical unattached-first delivery**, not current machine state. If an older service is running later, loading new code requires an explicit user-chosen Numen restart, not a Djinn restart; installation never upgrades it in place. A service missing `unattached_open` fails with a manual-restart error, never automatic replacement. See [current delivery evidence and manual limits](#optionc-validation-and-deployment).
 
 Inspired by the pet feature in the Codex app, but generalized beyond a single application: the companion is its own process. Tools publish semantic activity through the initial local v1 protocol. In the implemented **shared-focused** mode, one visible familiar represents **one selected conversation (activity)**, never an aggregate of every conversation. Background activities remain tracked and queryable but cannot steal its expression or completion cues. The included publisher is an interactive diagnostic, not a stable public SDK or automatic integration.
 
@@ -81,7 +90,7 @@ numen open # Same unattached Open, but requires a RUNNING graphical service
 cargo run --locked -- check-assets
 cargo run --locked -- run
 cargo run --locked -- run --bubble-duration 3 # Timed notifications and reveals
-cargo run --locked -- run --no-hotkey # Neither global key; focused local Option+I/Option+M remain
+cargo run --locked -- run --no-hotkey # All global I/M/C off; focused local I/M/C remain where supported
 cargo run --locked -- run --font-family 'SauceCodePro Nerd Font' --font-size 12
 cargo run --locked -- run --font-file assets/fonts/SourceCodePro-Regular.ttf --font-size 12
 cargo run --locked -- run --sprite-scale 1 # Full-size character; bubble/text unchanged
@@ -224,7 +233,7 @@ Merely entering the menu or discovering sources never spawns a service or writes
 ~/Projects/numen/target/debug/numen wisp-action --install
 ```
 
-The generated **Summon** entry is reached through `wisp palette`; it has **no key** and adds no WM-prefix/static hint binding. It stores absolute executable/socket argv, so Numen need not be on PATH. Installation is opt-in and preserves existing catalog text with two backups on changes; [WISP.md](WISP.md) explains conflict refusal, concurrent-edit preservation and recovery.
+The generated entry is `id=numen`, title **Numen**, `kind=exec`, key **n**, with exactly `[absoluteExecutable, "--socket", absoluteSocket]` and **no `menu`**. Native Palette dispatches bare launch without Kitty/fzf; explicit `numen menu` still requires a TTY and Wisp `run`/`summon`. Installation remains opt-in and strict: no automatic old-entry replacement, and another action whose trimmed, ASCII-case-folded key is `n` rejects before writes even when Numen already matches. See [WISP.md](WISP.md#installer-safety-and-recovery) for manual review, `$` path rejection and two-backup recovery.
 
 Global `--socket PATH` works before or after the subcommand. Default: nonempty `$XDG_RUNTIME_DIR/numen/events.sock`, otherwise the standard temporary directory plus `numen-UID/events.sock`. Paths are limited to 100 bytes. Use a user-owned private parent (0700); the server creates only its leaf directory if its ancestor exists and never chmods an existing directory. The socket is user-owned, mode 0600. See [Protocol](PROTOCOL.md) for safety and lifecycle details.
 
@@ -238,10 +247,10 @@ Global `--socket PATH` works before or after the subcommand. Default: nonempty `
 | `--scale NUMBER` | Finite 0.5–4, default 1.5; scales the whole scene, including bubble and font. Default canvas is 96 × 104 hidden, 384 × 248 revealed. |
 | `--move-speed NUMBER` | Finite 40–2000, default 360 desktop logical points/second; independent of font, sprite and scene scales. |
 | `--sprite-scale NUMBER` | Finite 0.25–2, default 0.5; scales only the native 192 × 208 character, independently of bubble/text. Use 1 for full-size artwork. Canvas height follows the scaled sprite. |
-| `--no-bubble` | Hard privacy disable: ignores every reveal, stays sprite-only and skips fonts/global Option+I; global Option+M remains eligible. Does not redact wire/state metadata. |
+| `--no-bubble` | Hard privacy disable: ignores every reveal, stays sprite-only and skips fonts/global Option+I; global Option+M/Option+C remain eligible. Does not redact wire/state metadata. |
 | `--always-bubble` | Opt-in persistent bubble for debugging/previews; conflicts with `--no-bubble`. |
 | `--bubble-duration SECONDS` | Finite 0.25–30, default 5; lifetime of notifications and explicit reveals. |
-| `--no-hotkey` | Disables both global Option+I and Option+M registrations, not focused local shortcuts or CLI controls. |
+| `--no-hotkey` | Disables all three global Option+I/Option+M/Option+C registrations, not focused local shortcuts or existing CLI controls. |
 | `--font-family NAME` | Explicit installed family, exact Normal weight/style/stretch (Regular); missing/invalid selection errors rather than falling back. Conflicts with `--font-file`. |
 | `--font-file PATH` | Explicit TTF/OTF override; uses face 0 (also index 0 for a TTC collection). Missing/invalid files error rather than falling back. |
 | `--font-size NUMBER` | Finite 8–32, default 12 logical canvas units; scales with `--scale` and display density, independently of `--sprite-scale`. |
@@ -258,9 +267,37 @@ With keyboard focus, **Tab** queues next-conversation for that familiar and resu
 
 The macOS global shortcut uses Carbon registration via `global-hotkey` 0.9, not an EventTap or all-keystroke capture. Registration failure warns but does not stop the app. Another Numen process may own the chord: use `bubbles --socket PATH` to target the desired service. Option+I is reserved while registered and may override a macOS dead-accent shortcut; opt out with `--no-hotkey`. This non-media Carbon key should not require Accessibility permission, but actual background-focus chord acceptance remains pending; no synthetic OS keyboard input was used.
 
-Option+I and Option+M have independent registration guards and press latches: repeats are ignored until that key's matching release. A collision warns and enables that key's local/CLI fallback without disabling the other. Focused local **exact Alt+M** moves only the focused view when global M is unregistered; successful global M suppresses duplicate local delivery, independently of global I. M/navigation requires successful pointer initialization in a live macOS service; it is unavailable in manual/demo, on other platforms or after pointer initialization failure. Callbacks only queue bounded intent; the main GUI loop applies the latest registry and skips closing/failed views. Pause is preserved, so queued movement waits for resume.
+Option+I, Option+M and Option+C have independent registration guards and press latches: repeats are ignored until that key's matching release. A collision warns without disabling the other keys. Focused local **exact Alt+M/Alt+C** moves only the focused view when that global key is unregistered; successful registration suppresses its duplicate local delivery independently of the others. `--no-hotkey` retains focused I/M/C fallbacks where supported. M requires successful pointer initialization in a live macOS service; C does not. Both movement controls are unavailable in manual/demo and on unsupported platforms. Callbacks only queue bounded intent; the main GUI loop applies the latest registry and skips closing/failed views. Pause is preserved, so movement waits for resume.
 
-Both guards share one main-thread Carbon manager and a process-global capture-free dispatcher with two weak targets. Cleanup releases Rust callbacks and warns on unregister failure. Native unregister is best-effort: the public crate can lose its native handle on an OS `UnregisterEventHotKey` error (a pre-existing rare limitation); process exit supplies OS cleanup, not a guarantee of leak-free native failure handling.
+All three guards share one main-thread Carbon manager and a process-global capture-free dispatcher with three weak slots. Cleanup releases Rust callbacks and warns on unregister failure. Native unregister is best-effort: the public crate can lose its native handle on an OS `UnregisterEventHotKey` error (a pre-existing rare limitation); process exit supplies OS cleanup, not a guarantee of leak-free native failure handling.
+
+### Random corners (Option+C)
+
+**Overview:** on a live macOS service, global **exact Option+C** sends every current eligible familiar in that service running to an independently, uniformly chosen corner of its current display. Each view chooses once per dispatched request, not on every tick; choices may coincide. This is not teleportation, cross-process broadcast, ongoing roaming or a source outcome.
+
+**API / Interfaces:** C is hotkey-only: no corner CLI command, wire request or advertised wire capability was added. If global C is absent, focused local exact Option+C targets only that view. `--no-hotkey` disables global I/M/C but retains supported local fallbacks; `--no-bubble` disables I only. C does not depend on `PointerReader`; pointer sampling failure cancels mouse pursuit only. Doctor's additive optional diagnostics-v1 `hotkeys.option_c` reports registration, not delivery; missing older-service status is unknown/not_reported. See [schema and reason gates](PROTOCOL.md#read-only-diagnostics).
+
+**Data Flow:** Carbon callback → shared ordered **32-request** navigation mailbox (targeted/broadcast mouse and broadcast corner requests) → latest registry reconciliation → per-view destination selection → bounded running movement with actual native-position arrival feedback. Overflow drops the oldest request; the latest dispatched applicable M/C intent replaces the previous movement. Zero views is a non-sticky no-op, not an instruction for later Opens.
+
+Placement uses the current display's usable **`NSScreen.visibleFrame`**, full projected sprite dimensions and a stable foot-center, with a **12 desktop-logical-point margin**. If an axis cannot fit the sprite plus margins, that axis uses a centered best fit. Speech bubbles may overflow. C preserves source state, attachment, manual expression selection and pause, and never saves placement/preferences. Arrival restores the saved manual expression or latest live expression, **without M's jump celebration**. Movement clears the old hidden anchor so reveal/run/arrival/bubble expiry cannot snap back.
+
+**Edge Cases:** invalid/unavailable geometry, removed displays, changed work areas or materially changed sprite dimensions cancel rather than rerolling or moving to another display. Unsupported platforms safely decline support; manual/demo C is unsupported. Registration failures remain nonfatal and independent of I/M.
+
+**Example usage:** open two familiars with two bare `numen` launches, then press Option+C in an updated live service: each runs to its own sampled corner. With global registration disabled, focus one view and press Option+C to move only it. Physical key delivery remains a manual check, not evidence established by this example.
+
+**Related files:** [`src/corner.rs`](src/corner.rs), [`src/window.rs`](src/window.rs), [`src/motion.rs`](src/motion.rs), [`src/hotkey.rs`](src/hotkey.rs), [`src/diagnostics.rs`](src/diagnostics.rs), [`src/doctor.rs`](src/doctor.rs), [`src/main.rs`](src/main.rs).
+
+#### Option+C validation and deployment
+
+Supplied final main-agent results: **429 passed (374 unit + 7 build-fingerprint + 48 CLI), one visual test ignored**; formatting, strict all-target Clippy, build and installation passed. Source was unchanged after the documentation edits. The unrelated asynchronous-bootstrap mock's unsafe-socket-publication flake was fixed by bind-staged/chmod/rename **only in the private test fixture**; the full suite then passed. This is not a production security change. Review is READY with prior findings fixed, including hidden-anchor clearing and retained `--no-hotkey` I/M fallback.
+
+The latest build was installed at `~/.local/bin/numen` using the command-scoped SDK 26.5 Cargo install workflow, with recorded fingerprint **`numen-build-v1-fnv1a128:c601503624c55c17edf649246eb4b3a5`**. Fresh installed Djinn interoperability passed **1 test / 46 assertions**; installed Wisp opt-in integration passed **1 test**. Final installed doctor found the default service **`not_running`**, starting nothing. The user can run **`numen`, then Option+C**; no restart is currently required by that observation. If an older service exists later, an explicit user-chosen Numen restart is needed because installation does not upgrade it in place; no Djinn restart is needed. No user Numen controls were used.
+
+**Installed private shortcut registration PASSED:** `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/cr-7sscibmv/evidence.json` records two successive native service cycles using the actual installed binary with `run --empty --no-preferences --no-bubble --exit-after 10`. Both reported **C and M `registered` / null reason**, I `disabled` / `no_bubble`, preferences `disabled` / `not_loaded` / null path, **zero views and sources**, and matching client/service recorded builds. Each quit with exit 0 and removed its socket. The second C registration confirms normal release/reacquisition, not rare unregister-failure handling. This verifies installed native registration/normal cleanup only: **no actual key delivery, global input or user Numen controls** occurred.
+
+External native smoke evidence: `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/numen-corner-native-smoke/results.json` and sibling `run-retina.log`. The harness exercised production window code with two Metal test views on **2× Retina**, a **144×156-point sprite**, no PointerReader, four deterministic foot destinations **(84,168), (1836,168), (84,1068), (1836,1068)** and two random broadcasts through the navigation mailbox. Actual native feedback confirmed arrival and the 12-point margin; reveal during running → arrival → **450 ms** bubble expiry showed no snapback. All views closed and the process exited. The harness used a **separate offline lockfile with transitive dependency differences**, not an identical production build. It used no services, sockets, preferences, hotkey registration, global input or focus requests.
+
+Physical Option+C/background delivery, different-DPI displays and Dock/work-area hotplug behavior remain manual. The authorized AeroSpace reload is confirmed active with main-mode `alt-c = workspace [c]ode` removed and `alt-shift-c` unchanged; dotfiles `wisp-catalog` tests passed. No further AeroSpace reload is needed. Reviewed rollback instructions are in `/var/folders/4x/vb2wqbds6_x1sh38zt3l17vc0000gq/T/opencode/numen-option-c-aerospace-rollback.txt`. This documentation edit runs no commands, changes no code/user configuration, installs nothing and controls no services.
 
 `bubbles` sends v1 `companion.reveal` without producer registration and prints status from the ACK. Acceptance does not guarantee a displayed frame (notably with `--no-bubble`). It changes neither selection nor producer state/liveness and never requests focus. Headless `listen` rejects it with `no graphical familiar`.
 
@@ -288,7 +325,7 @@ Retargeting preserves the existing view's appearance, location, pause, Preview/m
 
 The current wiring is complete: the App has one service/control lifetime, compares the applied attachment binding against the memo, and the worker guards service instance authoritatively. No root GUI snapshot service-stamp rewrite or remaining integration workaround is needed.
 
-**Historical picker delivery:** the earlier installation/interop report observed the default service as `not_running`; that is not the current result. See [current unattached-first installation, reachable-service diagnostics and fresh interop evidence](#unattached-first-validation-status). Physical **NativeChoiceSelected** remains manual, not established by the older USER-REPORTED workflow.
+**Historical picker delivery:** the earlier installation/interop report observed the default service as `not_running`; a later unattached-first phase observed an older reachable service. Neither is a permanent machine-state claim. See [final installed checks and current default-service observation](#optionc-validation-and-deployment). Physical **NativeChoiceSelected** remains manual, not established by the older USER-REPORTED workflow.
 
 See [internal interfaces/data flow](PROTOCOL.md#native-chat-picker-internal-interface) and [memo/commit boundaries](ARCHITECTURE.md#native-chat-picker-snapshot-and-commit).
 
@@ -428,9 +465,17 @@ Graphical startup validates the embedded `assets/djinn/` PNG/manifest through th
 
 ## Validation
 
+Final Palette/direct-exec checks, confirmed installations and the installed
+native **reuse** smoke are recorded once in [WISP.md](WISP.md#wisp-integration-validation),
+alongside the confirmed authorized AeroSpace reload and remaining physical-input/focus requirements.
+The installation and no-home-edit observations below are **historical feature
+evidence**, not the current migration record or claims that the manually migrated
+catalog is still untouched. Historical “Wisp palette → Kitty” means the old CLI interface (now
+`wisp menu`), not the native passive Palette or new default exec handoff.
+
 ### Unattached-first validation status
 
-**Delivery confirmed:** the unattached-first debug installation succeeded with:
+**Historical unattached-first delivery:** the debug installation at that phase succeeded with the following command. Its older reachable-service observation and fingerprints below are historical; see [final corner installation, registration smoke and default-service status](#optionc-validation-and-deployment) for current evidence.
 
 ```sh
 SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk cargo install --path . --debug --locked --offline --root /Users/jdawson/.local --force
@@ -443,7 +488,7 @@ SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk cargo install --
 - Fresh installed-binary interop from Djinn's `packages/opencode`: `NUMEN_TEST_BINARY=/Users/jdawson/.local/bin/numen bun test test/numen/interoperability.test.ts --timeout 30000` → **1 pass, 0 fail, 46 assertions**.
 - Fresh delivery checks: `git diff --check` and `cargo fmt --all -- --check` passed. These are supplied delivery results, not commands rerun by this documentation edit.
 
-No startup, restart, window or user-preference changes occurred during final delivery verification. **One explicit user-chosen Numen restart is required to load the installed code into the older service; no Djinn restart is needed.** Physical native menu-item selection and Wisp palette → Kitty handoff remain manual. Earlier `not_running` observations below are historical, not the latest service result.
+No startup, restart, window or user-preference changes occurred during that historical delivery verification. At that phase, an explicit user-chosen Numen restart would have been needed to update the older service; no Djinn restart was needed. The final installed doctor now reports `not_running`, so no restart is currently required: use bare `numen`. Physical native menu-item selection and Wisp palette → Kitty handoff remain manual. All earlier service observations retain their original time scope.
 
 **Previously confirmed main-agent results (not freshly rerun): 413 passed — 361 unit + 7 build-fingerprint + 45 CLI; one existing visual-preview test ignored.** Prior strict all-target Clippy, offline locked tests/build and native smoke evidence retain their recorded scope. Earlier feature totals/installations below remain historical. This edit changes documentation only; it performs no installation, service controls, Rust edits or commits.
 

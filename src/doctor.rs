@@ -125,7 +125,11 @@ fn parse_service(mut data: Value) -> Result<(Service, ServiceState)> {
             && snapshot
                 .hotkeys
                 .option_m
-                .valid_for(crate::hotkey::Shortcut::GoToMouse),
+                .valid_for(crate::hotkey::Shortcut::GoToMouse)
+            && snapshot
+                .hotkeys
+                .option_c
+                .is_none_or(|status| status.valid_for(crate::hotkey::Shortcut::GoToCorner)),
         "invalid service shortcut metadata"
     );
     ensure!(
@@ -222,9 +226,14 @@ pub fn run(path: &Path, json: bool) -> Result<()> {
                 snapshot.build.source_fingerprint
             );
             for (chord, status) in [
-                ("Option+I", snapshot.hotkeys.option_i),
-                ("Option+M", snapshot.hotkeys.option_m),
+                ("Option+I", Some(snapshot.hotkeys.option_i)),
+                ("Option+M", Some(snapshot.hotkeys.option_m)),
+                ("Option+C", snapshot.hotkeys.option_c),
             ] {
+                let Some(status) = status else {
+                    println!("  {chord}: unknown (reason: not_reported)");
+                    continue;
+                };
                 println!(
                     "  {chord}: {} (reason: {})",
                     label(&status.state),
@@ -263,6 +272,7 @@ pub fn run(path: &Path, json: bool) -> Result<()> {
             println!("  Path/build: unknown");
             println!("  Option+I: unknown (reason: not_reported)");
             println!("  Option+M: unknown (reason: not_reported)");
+            println!("  Option+C: unknown (reason: not_reported)");
             println!("  Preferences: unknown (reason: not_reported)");
         }
         println!("  Navigation: {}", service.navigation);
@@ -291,6 +301,7 @@ pub fn run(path: &Path, json: bool) -> Result<()> {
         println!("  PID/path/build: unknown");
         println!("  Option+I: unknown (reason: not_reported)");
         println!("  Option+M: unknown (reason: not_reported)");
+        println!("  Option+C: unknown (reason: not_reported)");
         println!("  Preferences: unknown (reason: not_reported)");
         println!("  Navigation/settings: unknown");
         println!("  Familiars/sources: unknown");

@@ -41,6 +41,9 @@ use crate::visibility::BubbleVisibility;
 
 const DEMO_INTERVAL: Duration = Duration::from_secs(3);
 
+#[path = "corner.rs"]
+mod corner;
+
 #[derive(Default)]
 struct ClickGesture {
     cursor: Option<PhysicalPosition<f64>>,
@@ -277,7 +280,7 @@ impl RevealNotifier {
 
 #[derive(Clone)]
 struct NavigationNotifier {
-    pending: Arc<RevealMailbox>,
+    pending: Arc<NavigationMailbox>,
     proxy: EventLoopProxy<AppEvent>,
 }
 
@@ -286,6 +289,43 @@ impl NavigationNotifier {
         if self.pending.post(targets) && self.proxy.send_event(AppEvent::GoToMouse).is_err() {
             self.pending.take();
         }
+    }
+
+    fn corner(&self) {
+        if self.pending.post_corner() && self.proxy.send_event(AppEvent::GoToMouse).is_err() {
+            self.pending.take();
+        }
+    }
+}
+
+#[derive(Default)]
+struct NavigationMailbox(Mutex<VecDeque<(bool, Option<Vec<String>>)>>);
+
+impl NavigationMailbox {
+    fn post(&self, targets: Option<Vec<String>>) -> bool {
+        self.push(false, targets)
+    }
+
+    fn post_corner(&self) -> bool {
+        self.push(true, None)
+    }
+
+    fn push(&self, corner: bool, targets: Option<Vec<String>>) -> bool {
+        let mut pending = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let wake = pending.is_empty();
+        if pending.len() == 32 {
+            pending.pop_front();
+        }
+        let targets = targets.map(|mut ids| {
+            ids.truncate(16);
+            ids
+        });
+        pending.push_back((corner, targets));
+        wake
+    }
+
+    fn take(&self) -> VecDeque<(bool, Option<Vec<String>>)> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -296,8 +336,8 @@ fn register_shortcuts<T>(
     platform_supported: bool,
     reporter: Option<&RuntimeDiagnostics>,
     mut register: impl FnMut(Shortcut) -> Result<T>,
-) -> [Option<T>; 2] {
-    let shortcuts = [Shortcut::Reveal, Shortcut::GoToMouse];
+) -> [Option<T>; 3] {
+    let shortcuts = [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner];
     let statuses = shortcuts.map(|shortcut| {
         let (state, reason) = if options.no_hotkey {
             (ShortcutState::Disabled, ShortcutReason::NoHotkey)
@@ -308,6 +348,8 @@ fn register_shortcuts<T>(
                 ShortcutState::Unsupported,
                 ShortcutReason::UnsupportedPlatform,
             )
+        } else if shortcut == Shortcut::GoToCorner && (options.manual || options.demo || !live) {
+            (ShortcutState::Unsupported, ShortcutReason::UnsupportedMode)
         } else if shortcut == Shortcut::GoToMouse && !pointer_available {
             if options.manual || options.demo || !live {
                 (ShortcutState::Unsupported, ShortcutReason::UnsupportedMode)
@@ -332,11 +374,12 @@ fn register_shortcuts<T>(
         }
         status
     });
-    // Publish both gates before entering OS registration, without retaining a lock.
+    // Publish all gates before entering OS registration, without retaining a lock.
     shortcuts.map(|shortcut| {
         let index = match shortcut {
             Shortcut::Reveal => 0,
             Shortcut::GoToMouse => 1,
+            Shortcut::GoToCorner => 2,
         };
         if statuses[index].reason != Some(ShortcutReason::RegistrationPending) {
             return None;
@@ -449,7 +492,7 @@ pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Re
     if app.live && pointer::supported() {
         match PointerReader::new() {
             Ok(reader) => app.pointer = Some(reader),
-            Err(error) => warn!(%error, "Live pointer unavailable; navigation disabled"),
+            Err(error) => warn!(%error, "Live pointer unavailable; mouse navigation disabled"),
         }
     }
     let mailbox = app.mailbox.clone();
@@ -527,11 +570,13 @@ pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Re
             GlobalHotkey::register(shortcut, move || match shortcut {
                 Shortcut::Reveal => reveal.request(None),
                 Shortcut::GoToMouse => navigation.request(None),
+                Shortcut::GoToCorner => navigation.corner(),
             })
         },
     );
     app.global_hotkey_registered = hotkeys[0].is_some();
     app.global_navigation_registered = hotkeys[1].is_some();
+    app.global_corner_registered = hotkeys[2].is_some();
     let result = event_loop.run_app(&mut app);
     drop(hotkeys);
     drop(server);
@@ -545,6 +590,12 @@ pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Re
 
 enum Navigation {
     Seeking(Navigator),
+    Corner {
+        navigator: Navigator,
+        display: corner::DisplayArea,
+        target: Point,
+        size: Point,
+    },
     Celebrating,
 }
 
@@ -599,8 +650,11 @@ struct FamiliarView {
     hidden_position: Option<PhysicalPosition<i32>>,
     global_hotkey_registered: bool,
     global_navigation_registered: bool,
+    global_corner_registered: bool,
+    corner_available: bool,
     navigation_available: bool,
     navigation: Option<Navigation>,
+    corner_return: Option<Animation>,
     motion_clock: MotionClock,
     native_motion: NativeMotion,
     raster: Option<CachedRaster>,
@@ -937,8 +991,11 @@ impl FamiliarView {
             hidden_position: None,
             global_hotkey_registered: false,
             global_navigation_registered: false,
+            global_corner_registered: false,
+            corner_available: false,
             navigation_available: false,
             navigation: None,
+            corner_return: None,
             motion_clock: MotionClock::default(),
             native_motion: NativeMotion::default(),
             raster: None,
@@ -1077,6 +1134,7 @@ impl FamiliarView {
             character = DEFAULT_CHARACTER_ID,
             animation = self.player.animation().label(),
             navigation_shortcut = self.navigation_available.then_some("Option+M/go to mouse"),
+            corner_shortcut = self.corner_available.then_some("Option+C/random corner"),
             "{DEFAULT_CHARACTER_NAME} ready; click/menu (macOS), drag/move, Option+I/bubbles, Tab/next conversation, 1–9/manual, L/live, Space/pause, Esc/Q/Close familiar"
         );
         Ok(())
@@ -1193,6 +1251,14 @@ impl FamiliarView {
         false
     }
 
+    fn local_corner(&self, code: KeyCode, focused: bool) -> bool {
+        focused
+            && self.corner_available
+            && !self.global_corner_registered
+            && code == KeyCode::KeyC
+            && self.modifiers == ModifiersState::ALT
+    }
+
     fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
         self.last_tick = Instant::now();
@@ -1294,6 +1360,7 @@ impl FamiliarView {
             return;
         }
         self.cancel_restore_for_user_intent();
+        self.corner_return = None;
         let base = self.display.resume();
         self.select(base);
         self.navigation = Some(Navigation::Seeking(Navigator::new(
@@ -1309,13 +1376,21 @@ impl FamiliarView {
     }
 
     fn seeking(&self) -> bool {
-        matches!(self.navigation, Some(Navigation::Seeking(_)))
-            && !self.close_requested
+        matches!(
+            self.navigation,
+            Some(Navigation::Seeking(_) | Navigation::Corner { .. })
+        ) && !self.close_requested
             && self.error.is_none()
     }
 
+    fn mouse_seeking(&self) -> bool {
+        self.seeking() && matches!(self.navigation, Some(Navigation::Seeking(_)))
+    }
+
     fn resume_navigation(&mut self, now: Instant) {
-        if let Some(Navigation::Seeking(navigator)) = &mut self.navigation {
+        if let Some(Navigation::Seeking(navigator) | Navigation::Corner { navigator, .. }) =
+            &mut self.navigation
+        {
             navigator.resume(now);
             self.motion_clock.reset(now);
             self.native_motion = NativeMotion::default();
@@ -1325,17 +1400,22 @@ impl FamiliarView {
     fn cancel_navigation(&mut self, reason: &str) {
         if self.navigation.take().is_some() {
             self.motion_clock.clear();
-            let base = self.display.resume();
+            let base = self
+                .corner_return
+                .take()
+                .unwrap_or_else(|| self.display.resume());
             self.select(base);
-            info!(familiar = %self.id, reason, "Pointer pursuit cancelled");
+            info!(familiar = %self.id, reason, "Navigation stopped");
         }
     }
 
     fn source_animation(&mut self, view: Presentation) {
-        if let Some(animation) = self.display.update(view)
-            && self.navigation.is_none()
-        {
-            self.select(animation);
+        if let Some(animation) = self.display.update(view) {
+            if self.corner_return.is_some() {
+                self.corner_return = Some(animation);
+            } else if self.navigation.is_none() {
+                self.select(animation);
+            }
         }
     }
 
@@ -1365,8 +1445,16 @@ impl FamiliarView {
             return None;
         }
         match step {
-            PursuitStep::Move { delta, .. } => Some(delta),
+            PursuitStep::Move { delta, .. } => {
+                // Navigation owns the live foot now, not a pre-bubble anchor.
+                self.hidden_position = None;
+                Some(delta)
+            }
             PursuitStep::Arrived => {
+                if matches!(self.navigation, Some(Navigation::Corner { .. })) {
+                    self.cancel_navigation("corner arrived");
+                    return None;
+                }
                 self.navigation = Some(Navigation::Celebrating);
                 self.motion_clock.clear();
                 self.select(Animation::Succeeded);
@@ -1374,7 +1462,7 @@ impl FamiliarView {
                 None
             }
             PursuitStep::Blocked(reason) => {
-                warn!(familiar = %self.id, reason, "Pointer pursuit blocked");
+                warn!(familiar = %self.id, reason, "Navigation blocked");
                 self.cancel_navigation(reason);
                 None
             }
@@ -1388,7 +1476,7 @@ impl FamiliarView {
         };
         if self.player.animation() != animation {
             self.select(animation);
-            info!(familiar = %self.id, ?facing, "Pointer pursuit direction changed");
+            info!(familiar = %self.id, ?facing, "Navigation direction changed");
         } else {
             self.advance_animation(elapsed);
         }
@@ -1496,7 +1584,6 @@ impl FamiliarView {
             elapsed,
         );
         if let Some(delta) = self.apply_pursuit_step(step) {
-            self.hidden_position = None;
             let target = self.native_motion.request(
                 Point {
                     x: origin.x,
@@ -1507,6 +1594,158 @@ impl FamiliarView {
             );
             if target.x != origin.x || target.y != origin.y {
                 window.set_outer_position(LogicalPosition::new(target.x, target.y));
+            }
+        }
+    }
+
+    fn start_corner(
+        &mut self,
+        now: Instant,
+        display: corner::DisplayArea,
+        target: Point,
+        size: Point,
+    ) {
+        if self.close_requested || self.error.is_some() {
+            return;
+        }
+        // Unlike M, C does not change manual/live source selection or attachment.
+        self.cancel_restore_for_user_intent();
+        if self.corner_return.is_none() {
+            self.corner_return = Some(if self.navigation.is_some() && !self.display.is_manual() {
+                self.display.resume()
+            } else {
+                self.player.animation()
+            });
+        }
+        self.navigation = Some(Navigation::Corner {
+            navigator: Navigator::new(self.options.move_speed, now),
+            display,
+            target,
+            size,
+        });
+        self.hidden_position = None;
+        self.motion_clock.reset(now);
+        self.native_motion = NativeMotion::default();
+        self.last_tick = now;
+    }
+
+    fn request_corner(&mut self, now: Instant) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(display) = window.current_monitor().as_ref().and_then(corner::display) else {
+            self.cancel_navigation("current display unavailable");
+            return;
+        };
+        let size = window.inner_size();
+        let backing = window.scale_factor();
+        if !backing.is_finite() || backing <= 0.0 || size.width == 0 || size.height == 0 {
+            self.cancel_navigation("invalid corner geometry");
+            return;
+        }
+        let (x0, y0, x1, y1) = bubble::SpriteProjection::new(
+            (size.width, size.height),
+            self.bubble_visible,
+            self.options.sprite_scale,
+        )
+        .bounds;
+        let Some(target) = corner::Corner::random().target(
+            display.work,
+            (x1 - x0) as f64 / backing,
+            (y1 - y0) as f64 / backing,
+        ) else {
+            self.cancel_navigation("invalid corner geometry");
+            return;
+        };
+        self.start_corner(
+            now,
+            display,
+            target,
+            Point {
+                x: (x1 - x0) as f64 / backing,
+                y: (y1 - y0) as f64 / backing,
+            },
+        );
+    }
+
+    fn pursue_corner(&mut self, now: Instant, elapsed: Duration) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(Navigation::Corner {
+            display,
+            target,
+            size: sprite_size,
+            ..
+        }) = &self.navigation
+        else {
+            return;
+        };
+        let display = *display;
+        let target = *target;
+        let sprite_size = *sprite_size;
+        // Keep the original monitor, even if the moving window crosses an edge.
+        let current = window
+            .available_monitors()
+            .filter_map(|m| corner::display(&m))
+            .find(|d| d.id == display.id);
+        if current != Some(display) {
+            self.cancel_navigation("corner display removed or work area changed");
+            return;
+        }
+        let backing = window.scale_factor();
+        let size = window.inner_size();
+        let (x0, y0, x1, y1) = bubble::SpriteProjection::new(
+            (size.width, size.height),
+            self.bubble_visible,
+            self.options.sprite_scale,
+        )
+        .bounds;
+        // A scale/layout change must not make a previously safe destination clip
+        // a larger frame. Cancel, rather than silently choose another corner.
+        if !backing.is_finite()
+            || backing <= 0.0
+            || ((x1 - x0) as f64 / backing - sprite_size.x).abs() > 1.0 / backing
+            || ((y1 - y0) as f64 / backing - sprite_size.y).abs() > 1.0 / backing
+        {
+            self.cancel_navigation("corner sprite dimensions changed");
+            return;
+        }
+        let geometry = window.outer_position().ok().and_then(|position| {
+            let position = position.to_logical::<f64>(backing);
+            let origin = Point {
+                x: position.x,
+                y: position.y,
+            };
+            let foot = foot_offset(
+                (size.width, size.height),
+                backing,
+                self.bubble_visible,
+                self.options.sprite_scale,
+            )?;
+            Some((
+                origin,
+                Point {
+                    x: origin.x + foot.x,
+                    y: origin.y + foot.y,
+                },
+            ))
+        });
+        let Some((origin, foot)) = geometry else {
+            self.cancel_navigation("corner position unavailable");
+            return;
+        };
+        let Some(Navigation::Corner { navigator, .. }) = &mut self.navigation else {
+            return;
+        };
+        let step = navigator.step_fixed(now, foot, target, backing);
+        if let PursuitStep::Move { facing, .. } = step {
+            self.prepare_running_pose(facing, elapsed);
+        }
+        if let Some(delta) = self.apply_pursuit_step(step) {
+            let position = self.native_motion.request(origin, delta, backing);
+            if position != origin {
+                window.set_outer_position(LogicalPosition::new(position.x, position.y));
             }
         }
     }
@@ -1862,6 +2101,7 @@ impl FamiliarView {
         event_loop: &ActiveEventLoop,
         now: Instant,
         cursor: Option<Point>,
+        motion_due: bool,
     ) -> Option<Instant> {
         if context_menu::supported() && self.gesture.held {
             // AppKit can finish dragging without delivering a winit release.
@@ -1897,10 +2137,16 @@ impl FamiliarView {
                     // reaching this handler first. Discard its suspended time.
                     self.resume_navigation(now);
                 }
-                if let Some(cursor) = cursor
+                if motion_due
+                    && (cursor.is_some()
+                        || matches!(self.navigation, Some(Navigation::Corner { .. })))
                     && let Some(motion_elapsed) = self.motion_clock.take(now)
                 {
-                    self.pursue(now, cursor, motion_elapsed);
+                    if matches!(self.navigation, Some(Navigation::Corner { .. })) {
+                        self.pursue_corner(now, motion_elapsed);
+                    } else if let Some(cursor) = cursor {
+                        self.pursue(now, cursor, motion_elapsed);
+                    }
                     if let Some(window) = &self.window {
                         // Moving an unchanged local image does not dirty its pixels.
                         if self.scene_dirty {
@@ -1910,7 +2156,9 @@ impl FamiliarView {
                 }
             } else {
                 self.motion_clock.clear();
-                if let Some(Navigation::Seeking(navigator)) = &mut self.navigation {
+                if let Some(Navigation::Seeking(navigator) | Navigation::Corner { navigator, .. }) =
+                    &mut self.navigation
+                {
                     navigator.resume(now);
                 }
             }
@@ -1947,7 +2195,7 @@ struct App {
     options: RunOptions,
     mailbox: Arc<Mailbox<Vec<FamiliarPresentation>>>,
     reveal_pending: Arc<RevealMailbox>,
-    navigation_pending: Arc<RevealMailbox>,
+    navigation_pending: Arc<NavigationMailbox>,
     pointer: Option<PointerReader>,
     motion_clock: MotionClock,
     control: Option<FamiliarControl>,
@@ -1957,6 +2205,7 @@ struct App {
     initial_snapshot: bool,
     global_hotkey_registered: bool,
     global_navigation_registered: bool,
+    global_corner_registered: bool,
     exit_at: Option<Instant>,
     error: Option<anyhow::Error>,
     // Failed native views stay suppressed until the registry acknowledges removal.
@@ -1975,7 +2224,7 @@ impl App {
             options,
             mailbox: Arc::new(Mailbox::default()),
             reveal_pending: Arc::new(RevealMailbox::default()),
-            navigation_pending: Arc::new(RevealMailbox::default()),
+            navigation_pending: Arc::new(NavigationMailbox::default()),
             pointer: None,
             motion_clock: MotionClock::default(),
             control: None,
@@ -1985,6 +2234,7 @@ impl App {
             initial_snapshot: true,
             global_hotkey_registered: false,
             global_navigation_registered: false,
+            global_corner_registered: false,
             exit_at: None,
             error: None,
             failed: BTreeSet::new(),
@@ -2054,6 +2304,11 @@ impl App {
                 view.focus_control = self.control.clone();
                 view.global_hotkey_registered = self.global_hotkey_registered;
                 view.global_navigation_registered = self.global_navigation_registered;
+                view.global_corner_registered = self.global_corner_registered;
+                view.corner_available = self.live
+                    && !self.options.manual
+                    && !self.options.demo
+                    && cfg!(target_os = "macos");
                 view.navigation_available = self.pointer.is_some();
                 self.views.insert(id.clone(), view);
             }
@@ -2192,16 +2447,28 @@ impl App {
     }
 
     fn apply_navigation(&mut self) {
+        self.apply_navigation_with(|view, now| view.request_corner(now));
+    }
+
+    fn apply_navigation_with(&mut self, mut start_corner: impl FnMut(&mut FamiliarView, Instant)) {
         // Resolve broadcasts here, after the newest registry snapshot, not in callbacks.
-        let targets = reveal_targets(self.navigation_pending.take(), self.views.keys().cloned());
         let now = Instant::now();
-        for id in targets {
-            if !self.pending_close.contains(&id)
-                && !self.submitted_close.contains(&id)
-                && !self.failed.contains(&id)
-                && let Some(view) = self.views.get_mut(&id)
-            {
-                view.start_navigation(now);
+        for (corner, request) in self.navigation_pending.take() {
+            let targets = reveal_targets(VecDeque::from([request]), self.views.keys().cloned());
+            for id in targets {
+                if !self.pending_close.contains(&id)
+                    && !self.submitted_close.contains(&id)
+                    && !self.failed.contains(&id)
+                    && let Some(view) = self.views.get_mut(&id)
+                {
+                    if corner {
+                        if view.corner_available {
+                            start_corner(view, now);
+                        }
+                    } else {
+                        view.start_navigation(now);
+                    }
+                }
             }
         }
     }
@@ -2358,7 +2625,8 @@ impl App {
         match action {
             Action::RevealStatus if !view.options.no_bubble => view.reveal_bubbles(event_loop),
             Action::GoToMouse if view.navigation_available && self.pointer.is_some() => {
-                view.start_navigation(Instant::now())
+                self.navigation_pending.post(Some(vec![id.to_owned()]));
+                self.apply_navigation();
             }
             Action::SetPaused(paused) => view.set_paused(paused),
             Action::Attach(index) => {
@@ -2505,6 +2773,53 @@ impl ApplicationHandler<AppEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // A local fallback participates in the same ordered mailbox as globals.
+        // Reconcile first so broadcasts include the newest service registry.
+        if let Some(snapshot) = self.mailbox.take() {
+            self.reconcile(event_loop, snapshot);
+        }
+        let local_corner = matches!(&event, WindowEvent::KeyboardInput { event, .. }
+            if event.state == ElementState::Pressed && !event.repeat
+                && event.physical_key == PhysicalKey::Code(KeyCode::KeyC))
+            && self.views.values().any(|view| {
+                view.local_corner(
+                    KeyCode::KeyC,
+                    view.window
+                        .as_ref()
+                        .is_some_and(|w| w.id() == window_id && w.has_focus()),
+                )
+            });
+        if local_corner {
+            self.navigation_pending.post_corner();
+        }
+        let local_mouse = if matches!(&event, WindowEvent::KeyboardInput { event, .. }
+            if event.state == ElementState::Pressed && !event.repeat
+                && event.physical_key == PhysicalKey::Code(KeyCode::KeyM))
+        {
+            self.views
+                .values()
+                .find(|view| {
+                    view.window
+                        .as_ref()
+                        .is_some_and(|w| w.id() == window_id && w.has_focus())
+                        && local_navigation_shortcut(
+                            KeyCode::KeyM,
+                            view.modifiers,
+                            view.global_navigation_registered,
+                            view.navigation_available,
+                        )
+                })
+                .map(|view| view.id.clone())
+        } else {
+            None
+        };
+        if let Some(id) = &local_mouse {
+            self.navigation_pending.post(Some(vec![id.clone()]));
+        }
+        self.apply_navigation();
+        if local_corner || local_mouse.is_some() {
+            return;
+        }
         let request = self
             .views
             .values_mut()
@@ -2528,11 +2843,16 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
         let mut wake_at = self.exit_at;
-        let needs_pointer = self.views.values().any(FamiliarView::motion_eligible);
-        if !needs_pointer {
+        let needs_motion = self.views.values().any(FamiliarView::motion_eligible);
+        let needs_pointer = self
+            .views
+            .values()
+            .any(|v| v.motion_eligible() && v.mouse_seeking());
+        if !needs_motion {
             self.motion_clock.clear();
         }
-        let cursor = if needs_pointer && self.motion_clock.take(now).is_some() {
+        let motion_due = needs_motion && self.motion_clock.take(now).is_some();
+        let cursor = if needs_pointer && motion_due {
             match self
                 .pointer
                 .as_ref()
@@ -2541,7 +2861,7 @@ impl ApplicationHandler<AppEvent> for App {
             {
                 Ok(point) => Some(point),
                 Err(error) => {
-                    for view in self.views.values_mut().filter(|view| view.seeking()) {
+                    for view in self.views.values_mut().filter(|view| view.mouse_seeking()) {
                         warn!(familiar = %view.id, %error, "Pointer pursuit query failed");
                         view.cancel_navigation("pointer unavailable");
                     }
@@ -2552,7 +2872,7 @@ impl ApplicationHandler<AppEvent> for App {
             None
         };
         for view in self.views.values_mut() {
-            if let Some(deadline) = view.tick(event_loop, now, cursor) {
+            if let Some(deadline) = view.tick(event_loop, now, cursor, motion_due) {
                 wake_at = Some(wake_at.map_or(deadline, |wake| wake.min(deadline)));
             }
         }
@@ -4908,9 +5228,314 @@ mod tests {
         options
     }
 
+    fn injected_corner(view: &mut FamiliarView, now: Instant) {
+        let area = corner::Area {
+            x: -1000.0,
+            y: -500.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let corner = if view.id == "first" {
+            corner::Corner::TopLeft
+        } else {
+            corner::Corner::BottomRight
+        };
+        view.start_corner(
+            now,
+            corner::DisplayArea {
+                id: 42,
+                frame: area,
+                work: area,
+            },
+            corner.target(area, 100.0, 100.0).unwrap(),
+            Point { x: 100.0, y: 100.0 },
+        );
+    }
+
+    #[test]
+    fn corner_broadcast_resolves_latest_views_independently_and_empty_is_not_sticky() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        app.stage_snapshot(vec![familiar("removed")]);
+        app.navigation_pending.post_corner();
+        app.stage_snapshot(vec![
+            familiar("first"),
+            familiar("second"),
+            familiar("closing"),
+        ]);
+        app.views.get_mut("closing").unwrap().close_requested = true;
+        app.views.get_mut("first").unwrap().paused = true;
+        app.apply_navigation_with(injected_corner);
+        assert!(app.pointer.is_none());
+        assert!(!app.views.contains_key("removed"));
+        let first = &app.views["first"];
+        let second = &app.views["second"];
+        assert!(first.paused);
+        assert!(!first.mouse_seeking());
+        let Some(Navigation::Corner { target: a, .. }) = first.navigation else {
+            panic!()
+        };
+        let Some(Navigation::Corner { target: b, .. }) = second.navigation else {
+            panic!()
+        };
+        assert_ne!(a, b);
+        assert!(app.views["closing"].navigation.is_none());
+        app.stage_snapshot(vec![]);
+        app.navigation_pending.post_corner();
+        app.apply_navigation_with(injected_corner);
+        app.stage_snapshot(vec![familiar("later")]);
+        app.apply_navigation_with(injected_corner);
+        assert!(app.views["later"].navigation.is_none());
+        app.navigation_pending.post_corner();
+        app.apply_navigation_with(injected_corner);
+        assert!(app.views["later"].seeking());
+    }
+
+    #[test]
+    fn mouse_corner_replacement_is_ordered_and_pointer_failure_only_cancels_mouse() {
+        for corner_last in [false, true] {
+            let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+            app.stage_snapshot(vec![familiar("first"), familiar("second")]);
+            if corner_last {
+                app.navigation_pending.post(None);
+                app.navigation_pending.post_corner();
+            } else {
+                app.navigation_pending.post_corner();
+                app.navigation_pending.post(Some(vec!["first".into()]));
+            }
+            app.apply_navigation_with(injected_corner);
+            assert_eq!(app.views["first"].mouse_seeking(), !corner_last);
+            assert!(!app.views["second"].mouse_seeking());
+            for view in app.views.values_mut().filter(|v| v.mouse_seeking()) {
+                view.cancel_navigation("injected pointer failure");
+            }
+            assert!(app.views["second"].seeking());
+            assert_eq!(app.views["first"].seeking(), corner_last);
+            let view = app.views.get_mut("second").unwrap();
+            let Some(Navigation::Corner {
+                navigator, target, ..
+            }) = &mut view.navigation
+            else {
+                panic!()
+            };
+            let step = navigator.step_fixed(
+                Instant::now() + FRAME_INTERVAL,
+                Point::default(),
+                *target,
+                1.5,
+            );
+            let delta = view.apply_pursuit_step(step).unwrap();
+            assert!(delta.x.hypot(delta.y) > 0.0);
+        }
+    }
+
+    #[test]
+    fn corners_preserve_manual_pause_source_preferences_and_restore_latest_live_source() {
+        for manual in [false, true] {
+            let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+            let mut snapshot = familiar("first");
+            snapshot.preference = Some(preference(3));
+            app.stage_snapshot(vec![snapshot]);
+            let view = app.views.get_mut("first").unwrap();
+            view.paused = true;
+            if manual {
+                view.display.manual(Animation::Waving);
+                view.select(Animation::Waving);
+            }
+            let binding = view.runtime_binding.clone();
+            let pref = view.preference.clone();
+            injected_corner(view, Instant::now());
+            view.prepare_running_pose(Facing::Left, Duration::ZERO);
+            injected_corner(view, Instant::now());
+            view.source_animation(source(crate::protocol::ActivityState::Working, None));
+            view.set_paused(false);
+            assert!(view.seeking());
+            assert_eq!(view.display.is_manual(), manual);
+            assert_eq!(view.runtime_binding, binding);
+            assert_eq!(view.preference, pref);
+            assert!(view.pending_placement.is_none());
+            assert!(view.pending_restore.is_none());
+            view.apply_pursuit_step(PursuitStep::Arrived);
+            assert!(view.navigation.is_none());
+            assert_eq!(
+                view.player.animation(),
+                if manual {
+                    Animation::Waving
+                } else {
+                    Animation::Working
+                }
+            );
+            assert_eq!(view.display.is_manual(), manual);
+        }
+    }
+
+    #[test]
+    fn corner_movement_keeps_current_foot_when_midrun_bubbles_expire() {
+        let atlas = Arc::new(SpriteAtlas::load().unwrap());
+        for backing in [1.0, 1.25, 1.5, 2.0] {
+            for after_arrival in [false, true] {
+                let mut view = FamiliarView::new("first".into(), atlas.clone(), options());
+                let now = Instant::now();
+                injected_corner(&mut view, now);
+                let scale = view.options.sprite_scale;
+                let hidden = (layout_size(false, scale, backing), false, scale);
+                let shown = (layout_size(true, scale, backing), true, scale);
+                let mut position = PhysicalPosition::new(-500, 300);
+                let delta = view
+                    .apply_pursuit_step(PursuitStep::Move {
+                        delta: Point { x: 24.0, y: 18.0 },
+                        facing: Facing::Right,
+                    })
+                    .unwrap();
+                let origin = position.to_logical::<f64>(backing);
+                position = LogicalPosition::new(origin.x + delta.x, origin.y + delta.y)
+                    .to_physical(backing);
+
+                assert!(view.visibility.reveal(now));
+                view.sync_visibility(now).unwrap();
+                assert!(view.bubble_visible);
+                // Emulate the native show layout's saved hidden origin and resize.
+                let show_anchor = position;
+                view.hidden_position = Some(show_anchor);
+                position = resized_position(position, hidden, shown);
+                let delta = view
+                    .apply_pursuit_step(PursuitStep::Move {
+                        delta: Point { x: 48.0, y: 36.0 },
+                        facing: Facing::Right,
+                    })
+                    .unwrap();
+                let origin = position.to_logical::<f64>(backing);
+                let moved = view.native_motion.request(
+                    Point {
+                        x: origin.x,
+                        y: origin.y,
+                    },
+                    delta,
+                    backing,
+                );
+                position = LogicalPosition::new(moved.x, moved.y).to_physical(backing);
+                assert!(view.hidden_position.is_none());
+                if after_arrival {
+                    view.apply_pursuit_step(PursuitStep::Arrived);
+                    assert!(view.navigation.is_none());
+                } else {
+                    assert!(view.seeking());
+                }
+                let origin = position.to_logical::<f64>(backing);
+                let foot = foot_offset(shown.0, backing, true, scale).unwrap();
+                let current_foot = Point {
+                    x: origin.x + foot.x,
+                    y: origin.y + foot.y,
+                };
+                let expiry = view.visibility.deadline().unwrap();
+                assert!(view.visibility.expire(expiry));
+                view.sync_visibility(expiry).unwrap();
+                assert!(!view.bubble_visible);
+                // This is the hide layout's actual saved-anchor/fresh-foot choice.
+                let position = view
+                    .hidden_position
+                    .unwrap_or_else(|| resized_position(position, shown, hidden));
+                assert_ne!(
+                    position, show_anchor,
+                    "hide must not snap to the midrun anchor"
+                );
+                let origin = position.to_logical::<f64>(backing);
+                let foot = foot_offset(hidden.0, backing, false, scale).unwrap();
+                assert!((origin.x + foot.x - current_foot.x).abs() < 1e-9);
+                assert!((origin.y + foot.y - current_foot.y).abs() < 1e-9);
+                assert!(view.pending_placement.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn nonmoving_corner_steps_preserve_saved_bubble_anchor() {
+        let atlas = Arc::new(SpriteAtlas::load().unwrap());
+        for step in [PursuitStep::Arrived, PursuitStep::Blocked("injected stall")] {
+            let mut view = FamiliarView::new("first".into(), atlas.clone(), options());
+            injected_corner(&mut view, Instant::now());
+            let saved = Some(PhysicalPosition::new(-350, 240));
+            view.hidden_position = saved;
+            view.set_paused(true);
+            assert_eq!(view.hidden_position, saved);
+            assert!(view.apply_pursuit_step(step).is_none());
+            assert_eq!(view.hidden_position, saved);
+            assert!(view.pending_placement.is_none());
+        }
+    }
+
+    #[test]
+    fn no_hotkey_keeps_focused_fallbacks_but_registered_globals_suppress_duplicates() {
+        for no_hotkey in [false, true] {
+            for registered in [false, true] {
+                let mut options = options();
+                options.no_hotkey = no_hotkey;
+                let mut app = App::new(SpriteAtlas::load().unwrap(), options, true);
+                app.stage_snapshot(vec![familiar("first")]);
+                let view = app.views.get_mut("first").unwrap();
+                view.modifiers = ModifiersState::ALT;
+                view.navigation_available = true;
+                view.global_hotkey_registered = registered;
+                view.global_navigation_registered = registered;
+                view.global_corner_registered = registered;
+                assert_eq!(
+                    local_reveal_shortcut(
+                        KeyCode::KeyI,
+                        view.modifiers,
+                        view.global_hotkey_registered,
+                    ),
+                    !registered
+                );
+                assert_eq!(view.local_navigation(KeyCode::KeyM, true), !registered);
+                assert_eq!(
+                    view.local_corner(KeyCode::KeyC, true),
+                    !registered && cfg!(target_os = "macos")
+                );
+                assert!(!view.local_navigation(KeyCode::KeyM, false));
+                assert!(!view.local_corner(KeyCode::KeyC, false));
+            }
+        }
+        for mode in 0..3 {
+            let mut options = options();
+            options.no_hotkey = true;
+            options.manual = mode == 0;
+            options.demo = mode == 1;
+            let mut app = App::new(SpriteAtlas::load().unwrap(), options, false);
+            app.stage_snapshot(vec![familiar("preview")]);
+            let view = app.views.get_mut("preview").unwrap();
+            view.modifiers = ModifiersState::ALT;
+            assert!(!view.local_corner(KeyCode::KeyC, true));
+            assert!(!view.local_navigation(KeyCode::KeyM, true));
+        }
+    }
+
+    #[test]
+    fn local_corner_gates_are_independent_of_pointer_bubbles_and_mouse_registration() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        app.stage_snapshot(vec![familiar("first")]);
+        let view = app.views.get_mut("first").unwrap();
+        view.options.no_bubble = true;
+        view.global_navigation_registered = true;
+        view.modifiers = ModifiersState::ALT;
+        assert!(view.local_corner(KeyCode::KeyC, true));
+        assert!(!view.local_corner(KeyCode::KeyC, false));
+        assert!(!view.local_corner(KeyCode::KeyM, true));
+        view.modifiers |= ModifiersState::SHIFT;
+        assert!(!view.local_corner(KeyCode::KeyC, true));
+        view.modifiers = ModifiersState::ALT;
+        view.global_corner_registered = true;
+        assert!(!view.local_corner(KeyCode::KeyC, true));
+        view.global_corner_registered = false;
+        view.options.no_hotkey = true;
+        assert!(view.local_corner(KeyCode::KeyC, true));
+        assert!(!view.local_navigation(KeyCode::KeyM, true));
+        view.options.no_hotkey = false;
+        view.corner_available = false;
+        assert!(!view.local_corner(KeyCode::KeyC, true));
+    }
+
     #[test]
     fn shortcut_diagnostics_cover_gates_pending_and_independent_results() {
-        for flags in 0..512 {
+        for flags in 0..1024 {
             let flag = |bit| flags & (1 << bit) != 0;
             let mut options = options();
             options.no_hotkey = flag(0);
@@ -4920,42 +5545,48 @@ mod tests {
             let pointer_available = flag(2);
             let live = flag(3);
             let platform_supported = flag(4);
-            let succeeded = [flag(7), flag(8)];
-            let mut expected = [Shortcut::Reveal, Shortcut::GoToMouse].map(|key| {
-                let (state, reason) = match key {
-                    _ if options.no_hotkey => (ShortcutState::Disabled, ShortcutReason::NoHotkey),
-                    Shortcut::Reveal if options.no_bubble => {
-                        (ShortcutState::Disabled, ShortcutReason::NoBubble)
-                    }
-                    _ if !platform_supported => (
-                        ShortcutState::Unsupported,
-                        ShortcutReason::UnsupportedPlatform,
-                    ),
-                    Shortcut::GoToMouse if !pointer_available => {
-                        if options.manual || options.demo || !live {
-                            (ShortcutState::Unsupported, ShortcutReason::UnsupportedMode)
-                        } else {
-                            (
-                                ShortcutState::Unavailable,
-                                ShortcutReason::PointerInitializationFailed,
-                            )
+            let succeeded = [flag(7), flag(8), flag(9)];
+            let mut expected =
+                [Shortcut::Reveal, Shortcut::GoToMouse, Shortcut::GoToCorner].map(|key| {
+                    let (state, reason) = match key {
+                        _ if options.no_hotkey => {
+                            (ShortcutState::Disabled, ShortcutReason::NoHotkey)
                         }
+                        Shortcut::Reveal if options.no_bubble => {
+                            (ShortcutState::Disabled, ShortcutReason::NoBubble)
+                        }
+                        _ if !platform_supported => (
+                            ShortcutState::Unsupported,
+                            ShortcutReason::UnsupportedPlatform,
+                        ),
+                        Shortcut::GoToCorner if options.manual || options.demo || !live => {
+                            (ShortcutState::Unsupported, ShortcutReason::UnsupportedMode)
+                        }
+                        Shortcut::GoToMouse if !pointer_available => {
+                            if options.manual || options.demo || !live {
+                                (ShortcutState::Unsupported, ShortcutReason::UnsupportedMode)
+                            } else {
+                                (
+                                    ShortcutState::Unavailable,
+                                    ShortcutReason::PointerInitializationFailed,
+                                )
+                            }
+                        }
+                        _ => (
+                            ShortcutState::Uninitialized,
+                            ShortcutReason::RegistrationPending,
+                        ),
+                    };
+                    ShortcutStatus {
+                        state,
+                        reason: Some(reason),
                     }
-                    _ => (
-                        ShortcutState::Uninitialized,
-                        ShortcutReason::RegistrationPending,
-                    ),
-                };
-                ShortcutStatus {
-                    state,
-                    reason: Some(reason),
-                }
-            });
+                });
             let eligible =
                 expected.map(|status| status.reason == Some(ShortcutReason::RegistrationPending));
             let diagnostics = RuntimeDiagnostics::new(true);
             let reader = diagnostics.clone();
-            let mut attempted = [false; 2];
+            let mut attempted = [false; 3];
             let guards = register_shortcuts(
                 &options,
                 pointer_available,
@@ -4969,11 +5600,19 @@ mod tests {
                         .join()
                         .unwrap();
                     assert_eq!(
-                        [hotkeys.option_i, hotkeys.option_m],
+                        [
+                            hotkeys.option_i,
+                            hotkeys.option_m,
+                            hotkeys.option_c.unwrap()
+                        ],
                         expected,
                         "flags={flags}"
                     );
-                    let index = usize::from(key == Shortcut::GoToMouse);
+                    let index = match key {
+                        Shortcut::Reveal => 0,
+                        Shortcut::GoToMouse => 1,
+                        Shortcut::GoToCorner => 2,
+                    };
                     assert!(eligible[index]);
                     attempted[index] = true;
                     expected[index] = if succeeded[index] {
@@ -4993,14 +5632,22 @@ mod tests {
             );
             let hotkeys = reader.snapshot().hotkeys;
             assert_eq!(
-                [hotkeys.option_i, hotkeys.option_m],
+                [
+                    hotkeys.option_i,
+                    hotkeys.option_m,
+                    hotkeys.option_c.unwrap()
+                ],
                 expected,
                 "flags={flags}"
             );
             assert_eq!(attempted, eligible);
             assert_eq!(
                 guards.map(|guard| guard.is_some()),
-                [eligible[0] && succeeded[0], eligible[1] && succeeded[1]]
+                [
+                    eligible[0] && succeeded[0],
+                    eligible[1] && succeeded[1],
+                    eligible[2] && succeeded[2]
+                ]
             );
             assert!(
                 !serde_json::to_string(&reader.snapshot())
@@ -5056,7 +5703,10 @@ mod tests {
             let mut expected_service = before;
             expected_service["diagnostics"] = json!(diagnostics.snapshot());
             assert_eq!(after, expected_service);
-            assert_eq!(guards.map(|guard| guard.is_some()), [reveal_ok, !reveal_ok]);
+            assert_eq!(
+                guards.map(|guard| guard.is_some()),
+                [reveal_ok, !reveal_ok, !reveal_ok]
+            );
             let encoded = after.to_string();
             assert!(encoded.contains("registered"));
             assert!(encoded.contains("registration_failed"));
@@ -5087,6 +5737,7 @@ mod tests {
                                     let ok = match key {
                                         Shortcut::Reveal => reveal_ok,
                                         Shortcut::GoToMouse => navigation_ok,
+                                        Shortcut::GoToCorner => true,
                                     };
                                     anyhow::ensure!(ok, "simulated key collision");
                                     Ok(key)
@@ -5281,7 +5932,10 @@ mod tests {
         assert!(!app.views["f0"].seeking());
         app.navigation_pending
             .post(Some((0..20).map(|n| format!("f{n}")).collect()));
-        assert_eq!(app.navigation_pending.take()[0].as_ref().unwrap().len(), 16);
+        assert_eq!(
+            app.navigation_pending.take()[0].1.as_ref().unwrap().len(),
+            16
+        );
         app.navigation_pending.post(Some(vec!["f0".into()]));
         app.stage_snapshot(vec![familiar("f0"), familiar("unrelated")]);
         app.apply_navigation();
