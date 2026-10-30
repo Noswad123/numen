@@ -22,6 +22,8 @@ pub struct AttachmentContext {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     RevealStatus,
+    CopySessionId,
+    OpenChat,
     GoToMouse,
     SetPaused(bool),
     Settings(SettingsPatch),
@@ -41,6 +43,8 @@ impl Action {
 pub struct Context {
     pub paused: bool,
     pub bubbles: bool,
+    pub copy_session_id: bool,
+    pub open_chat: bool,
     pub navigation: bool,
     pub settings: Option<FamiliarSettings>,
     pub preferences: bool,
@@ -73,6 +77,20 @@ pub fn entries(context: Context) -> Vec<Entry> {
             enabled: context.bubbles,
             checked: false,
             tooltip: None,
+        },
+        Entry::Item {
+            label: "Copy session ID".into(),
+            action: Some(Action::CopySessionId),
+            enabled: context.copy_session_id,
+            checked: false,
+            tooltip: None,
+        },
+        Entry::Item {
+            label: "Open chat".into(),
+            action: Some(Action::OpenChat),
+            enabled: context.open_chat,
+            checked: false,
+            tooltip: Some("Open or focus this live Djinn chat in a compact Wisp window".into()),
         },
         Entry::Item {
             label: "Go to mouse".into(),
@@ -303,6 +321,17 @@ pub fn supported() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Writes exact plain text only in response to an explicit menu action.
+pub fn copy_text(text: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    return native::copy_text(text);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+        anyhow::bail!("Familiar clipboard actions are supported only on macOS")
+    }
+}
+
 /// An original mouse-down captured on the main thread, not the later drag event.
 /// Keep the caller's window alive until `start` returns.
 pub struct DragStart {
@@ -436,6 +465,22 @@ mod native {
         NSString, NSTimer, ns_string,
     };
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    pub(super) fn copy_text(text: &str) -> Result<()> {
+        MainThreadMarker::new().context("Clipboard actions require the main thread")?;
+        let text = NSString::from_str(text);
+        // SAFETY: AppKit pasteboard access runs on the main thread. Both objects
+        // remain retained throughout the synchronous plain-text write.
+        unsafe {
+            let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+            pasteboard.clearContents();
+            anyhow::ensure!(
+                pasteboard.setString_forType(&text, objc2_app_kit::NSPasteboardTypeString),
+                "Could not write session ID to clipboard"
+            );
+        }
+        Ok(())
+    }
 
     fn drag_window(
         window: &winit::window::Window,
@@ -701,6 +746,8 @@ mod tests {
         Context {
             paused: false,
             bubbles: true,
+            copy_session_id: false,
+            open_chat: false,
             navigation: true,
             settings,
             preferences: false,
@@ -946,6 +993,8 @@ mod tests {
         let catalog = entries(Context {
             paused: true,
             bubbles: false,
+            copy_session_id: false,
+            open_chat: false,
             navigation: false,
             settings: None,
             preferences: false,
@@ -961,7 +1010,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            &catalog[1],
+            &catalog[3],
             Entry::Item {
                 action: Some(Action::GoToMouse),
                 enabled: false,
@@ -969,21 +1018,23 @@ mod tests {
             }
         ));
         assert!(
-            matches!(&catalog[2], Entry::Item { label, action: Some(Action::SetPaused(false)), checked: true, .. } if label == "Resume")
-        );
-        assert_eq!(catalog[3], Entry::Separator);
-        assert!(
-            matches!(&catalog[4], Entry::Item { label, action: Some(Action::CloseFamiliar), .. } if label == "Close familiar")
+            matches!(&catalog[4], Entry::Item { label, action: Some(Action::SetPaused(false)), checked: true, .. } if label == "Resume")
         );
         assert_eq!(catalog[5], Entry::Separator);
         assert!(
-            matches!(&catalog[6], Entry::Item { label, action: Some(Action::QuitNumen), .. } if label == "Quit Numen (all familiars)")
+            matches!(&catalog[6], Entry::Item { label, action: Some(Action::CloseFamiliar), .. } if label == "Close familiar")
+        );
+        assert_eq!(catalog[7], Entry::Separator);
+        assert!(
+            matches!(&catalog[8], Entry::Item { label, action: Some(Action::QuitNumen), .. } if label == "Quit Numen (all familiars)")
         );
         assert!(Action::QuitNumen.is_service());
         assert!(Action::OpenFamiliar.is_service());
         for action in [
             Action::CloseFamiliar,
             Action::RevealStatus,
+            Action::CopySessionId,
+            Action::OpenChat,
             Action::GoToMouse,
             Action::SetPaused(true),
             Action::Settings(SettingsPatch {
@@ -994,8 +1045,42 @@ mod tests {
             assert!(!action.is_service());
         }
         assert!(
-            matches!(&entries(context(None))[2], Entry::Item { label, action: Some(Action::SetPaused(true)), checked: false, .. } if label == "Pause")
+            matches!(&entries(context(None))[4], Entry::Item { label, action: Some(Action::SetPaused(true)), checked: false, .. } if label == "Pause")
         );
+    }
+
+    #[test]
+    fn copy_session_id_is_attachment_gated_independently_of_bubble_visibility() {
+        for attached in [false, true] {
+            let mut context = context(None);
+            context.bubbles = false;
+            context.copy_session_id = attached;
+            let catalog = entries(context);
+            assert!(matches!(&catalog[1], Entry::Item {
+                label, action: Some(Action::CopySessionId), enabled, checked: false, ..
+            } if label == "Copy session ID" && *enabled == attached));
+            assert_eq!(
+                action_for_tag(&[Some(Action::CopySessionId).filter(|_| attached)], 1),
+                attached.then_some(Action::CopySessionId)
+            );
+        }
+    }
+
+    #[test]
+    fn open_chat_is_live_handoff_gated_not_bubble_gated() {
+        for available in [false, true] {
+            let mut context = context(None);
+            context.bubbles = false;
+            context.open_chat = available;
+            let catalog = entries(context);
+            assert!(matches!(&catalog[2], Entry::Item {
+                label, action: Some(Action::OpenChat), enabled, checked: false, ..
+            } if label == "Open chat" && *enabled == available));
+            assert_eq!(
+                action_for_tag(&[Some(Action::OpenChat).filter(|_| available)], 1),
+                available.then_some(Action::OpenChat)
+            );
+        }
     }
 
     #[test]
@@ -1003,7 +1088,7 @@ mod tests {
         let catalog = entries(context(Some(FamiliarSettings::default())));
         let Entry::Submenu {
             entries: fields, ..
-        } = &catalog[3]
+        } = &catalog[5]
         else {
             panic!("settings missing")
         };
@@ -1048,7 +1133,7 @@ mod tests {
         })));
         let Entry::Submenu {
             entries: fields, ..
-        } = &catalog[3]
+        } = &catalog[5]
         else {
             panic!("settings missing")
         };

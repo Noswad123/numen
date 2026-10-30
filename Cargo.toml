@@ -25,7 +25,7 @@ winit = "0.30.13"
 global-hotkey = "0.9"
 core-graphics = "0.23.2"
 objc2 = "=0.5.3"
-objc2-app-kit = { version = "=0.2.2", default-features = false, features = ["std", "NSApplication", "NSCell", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "=0.2.2", default-features = false, features = ["std", "NSApplication", "NSCell", "NSEvent", "NSMenu", "NSMenuItem", "NSPasteboard", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
 objc2-foundation = { version = "=0.2.2", default-features = false, features = ["std", "NSDate", "NSGeometry", "NSObject", "NSRunLoop", "NSString", "NSTimer"] }
 
 [dev-dependencies]

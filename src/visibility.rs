@@ -13,7 +13,7 @@ pub struct BubbleVisibility {
     until: Option<Instant>,
     quiet_until: Option<Instant>,
     last_text: Option<bubble::BubbleText>,
-    has_following: bool,
+    last_selection: Option<(String, String, String)>,
 }
 
 impl BubbleVisibility {
@@ -25,7 +25,7 @@ impl BubbleVisibility {
             until: None,
             quiet_until: None,
             last_text: None,
-            has_following: false,
+            last_selection: None,
         }
     }
 
@@ -38,17 +38,18 @@ impl BubbleVisibility {
     pub fn observe(&mut self, view: &Presentation, now: Instant) -> bool {
         self.expire(now);
         let text = bubble::text(view, None);
-        let has_following = view.following.is_some();
-        let new_selection = has_following
-            && (!self.has_following
-                || self
-                    .last_text
-                    .as_ref()
-                    .is_none_or(|old| old.identity != text.identity));
+        let selection = view.following.as_ref().map(|following| {
+            (
+                following.source.clone(),
+                following.instance.clone(),
+                following.activity.clone(),
+            )
+        });
+        let new_selection = selection.is_some() && selection != self.last_selection;
         let changed = self.last_text.as_ref().is_some_and(|old| *old != text);
         // Cache even suppressed changes: they must not become delayed notifications.
         self.last_text = Some(text);
-        self.has_following = has_following;
+        self.last_selection = selection;
 
         if new_selection {
             return self.reveal(now);
@@ -133,7 +134,7 @@ mod tests {
         p.set_duration(longer);
         assert_eq!(p.deadline(), Some(end));
         assert_eq!(p.last_text, text);
-        assert!(p.has_following);
+        assert!(p.last_selection.is_some());
         assert!(p.visible(end - Duration::from_nanos(1)));
         assert!(p.expire(end));
         let quiet = p.quiet_until;
@@ -340,6 +341,74 @@ mod tests {
         assert!(p.expire(now + LIFETIME));
         // A first following target is a selection, not an automatic message.
         assert!(p.observe(&view(), now + LIFETIME));
+    }
+
+    #[test]
+    fn exact_selection_switch_refreshes_identical_text_and_bypasses_quiet() {
+        let now = Instant::now();
+        for field in ["source", "instance", "activity"] {
+            for summary in [Some("Same title"), None, Some(" \n\t\0 ")] {
+                for available in [true, false] {
+                    for quiet in [false, true] {
+                        let mut p = policy();
+                        let mut v = view();
+                        let following = v.following.as_mut().unwrap();
+                        following.source = "djinn".into();
+                        following.summary = summary.map(String::from);
+                        following.available = available;
+                        assert!(p.observe(&v, now));
+                        let before = bubble::text(&v, None);
+                        let switched = if quiet {
+                            let end = now + LIFETIME;
+                            assert!(p.expire(end));
+                            end + Duration::from_millis(1)
+                        } else {
+                            now + Duration::from_secs(1)
+                        };
+                        let following = v.following.as_mut().unwrap();
+                        match field {
+                            // Both sources display as Djinn, but are distinct selections.
+                            "source" => following.source = "Djinn".into(),
+                            "instance" => following.instance = "session-2".into(),
+                            "activity" => following.activity = "conversation-8".into(),
+                            _ => unreachable!(),
+                        }
+                        assert_eq!(bubble::text(&v, None), before);
+                        assert!(p.observe(&v, switched), "{field}, quiet={quiet}");
+                        assert_eq!(p.deadline(), Some(switched + LIFETIME));
+                        assert_eq!(p.quiet_until, None);
+                        assert!(!p.observe(&v, switched + Duration::from_millis(1)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reattaching_same_selection_bypasses_quiet_and_refreshes() {
+        let now = Instant::now();
+        for available in [true, false] {
+            for quiet in [false, true] {
+                let mut p = policy();
+                let mut v = view();
+                v.following.as_mut().unwrap().summary = None;
+                v.following.as_mut().unwrap().available = available;
+                assert!(p.observe(&v, now));
+                let reattached = if quiet {
+                    let end = now + LIFETIME;
+                    assert!(p.expire(end));
+                    end + Duration::from_millis(1)
+                } else {
+                    now + Duration::from_secs(1)
+                };
+                p.observe(&Presentation::default(), reattached);
+                assert_eq!(p.last_selection, None);
+                assert!(p.observe(&v, reattached));
+                assert_eq!(p.deadline(), Some(reattached + LIFETIME));
+                assert_eq!(p.quiet_until, None);
+                assert!(!p.observe(&v, reattached + Duration::from_millis(1)));
+            }
+        }
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub fn dimensions(show: bool, sprite_scale: f32) -> (u32, u32) {
     }
 }
 
-/// Full model strings for logging; clipping and whitespace cleanup happen only in paint.
+/// Display strings; clipping and whitespace cleanup happen only in paint.
 pub fn text(view: &Presentation, preview: Option<Animation>) -> BubbleText {
     let Some(following) = &view.following else {
         return BubbleText {
@@ -75,13 +75,9 @@ pub fn text(view: &Presentation, preview: Option<Animation>) -> BubbleText {
         }
     };
     BubbleText {
-        identity: if following.instance.is_empty() {
-            format!("{} / {}", following.source, following.activity)
-        } else {
-            format!(
-                "{} / {} / {}",
-                following.source, following.activity, following.instance
-            )
+        identity: match following.source.as_str() {
+            "djinn" => "Djinn".into(),
+            source => source.into(),
         },
         summary: following
             .summary
@@ -92,7 +88,7 @@ pub fn text(view: &Presentation, preview: Option<Animation>) -> BubbleText {
                     .any(|c| !c.is_whitespace() && !c.is_control())
             })
             .cloned()
-            .unwrap_or_else(|| following.activity.clone()),
+            .unwrap_or_else(|| "Untitled session".into()),
         status: if preview.is_some() {
             format!("Preview: {live_status}")
         } else {
@@ -865,15 +861,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_blank_summary_falls_back_to_conversation_id() {
-        let mut view = view(ActivityState::Idle, false);
-        for summary in [None, Some(" \n\t\0 ".into())] {
-            view.following.as_mut().unwrap().summary = summary;
-            assert_eq!(text(&view, None).summary, "conversation-7");
+    fn identity_is_source_only_with_djinn_display_name() {
+        let mut view = view(ActivityState::Working, false);
+        for source in ["djinn", "Djinn", "opencode", "custom-source", "Custom App"] {
+            view.following.as_mut().unwrap().source = source.into();
+            let expected = if source == "djinn" { "Djinn" } else { source };
+            let before = text(&view, None);
+            assert_eq!(before.identity, expected);
+            view.following.as_mut().unwrap().instance = "backend-private-id".into();
+            view.following.as_mut().unwrap().activity = "session-private-id".into();
+            assert_eq!(text(&view, None), before);
+            view.following.as_mut().unwrap().instance.clear();
+            assert_eq!(text(&view, None), before);
         }
-        let full = "long instance ".repeat(30);
-        view.following.as_mut().unwrap().instance = full.clone();
-        assert!(text(&view, None).identity.ends_with(&full));
+    }
+
+    #[test]
+    fn missing_or_blank_summary_uses_untitled_session_even_when_unavailable() {
+        let mut view = view(ActivityState::Idle, false);
+        for available in [true, false] {
+            view.following.as_mut().unwrap().available = available;
+            for summary in [None, Some(String::new()), Some(" \n\t\0 ".into())] {
+                view.following.as_mut().unwrap().summary = summary;
+                let model = text(&view, None);
+                assert_eq!(model.identity, "opencode");
+                assert_eq!(model.summary, "Untitled session");
+                assert_eq!(model.status, if available { "Idle" } else { "Unavailable" });
+            }
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod assets;
 mod bootstrap;
 mod bubble;
 mod build_info;
+mod chat;
 mod context_menu;
 mod diagnostics;
 mod display;

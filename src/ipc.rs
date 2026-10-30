@@ -379,6 +379,12 @@ fn publish_target_memo(
 
 #[derive(Debug)]
 enum FamiliarCommand {
+    OpenChat {
+        id: String,
+        expected: RuntimeBinding,
+        target: FocusTarget,
+        incarnation: u64,
+    },
     OpenUnattached {
         preset: String,
     },
@@ -413,6 +419,34 @@ pub struct FamiliarControl {
 }
 
 impl FamiliarControl {
+    /// Queue acceptance only, never an application/window success claim.
+    pub fn open_chat(
+        &self,
+        id: &str,
+        expected: &RuntimeBinding,
+        target: &FocusTarget,
+        incarnation: u64,
+    ) -> Result<()> {
+        validate_attach(id, expected, target, incarnation)?;
+        ensure!(
+            crate::chat::supported(),
+            "chat launch unsupported on this platform"
+        );
+        ensure!(target.source == "djinn", "unsupported chat source");
+        ensure!(
+            expected.attachment.target.as_ref() == Some(target),
+            "chat target differs from attachment"
+        );
+        self.sender
+            .try_send(FamiliarCommand::OpenChat {
+                id: id.into(),
+                expected: expected.clone(),
+                target: target.clone(),
+                incarnation,
+            })
+            .context("queue chat launch")
+    }
+
     /// Queue acceptance only; registry snapshots report committed opens.
     pub fn open_unattached(&self, preset: &str) -> Result<()> {
         protocol::validate_id(preset)?;
@@ -1297,6 +1331,17 @@ fn run(
         }
     };
     let mut clients: Vec<Client> = Vec::new();
+    let chat = if controls.multi && crate::chat::supported() {
+        match crate::chat::Dispatcher::production(stop.clone()) {
+            Ok(dispatcher) => Some(dispatcher),
+            Err(_) => {
+                tracing::warn!(target: "numen::chat", "Chat launcher worker unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut quit_requested = false;
     while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
@@ -1314,7 +1359,10 @@ fn run(
             let Ok(command) = focus.try_recv() else {
                 break;
             };
-            let result = apply_familiar_command(&mut store, command, &controls);
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let result = apply_with_chat(&mut store, command, &controls, chat.as_ref());
             if let Err(error) = result {
                 eprintln!("numen familiar control: {error}");
             }
@@ -1390,7 +1438,9 @@ fn run(
         let Ok(command) = focus.try_recv() else {
             break;
         };
-        let _ = apply_familiar_command(&mut store, command, &controls);
+        if !matches!(command, FamiliarCommand::OpenChat { .. }) {
+            let _ = apply_familiar_command(&mut store, command, &controls);
+        }
     }
     if let Some(writer) = writer {
         let deadline = Instant::now() + Duration::from_millis(500);
@@ -1428,12 +1478,79 @@ fn run(
     }
 }
 
+fn validate_open_chat(
+    store: &Store,
+    service_instance: &str,
+    id: &str,
+    expected: &RuntimeBinding,
+    target: &FocusTarget,
+    incarnation: u64,
+) -> Result<()> {
+    validate_attach(id, expected, target, incarnation)?;
+    ensure!(
+        expected.service_instance == service_instance,
+        "service instance changed"
+    );
+    ensure!(
+        store.attachment_binding(id)? == expected.attachment,
+        "stale attachment binding"
+    );
+    ensure!(
+        expected.attachment.target.as_ref() == Some(target),
+        "chat target differs from attachment"
+    );
+    ensure!(target.source == "djinn", "unsupported chat source");
+    let live = store
+        .live_targets()
+        .into_iter()
+        .find(|row| FocusTarget::from(&row.selection) == *target)
+        .context("chat target no longer live")?;
+    ensure!(
+        live.incarnation == incarnation,
+        "source incarnation changed"
+    );
+    ensure!(
+        live.claimed_by.as_deref() == Some(id),
+        "chat target not claimed by clicked familiar"
+    );
+    Ok(())
+}
+
+fn apply_with_chat(
+    store: &mut Store,
+    command: FamiliarCommand,
+    controls: &ControlContext,
+    chat: Option<&crate::chat::Dispatcher>,
+) -> Result<()> {
+    if let FamiliarCommand::OpenChat {
+        id,
+        expected,
+        target,
+        incarnation,
+    } = command
+    {
+        ensure!(controls.multi, "no graphical familiar");
+        validate_open_chat(
+            store,
+            &controls.service_instance,
+            &id,
+            &expected,
+            &target,
+            incarnation,
+        )?;
+        chat.context("chat launcher unavailable")?.enqueue(&target)
+    } else {
+        apply_familiar_command(store, command, controls)
+    }
+}
+
 fn apply_familiar_command(
     store: &mut Store,
     command: FamiliarCommand,
     controls: &ControlContext,
 ) -> Result<()> {
     match command {
+        FamiliarCommand::OpenChat { .. } => bail!("chat launch requires active dispatcher"),
         FamiliarCommand::OpenUnattached { preset } => {
             ensure!(controls.multi, "no graphical familiar");
             store
@@ -2060,6 +2177,177 @@ mod tests {
                 snapshot.binding.attachment,
                 store.attachment_binding(&id).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn chat_gui_queue_is_bounded_and_shutdown_apply_rejects_launches() {
+        let (store, mut controls) = picker_store();
+        controls.service_instance = "test-service".into();
+        let target = FocusTarget {
+            source: "djinn".into(),
+            instance: "one".into(),
+            activity: "chat".into(),
+        };
+        let expected = RuntimeBinding {
+            service_instance: controls.service_instance.clone(),
+            attachment: AttachmentBinding {
+                target: Some(target.clone()),
+                generation: 1,
+            },
+        };
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let gui = FamiliarControl {
+            sender,
+            target_memo: TargetCache::default(),
+        };
+        assert!(gui.open_chat("bad/id", &expected, &target, 1).is_err());
+        assert!(gui.open_chat("main", &expected, &target, 0).is_err());
+        let mut bad = expected.clone();
+        bad.attachment.target = None;
+        assert!(gui.open_chat("main", &bad, &target, 1).is_err());
+        assert!(receiver.try_recv().is_err());
+        if crate::chat::supported() {
+            gui.close("main").unwrap();
+            gui.open_chat("main", &expected, &target, 1).unwrap();
+            assert!(gui.open_chat("main", &expected, &target, 1).is_err());
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                FamiliarCommand::Close(_)
+            ));
+            let mut store = store;
+            let before = store.presentations(Instant::now());
+            // The shutdown drain has no dispatcher and must never execute launches.
+            assert!(
+                apply_familiar_command(&mut store, receiver.try_recv().unwrap(), &controls)
+                    .is_err()
+            );
+            assert_eq!(store.presentations(Instant::now()), before);
+        }
+    }
+
+    #[test]
+    fn chat_revalidates_before_dispatch_without_mutation_or_ttl_refresh() {
+        for scenario in [
+            "valid",
+            "service",
+            "binding",
+            "zero-generation",
+            "zero-incarnation",
+            "reconnect",
+            "disconnect",
+            "close",
+            "unbound",
+            "unsupported",
+            "target",
+            "aba",
+            "expired",
+            "headless",
+        ] {
+            let now = Instant::now();
+            let mut store = Store::default();
+            let source = if scenario == "unsupported" {
+                "other"
+            } else {
+                "djinn"
+            };
+            let source_id = (source.into(), "one".into());
+            let activity = || Activity {
+                activity: "chat".into(),
+                sequence: 1,
+                state: ActivityState::Working,
+                attention: false,
+                reason: None,
+                summary: None,
+            };
+            store
+                .register(source_id.clone(), vec![activity()], now)
+                .unwrap();
+            store.focus(source, Some("one"), "chat").unwrap();
+            let mut expected = RuntimeBinding {
+                service_instance: "test-service".into(),
+                attachment: store.attachment_binding("main").unwrap(),
+            };
+            let mut target = expected.attachment.target.clone().unwrap();
+            let mut incarnation = store.live_targets()[0].incarnation;
+            let (_, mut controls) = picker_store();
+            controls.service_instance = "test-service".into();
+            match scenario {
+                "service" => expected.service_instance = "old-service".into(),
+                "binding" => expected.attachment.generation += 1,
+                "zero-generation" => expected.attachment.generation = 0,
+                "zero-incarnation" => incarnation = 0,
+                "reconnect" => {
+                    store.disconnect(&source_id);
+                    store
+                        .register(source_id.clone(), vec![activity()], now)
+                        .unwrap();
+                }
+                "disconnect" => store.disconnect(&source_id),
+                "close" => {
+                    store.close(&["main".into()]).unwrap();
+                }
+                "unbound" => expected.attachment.target = None,
+                "target" => target.activity = "other".into(),
+                "aba" => {
+                    let mut other = activity();
+                    other.activity = "other".into();
+                    store
+                        .apply(&source_id, Event::State { activity: other }, now)
+                        .unwrap();
+                    store.focus(source, Some("one"), "other").unwrap();
+                    store.focus(source, Some("one"), "chat").unwrap();
+                }
+                "expired" => {
+                    store.expire(now + crate::activity::SOURCE_TIMEOUT);
+                }
+                "headless" => controls.multi = false,
+                _ => {}
+            }
+            let (launched, observed) = mpsc::channel();
+            let dispatcher = crate::chat::Dispatcher::start(
+                Arc::new(AtomicBool::new(false)),
+                move |target, _| {
+                    launched.send(target.clone()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let before = store.presentations(now);
+            let rows = store.live_targets();
+            let bindings = store.list_binding_snapshot();
+            let command = || FamiliarCommand::OpenChat {
+                id: "main".into(),
+                expected: expected.clone(),
+                target: target.clone(),
+                incarnation,
+            };
+            let result = apply_with_chat(&mut store, command(), &controls, Some(&dispatcher));
+            assert_eq!(
+                result.is_ok(),
+                scenario == "valid",
+                "{scenario}: {result:?}"
+            );
+            if scenario == "valid" {
+                assert!(
+                    apply_with_chat(&mut store, command(), &controls, Some(&dispatcher)).is_err()
+                );
+                assert_eq!(
+                    observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    target
+                );
+            }
+            assert!(observed.try_recv().is_err(), "{scenario}");
+            assert_eq!(store.presentations(now), before, "{scenario}");
+            assert_eq!(store.live_targets(), rows, "{scenario}");
+            assert_eq!(store.list_binding_snapshot(), bindings, "{scenario}");
+            // Launch is not a producer heartbeat.
+            if scenario == "valid" {
+                assert_eq!(
+                    store.expire(now + crate::activity::SOURCE_TIMEOUT),
+                    vec![source_id]
+                );
+            }
         }
     }
 

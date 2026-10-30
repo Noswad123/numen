@@ -163,6 +163,24 @@ struct MenuAttachment {
     choices: Vec<ChatChoice>,
 }
 
+struct MenuBindings {
+    preference: Option<PreferenceBinding>,
+    attachment: Option<MenuAttachment>,
+    session: Option<AttachmentBinding>,
+}
+
+/// A menu must never copy a newly attached chat's ID under the old menu's action.
+/// Retained unavailable pins are valid; title/status/liveness are not identity.
+fn menu_session_id<'a>(
+    frozen: Option<&'a AttachmentBinding>,
+    applied: &AttachmentBinding,
+) -> Option<&'a str> {
+    frozen
+        .filter(|binding| *binding == applied)
+        .and_then(|binding| binding.target.as_ref())
+        .map(|target| target.activity.as_str())
+}
+
 fn attachment_context(
     id: &str,
     applied: &AttachmentBinding,
@@ -202,6 +220,19 @@ fn attachment_context(
 }
 
 impl MenuAttachment {
+    fn open_chat_index(&self, applied: &AttachmentBinding) -> Option<usize> {
+        if &self.binding.attachment != applied {
+            return None;
+        }
+        let target = applied
+            .target
+            .as_ref()
+            .filter(|target| target.source == "djinn")?;
+        self.choices
+            .iter()
+            .position(|choice| &choice.target == target)
+    }
+
     fn queue(
         &self,
         id: &str,
@@ -2497,6 +2528,9 @@ impl App {
             .menu_target(&request.familiar, request.window_id)
             .and_then(|view| view.preference.as_ref().filter(|p| p.writable))
             .map(|p| p.binding.clone());
+        let menu_session = self
+            .menu_target(&request.familiar, request.window_id)
+            .map(|view| view.runtime_binding.clone());
         let (attachments, menu_attachment) = match (
             self.control.as_ref(),
             self.menu_target(&request.familiar, request.window_id),
@@ -2520,6 +2554,12 @@ impl App {
             .map(|view| context_menu::Context {
                 paused: view.paused,
                 bubbles: !view.options.no_bubble,
+                copy_session_id: menu_session_id(menu_session.as_ref(), &view.runtime_binding)
+                    .is_some(),
+                open_chat: crate::chat::supported()
+                    && menu_attachment.as_ref().is_some_and(|frozen| {
+                        frozen.open_chat_index(&view.runtime_binding).is_some()
+                    }),
                 navigation: view.navigation_available && self.pointer.is_some(),
                 settings: self.control.as_ref().map(|_| view.settings),
                 preferences: menu_binding.is_some(),
@@ -2591,8 +2631,11 @@ impl App {
                     &request.familiar,
                     request.window_id,
                     action,
-                    menu_binding.as_ref(),
-                    menu_attachment.as_ref(),
+                    &MenuBindings {
+                        preference: menu_binding,
+                        attachment: menu_attachment,
+                        session: menu_session,
+                    },
                 )
             }
             Ok(None) => {}
@@ -2606,8 +2649,7 @@ impl App {
         id: &str,
         window_id: WindowId,
         action: Action,
-        menu_binding: Option<&PreferenceBinding>,
-        menu_attachment: Option<&MenuAttachment>,
+        bindings: &MenuBindings,
     ) {
         let Some(action) =
             validated_menu_action(Some(action), self.menu_target(id, window_id).is_some())
@@ -2624,13 +2666,42 @@ impl App {
         let view = self.views.get_mut(id).expect("validated menu target");
         match action {
             Action::RevealStatus if !view.options.no_bubble => view.reveal_bubbles(event_loop),
+            Action::CopySessionId => {
+                if let Some(session_id) =
+                    menu_session_id(bindings.session.as_ref(), &view.runtime_binding)
+                    && let Err(error) = context_menu::copy_text(session_id)
+                {
+                    warn!(%error, "Could not copy session ID");
+                }
+            }
+            Action::OpenChat if crate::chat::supported() => {
+                let Some(frozen) = bindings.attachment.as_ref() else {
+                    return;
+                };
+                let Some(index) = frozen.open_chat_index(&view.runtime_binding) else {
+                    return;
+                };
+                let Some(control) = &self.control else { return };
+                let fresh = control.target_snapshot(id).ok();
+                if let Err(error) = frozen.queue(
+                    id,
+                    index,
+                    &view.runtime_binding,
+                    fresh.as_ref(),
+                    |binding, choice| {
+                        control.open_chat(id, binding, &choice.target, choice.incarnation)
+                    },
+                ) {
+                    warn!(%error, "Could not queue live chat; reopen menu to retry");
+                }
+            }
             Action::GoToMouse if view.navigation_available && self.pointer.is_some() => {
                 self.navigation_pending.post(Some(vec![id.to_owned()]));
                 self.apply_navigation();
             }
             Action::SetPaused(paused) => view.set_paused(paused),
             Action::Attach(index) => {
-                let Some(frozen) = menu_attachment else {
+                let Some(frozen) = bindings.attachment.as_ref() else {
                     return;
                 };
                 let Some(control) = &self.control else { return };
@@ -2656,7 +2727,8 @@ impl App {
                 }
             }
             Action::ForgetPreferences => {
-                let Some(binding) = view.validated_forget_binding(menu_binding) else {
+                let Some(binding) = view.validated_forget_binding(bindings.preference.as_ref())
+                else {
                     return;
                 };
                 view.pending_placement = None;
@@ -3952,6 +4024,8 @@ mod tests {
             let catalog = context_menu::entries(context_menu::Context {
                 paused: view.paused,
                 bubbles: true,
+                copy_session_id: false,
+                open_chat: false,
                 navigation: false,
                 settings: Some(view.settings),
                 preferences: false,
@@ -3960,7 +4034,7 @@ mod tests {
             });
             let context_menu::Entry::Submenu {
                 entries: fields, ..
-            } = &catalog[3]
+            } = &catalog[5]
             else {
                 panic!("settings submenu missing")
             };
@@ -3998,6 +4072,8 @@ mod tests {
                 Action::Attach(0),
                 Action::CloseFamiliar,
                 Action::RevealStatus,
+                Action::CopySessionId,
+                Action::OpenChat,
                 Action::GoToMouse,
                 Action::SetPaused(true),
                 Action::Settings(crate::protocol::SettingsPatch {
@@ -4022,6 +4098,90 @@ mod tests {
             Some(Action::CloseFamiliar)
         );
         assert_eq!(validated_menu_action(None, true), None);
+    }
+
+    #[test]
+    fn copy_session_id_uses_exact_frozen_attachment_and_generation() {
+        let original = AttachmentBinding {
+            target: Some(FocusTarget {
+                source: "djinn".into(),
+                instance: "backend-1".into(),
+                activity: "session-with-an-exact-long-id-1234567890".into(),
+            }),
+            generation: 7,
+        };
+        assert_eq!(
+            menu_session_id(Some(&original), &original),
+            Some("session-with-an-exact-long-id-1234567890")
+        );
+        assert_eq!(menu_session_id(None, &original), None);
+        let unbound = AttachmentBinding {
+            target: None,
+            generation: 7,
+        };
+        assert_eq!(menu_session_id(Some(&unbound), &unbound), None);
+        for change in 0..5 {
+            let mut applied = original.clone();
+            match change {
+                0 => applied.target.as_mut().unwrap().source = "other".into(),
+                1 => applied.target.as_mut().unwrap().instance = "backend-2".into(),
+                2 => applied.target.as_mut().unwrap().activity = "other-session".into(),
+                3 => applied.generation += 1, // Includes detach/reattach to the same chat.
+                _ => applied.target = None,
+            }
+            assert_eq!(menu_session_id(Some(&original), &applied), None);
+        }
+        // Availability and titles are absent from the attachment identity: a
+        // disconnected pin can still be copied without a live discovery list.
+        assert_eq!(
+            menu_session_id(Some(&original), &original).unwrap(),
+            original.target.as_ref().unwrap().activity
+        );
+    }
+
+    #[test]
+    fn open_chat_requires_current_live_djinn_choice_not_another_available_chat() {
+        let target = FocusTarget {
+            source: "djinn".into(),
+            instance: "backend-1".into(),
+            activity: "session-1".into(),
+        };
+        let applied = AttachmentBinding {
+            target: Some(target.clone()),
+            generation: 3,
+        };
+        let mut menu = MenuAttachment {
+            binding: RuntimeBinding {
+                service_instance: "service-1".into(),
+                attachment: applied.clone(),
+            },
+            choices: vec![ChatChoice {
+                target,
+                incarnation: 1,
+                summary: None,
+            }],
+        };
+        assert_eq!(menu.open_chat_index(&applied), Some(0));
+        let mut changed = applied.clone();
+        changed.generation += 1;
+        assert_eq!(menu.open_chat_index(&changed), None);
+        menu.choices[0].target.activity = "session-2".into();
+        assert_eq!(menu.open_chat_index(&applied), None);
+        menu.choices.clear(); // A disconnected pin remains copyable, not openable.
+        assert_eq!(menu.open_chat_index(&applied), None);
+        assert!(menu_session_id(Some(&applied), &applied).is_some());
+        let mut other = applied.clone();
+        other.target.as_mut().unwrap().source = "other-app".into();
+        menu.binding.attachment = other.clone();
+        menu.choices.push(ChatChoice {
+            target: other.target.clone().unwrap(),
+            incarnation: 1,
+            summary: None,
+        });
+        assert_eq!(menu.open_chat_index(&other), None);
+        let unbound = unbound_attachment();
+        menu.binding.attachment = unbound.clone();
+        assert_eq!(menu.open_chat_index(&unbound), None);
     }
 
     fn target_snapshot(binding: AttachmentBinding) -> FamiliarTargetSnapshot {
