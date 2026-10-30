@@ -45,19 +45,6 @@ pub enum Corner {
 }
 
 impl Corner {
-    pub fn random() -> Self {
-        #[cfg(target_os = "macos")]
-        let index = unsafe { libc::arc4random_uniform(4) };
-        #[cfg(not(target_os = "macos"))]
-        let index = 0;
-        match index {
-            0 => Self::TopLeft,
-            1 => Self::TopRight,
-            2 => Self::BottomLeft,
-            _ => Self::BottomRight,
-        }
-    }
-
     /// Target is the full projected sprite's foot center, not the outer window.
     pub fn target(self, area: Area, width: f64, height: f64) -> Option<Point> {
         if !area.valid()
@@ -102,6 +89,67 @@ pub struct DisplayArea {
     pub work: Area,
 }
 
+/// Projection rounds both raster edges. Each density can contribute up to one
+/// physical pixel of size error; changing density alone is not a sprite edit.
+pub fn same_sprite_size(
+    original: Point,
+    original_backing: f64,
+    current: Point,
+    backing: f64,
+) -> bool {
+    if ![
+        original.x,
+        original.y,
+        current.x,
+        current.y,
+        original_backing,
+        backing,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+        || original_backing <= 0.0
+        || backing <= 0.0
+    {
+        return false;
+    }
+    let tolerance = 1.0 / original_backing + 1.0 / backing;
+    (original.x - current.x).abs() <= tolerance && (original.y - current.y).abs() <= tolerance
+}
+
+/// Uniform over all four corners of every connected, usable display. Selection
+/// happens once per request; the chosen display remains fixed during travel.
+pub fn random_target(
+    displays: &[DisplayArea],
+    width: f64,
+    height: f64,
+) -> Option<(DisplayArea, Point)> {
+    let count = u32::try_from(displays.len().checked_mul(4)?).ok()?;
+    if count == 0 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    let index = unsafe { libc::arc4random_uniform(count) } as usize;
+    #[cfg(not(target_os = "macos"))]
+    let index = 0;
+    target_at(displays, index, width, height)
+}
+
+fn target_at(
+    displays: &[DisplayArea],
+    index: usize,
+    width: f64,
+    height: f64,
+) -> Option<(DisplayArea, Point)> {
+    let display = *displays.get(index / 4)?;
+    let corner = [
+        Corner::TopLeft,
+        Corner::TopRight,
+        Corner::BottomLeft,
+        Corner::BottomRight,
+    ][index % 4];
+    Some((display, corner.target(display.work, width, height)?))
+}
+
 #[cfg(target_os = "macos")]
 pub fn display(monitor: &winit::monitor::MonitorHandle) -> Option<DisplayArea> {
     use objc2_app_kit::NSScreen;
@@ -139,6 +187,46 @@ pub fn display(_: &winit::monitor::MonitorHandle) -> Option<DisplayArea> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_connected_display_and_corner_is_selectable() {
+        let displays: Vec<_> = [(0.0, 0.0), (-1512.0, 723.0), (-1920.0, -357.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(id, (x, y))| {
+                let area = Area {
+                    x,
+                    y,
+                    width: 1200.0,
+                    height: 900.0,
+                };
+                DisplayArea {
+                    id: id as u32,
+                    frame: area,
+                    work: area,
+                }
+            })
+            .collect();
+        for (index, display) in displays.iter().enumerate() {
+            for (offset, corner) in [
+                Corner::TopLeft,
+                Corner::TopRight,
+                Corner::BottomLeft,
+                Corner::BottomRight,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (selected, target) =
+                    target_at(&displays, index * 4 + offset, 144.0, 156.0).unwrap();
+                assert_eq!(selected, *display);
+                assert_eq!(Some(target), corner.target(display.work, 144.0, 156.0));
+            }
+        }
+        assert!(target_at(&displays, 12, 144.0, 156.0).is_none());
+        assert!(random_target(&[], 144.0, 156.0).is_none());
+        assert!(random_target(&displays, f64::NAN, 156.0).is_none());
+    }
 
     #[test]
     fn corners_negative_coordinates_fractional_sizes_and_best_fit() {

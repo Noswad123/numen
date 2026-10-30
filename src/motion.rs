@@ -164,7 +164,7 @@ impl MotionClock {
     }
 }
 
-/// Integrate fractional intent; never turn every small event into a native pixel.
+/// Integrate fractional intent; never turn every small event into a native step.
 #[derive(Default)]
 pub struct NativeMotion {
     residual: Point,
@@ -172,6 +172,16 @@ pub struct NativeMotion {
 }
 
 impl NativeMotion {
+    /// AppKit snaps window origins to whole logical points even on Retina.
+    /// Keep this separate from backing scale used for raster/desktop conversion.
+    pub fn position_scale(backing: f64) -> f64 {
+        if cfg!(target_os = "macos") {
+            1.0
+        } else {
+            backing
+        }
+    }
+
     pub fn request(&mut self, origin: Point, delta: Point, backing: f64) -> Point {
         if backing != self.backing {
             self.residual = Point::default();
@@ -215,7 +225,7 @@ pub struct Navigator {
 
 impl Navigator {
     /// Fixed foot-center pursuit. Arrival is based only on actual native feedback;
-    /// one physical pixel per axis tolerates fractional native quantization.
+    /// one native position step per axis tolerates fractional quantization.
     pub fn step_fixed(
         &mut self,
         now: Instant,
@@ -443,6 +453,41 @@ fn hit(cursor: Point, origin: Point, scale: f64, mask: Mask<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn native_logical_steps_preserve_fractional_intent_across_density_changes() {
+        for direction in [-1.0, 1.0] {
+            let mut native = NativeMotion::default();
+            let mut actual = Point {
+                x: -800.0,
+                y: 900.0,
+            };
+            for frame in 0..120 {
+                let backing = if frame < 60 { 2.0 } else { 1.0 };
+                let requested = native.request(
+                    actual,
+                    Point {
+                        x: direction * 0.5,
+                        y: direction * 0.5,
+                    },
+                    NativeMotion::position_scale(backing),
+                );
+                // Model native whole-point snapping, not ideal setter feedback.
+                actual = Point {
+                    x: requested.x.floor(),
+                    y: requested.y.ceil(),
+                };
+            }
+            assert_eq!(
+                actual,
+                Point {
+                    x: -800.0 + direction * 60.0,
+                    y: 900.0 + direction * 60.0
+                }
+            );
+        }
+    }
 
     #[test]
     fn fixed_targets_use_native_feedback_at_fractional_densities() {

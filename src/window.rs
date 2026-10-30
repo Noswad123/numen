@@ -626,6 +626,7 @@ enum Navigation {
         display: corner::DisplayArea,
         target: Point,
         size: Point,
+        backing: f64,
     },
     Celebrating,
 }
@@ -1061,6 +1062,9 @@ impl FamiliarView {
         let duration = Duration::from_secs_f64(settings.bubble_duration);
         let old_scale = self.options.sprite_scale;
         let layout_changed = old_scale != sprite_scale;
+        if layout_changed && matches!(self.navigation, Some(Navigation::Corner { .. })) {
+            self.cancel_navigation("corner sprite scale changed");
+        }
         let paint_changed = layout_changed || self.options.font_size != font_size;
         let changed = paint_changed || self.options.bubble_duration != duration;
         self.options.sprite_scale = sprite_scale;
@@ -1127,6 +1131,7 @@ impl FamiliarView {
                 .with_accepts_first_mouse(true)
         };
         let window = Arc::new(event_loop.create_window(attributes)?);
+        crate::native_window::configure_unrestricted_familiar_window(&window)?;
         let size = window.inner_size();
         let surface = SurfaceTexture::new(size.width.max(1), size.height.max(1), window.clone());
         // Rasterize into actual display pixels, not a low-resolution canvas
@@ -1621,7 +1626,7 @@ impl FamiliarView {
                     y: origin.y,
                 },
                 delta,
-                backing,
+                NativeMotion::position_scale(backing),
             );
             if target.x != origin.x || target.y != origin.y {
                 window.set_outer_position(LogicalPosition::new(target.x, target.y));
@@ -1635,6 +1640,7 @@ impl FamiliarView {
         display: corner::DisplayArea,
         target: Point,
         size: Point,
+        backing: f64,
     ) {
         if self.close_requested || self.error.is_some() {
             return;
@@ -1653,6 +1659,7 @@ impl FamiliarView {
             display,
             target,
             size,
+            backing,
         });
         self.hidden_position = None;
         self.motion_clock.reset(now);
@@ -1664,10 +1671,10 @@ impl FamiliarView {
         let Some(window) = &self.window else {
             return;
         };
-        let Some(display) = window.current_monitor().as_ref().and_then(corner::display) else {
-            self.cancel_navigation("current display unavailable");
-            return;
-        };
+        let displays: Vec<_> = window
+            .available_monitors()
+            .filter_map(|monitor| corner::display(&monitor))
+            .collect();
         let size = window.inner_size();
         let backing = window.scale_factor();
         if !backing.is_finite() || backing <= 0.0 || size.width == 0 || size.height == 0 {
@@ -1680,8 +1687,8 @@ impl FamiliarView {
             self.options.sprite_scale,
         )
         .bounds;
-        let Some(target) = corner::Corner::random().target(
-            display.work,
+        let Some((display, target)) = corner::random_target(
+            &displays,
             (x1 - x0) as f64 / backing,
             (y1 - y0) as f64 / backing,
         ) else {
@@ -1696,6 +1703,7 @@ impl FamiliarView {
                 x: (x1 - x0) as f64 / backing,
                 y: (y1 - y0) as f64 / backing,
             },
+            backing,
         );
     }
 
@@ -1707,6 +1715,7 @@ impl FamiliarView {
             display,
             target,
             size: sprite_size,
+            backing: starting_backing,
             ..
         }) = &self.navigation
         else {
@@ -1715,7 +1724,8 @@ impl FamiliarView {
         let display = *display;
         let target = *target;
         let sprite_size = *sprite_size;
-        // Keep the original monitor, even if the moving window crosses an edge.
+        let starting_backing = *starting_backing;
+        // Keep the selected destination display, even while crossing other screens.
         let current = window
             .available_monitors()
             .filter_map(|m| corner::display(&m))
@@ -1732,13 +1742,18 @@ impl FamiliarView {
             self.options.sprite_scale,
         )
         .bounds;
-        // A scale/layout change must not make a previously safe destination clip
-        // a larger frame. Cancel, rather than silently choose another corner.
-        if !backing.is_finite()
-            || backing <= 0.0
-            || ((x1 - x0) as f64 / backing - sprite_size.x).abs() > 1.0 / backing
-            || ((y1 - y0) as f64 / backing - sprite_size.y).abs() > 1.0 / backing
-        {
+        // Pixel-center rounding can change at both densities during a crossing.
+        // Genuine sprite-scale edits cancel in apply_settings; do not mistake a
+        // newly rounded raster for a logical size edit or reroll the destination.
+        if !corner::same_sprite_size(
+            sprite_size,
+            starting_backing,
+            Point {
+                x: (x1 - x0) as f64 / backing,
+                y: (y1 - y0) as f64 / backing,
+            },
+            backing,
+        ) {
             self.cancel_navigation("corner sprite dimensions changed");
             return;
         }
@@ -1769,12 +1784,13 @@ impl FamiliarView {
         let Some(Navigation::Corner { navigator, .. }) = &mut self.navigation else {
             return;
         };
-        let step = navigator.step_fixed(now, foot, target, backing);
+        let movement_scale = NativeMotion::position_scale(backing);
+        let step = navigator.step_fixed(now, foot, target, movement_scale);
         if let PursuitStep::Move { facing, .. } = step {
             self.prepare_running_pose(facing, elapsed);
         }
         if let Some(delta) = self.apply_pursuit_step(step) {
-            let position = self.native_motion.request(origin, delta, backing);
+            let position = self.native_motion.request(origin, delta, movement_scale);
             if position != origin {
                 window.set_outer_position(LogicalPosition::new(position.x, position.y));
             }
@@ -5409,6 +5425,7 @@ mod tests {
             },
             corner.target(area, 100.0, 100.0).unwrap(),
             Point { x: 100.0, y: 100.0 },
+            1.0,
         );
     }
 
@@ -5526,6 +5543,66 @@ mod tests {
             );
             assert_eq!(view.display.is_manual(), manual);
         }
+    }
+
+    #[test]
+    fn corner_density_rounding_keeps_destination_but_sprite_edits_cancel() {
+        let atlas = Arc::new(SpriteAtlas::load().unwrap());
+        for sprite_scale in [0.525, 0.75, 1.0, 1.875] {
+            let mut opts = options();
+            opts.scale = 1.5;
+            opts.sprite_scale = sprite_scale;
+            let mut view = FamiliarView::new("first".into(), atlas.clone(), opts);
+            injected_corner(&mut view, Instant::now());
+            let Some(Navigation::Corner {
+                target: original_target,
+                ..
+            }) = view.navigation
+            else {
+                panic!()
+            };
+            for from in [1.0, 2.0] {
+                for to in [1.0, 2.0] {
+                    for old_show in [false, true] {
+                        for new_show in [false, true] {
+                            let dimensions = |backing, show| {
+                                let size = layout_size(show, sprite_scale, 1.5 * backing);
+                                let (x0, y0, x1, y1) =
+                                    bubble::SpriteProjection::new(size, show, sprite_scale).bounds;
+                                Point {
+                                    x: (x1 - x0) as f64 / backing,
+                                    y: (y1 - y0) as f64 / backing,
+                                }
+                            };
+                            assert!(corner::same_sprite_size(
+                                dimensions(from, old_show),
+                                from,
+                                dimensions(to, new_show),
+                                to
+                            ));
+                            assert!(
+                                matches!(view.navigation, Some(Navigation::Corner { target, .. }) if target == original_target)
+                            );
+                        }
+                    }
+                }
+            }
+            let settings = FamiliarSettings {
+                sprite_scale: f64::from(sprite_scale) + 0.01,
+                ..view.settings
+            };
+            view.apply_settings(settings).unwrap();
+            assert!(
+                view.navigation.is_none(),
+                "even small explicit scale edits must cancel"
+            );
+        }
+        assert!(!corner::same_sprite_size(
+            Point { x: 144.0, y: 156.0 },
+            1.0,
+            Point { x: 150.0, y: 156.0 },
+            2.0
+        ));
     }
 
     #[test]

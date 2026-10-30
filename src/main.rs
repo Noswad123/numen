@@ -13,6 +13,7 @@ mod hotkey;
 mod ipc;
 mod menu;
 mod motion;
+mod native_window;
 mod pointer;
 mod preferences;
 mod protocol;
