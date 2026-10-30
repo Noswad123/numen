@@ -107,57 +107,57 @@ pub fn entries(context: Context) -> Vec<Entry> {
             tooltip: None,
         },
     ];
+    if let Some(attachments) = context.attachments {
+        entries.insert(1, attachment_entries(attachments));
+    }
+    let mut fields = Vec::new();
     if let Some(settings) = context.settings.filter(|s| s.validate().is_ok()) {
-        let fields = crate::menu::SETTINGS
-            .iter()
-            .map(|(field, label, presets)| {
-                let current = match *field {
-                    "sprite_scale" => settings.sprite_scale,
-                    "font_size" => settings.font_size,
-                    "bubble_duration" => settings.bubble_duration,
-                    _ => unreachable!("trusted settings catalog"),
-                };
-                let mut values: Vec<_> = presets
-                    .iter()
-                    .map(|(name, value)| {
-                        let mut patch = SettingsPatch::default();
-                        match *field {
-                            "sprite_scale" => patch.sprite_scale = Some(*value),
-                            "font_size" => patch.font_size = Some(*value),
-                            "bubble_duration" => patch.bubble_duration = Some(*value),
-                            _ => unreachable!("trusted settings catalog"),
-                        }
-                        Entry::Item {
-                            label: format!("{name} ({value})"),
-                            action: Some(Action::Settings(patch)),
-                            enabled: true,
-                            checked: current == *value,
-                            tooltip: None,
-                        }
-                    })
-                    .collect();
-                if !presets.iter().any(|(_, value)| current == *value) {
-                    values.push(Entry::Item {
-                        label: format!("Custom ({current})"),
-                        action: None,
-                        enabled: false,
-                        checked: true,
+        fields.extend(crate::menu::SETTINGS.iter().map(|(field, label, presets)| {
+            let current = match *field {
+                "sprite_scale" => settings.sprite_scale,
+                "font_size" => settings.font_size,
+                "bubble_duration" => settings.bubble_duration,
+                _ => unreachable!("trusted settings catalog"),
+            };
+            let mut values: Vec<_> = presets
+                .iter()
+                .map(|(name, value)| {
+                    let mut patch = SettingsPatch::default();
+                    match *field {
+                        "sprite_scale" => patch.sprite_scale = Some(*value),
+                        "font_size" => patch.font_size = Some(*value),
+                        "bubble_duration" => patch.bubble_duration = Some(*value),
+                        _ => unreachable!("trusted settings catalog"),
+                    }
+                    Entry::Item {
+                        label: format!("{name} ({value})"),
+                        action: Some(Action::Settings(patch)),
+                        enabled: true,
+                        checked: current == *value,
                         tooltip: None,
-                    });
-                }
-                Entry::Submenu {
-                    label: (*label).into(),
-                    entries: values,
-                }
-            })
-            .collect();
-        entries.push(Entry::Submenu {
-            label: "Settings".into(),
-            entries: fields,
-        });
+                    }
+                })
+                .collect();
+            if !presets.iter().any(|(_, value)| current == *value) {
+                values.push(Entry::Item {
+                    label: format!("Custom ({current})"),
+                    action: None,
+                    enabled: false,
+                    checked: true,
+                    tooltip: None,
+                });
+            }
+            Entry::Submenu {
+                label: (*label).into(),
+                entries: values,
+            }
+        }));
     }
     if context.preferences {
-        entries.push(Entry::Item {
+        if !fields.is_empty() {
+            fields.push(Entry::Separator);
+        }
+        fields.push(Entry::Item {
             label: "Forget saved preferences".into(),
             action: Some(Action::ForgetPreferences),
             enabled: true,
@@ -165,8 +165,11 @@ pub fn entries(context: Context) -> Vec<Entry> {
             tooltip: None,
         });
     }
-    if let Some(attachments) = context.attachments {
-        entries.push(attachment_entries(attachments));
+    if !fields.is_empty() {
+        entries.push(Entry::Submenu {
+            label: "Settings".into(),
+            entries: fields,
+        });
     }
     if let Some(enabled) = context.open_familiar {
         entries.push(Entry::Item {
@@ -920,29 +923,119 @@ mod tests {
 
     #[test]
     fn forget_preferences_is_only_offered_for_writable_binding() {
-        for writable in [false, true] {
-            let mut context = context(None);
-            context.preferences = writable;
-            let catalog = entries(context);
-            let forget: Vec<_> = catalog
-                .iter()
-                .filter(|entry| {
-                    matches!(
-                        entry,
-                        Entry::Item {
-                            action: Some(Action::ForgetPreferences),
-                            ..
+        for settings in [
+            None,
+            Some(FamiliarSettings::default()),
+            Some(FamiliarSettings {
+                font_size: f64::NAN,
+                ..Default::default()
+            }),
+        ] {
+            for writable in [false, true] {
+                let mut context = context(settings);
+                context.preferences = writable;
+                let catalog = entries(context);
+                assert!(!catalog.iter().any(|entry| matches!(
+                    entry,
+                    Entry::Item {
+                        action: Some(Action::ForgetPreferences),
+                        ..
+                    }
+                )));
+                let fields = catalog.iter().find_map(|entry| match entry {
+                    Entry::Submenu { label, entries } if label == "Settings" => Some(entries),
+                    _ => None,
+                });
+                let editable = settings.is_some_and(|settings| settings.validate().is_ok());
+                assert_eq!(fields.is_some(), editable || writable);
+                let Some(fields) = fields else { continue };
+                let forget: Vec<_> = fields
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry,
+                            Entry::Item {
+                                action: Some(Action::ForgetPreferences),
+                                ..
+                            }
+                        )
+                    })
+                    .collect();
+                assert_eq!(forget.len(), usize::from(writable));
+                if writable {
+                    assert!(matches!(fields.last(), Some(Entry::Item {
+                        label, action: Some(Action::ForgetPreferences), enabled: true, ..
+                    }) if label == "Forget saved preferences"));
+                }
+                if editable && writable {
+                    assert_eq!(fields.len(), crate::menu::SETTINGS.len() + 2);
+                    assert_eq!(fields[fields.len() - 2], Entry::Separator);
+                } else {
+                    assert!(!fields.iter().any(|entry| matches!(entry, Entry::Separator)));
+                    assert_eq!(
+                        fields.len(),
+                        if editable {
+                            crate::menu::SETTINGS.len()
+                        } else {
+                            1
                         }
-                    )
-                })
-                .collect();
-            assert_eq!(forget.len(), usize::from(writable));
-            if writable {
-                assert!(matches!(forget[0], Entry::Item { label, enabled: true, .. }
-                    if label == "Forget saved preferences"));
+                    );
+                }
             }
         }
         assert!(!Action::ForgetPreferences.is_service());
+    }
+
+    #[test]
+    fn attachment_is_second_for_attached_unattached_and_unavailable_views() {
+        for attached in [false, true] {
+            for available in [false, true] {
+                let mut context = context(Some(FamiliarSettings::default()));
+                context.preferences = true;
+                context.attachments = Some(AttachmentContext {
+                    current: attached.then(|| chat(0).target),
+                    available,
+                    choices: if available { vec![chat(0)] } else { Vec::new() },
+                });
+                let catalog = entries(context);
+                assert!(matches!(
+                    catalog[0],
+                    Entry::Item {
+                        action: Some(Action::RevealStatus),
+                        ..
+                    }
+                ));
+                let expected = if attached {
+                    "Change attachment"
+                } else {
+                    "Attach to app / chat"
+                };
+                assert!(matches!(&catalog[1], Entry::Submenu { label, .. } if label == expected));
+                assert_eq!(
+                    catalog
+                        .iter()
+                        .filter(|entry| matches!(entry,
+                            Entry::Submenu { label, .. } if label == expected
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(matches!(
+                    catalog[2],
+                    Entry::Item {
+                        action: Some(Action::CopySessionId),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    catalog[3],
+                    Entry::Item {
+                        action: Some(Action::OpenChat),
+                        ..
+                    }
+                ));
+            }
+        }
     }
 
     #[test]

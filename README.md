@@ -335,14 +335,14 @@ See [internal interfaces/data flow](PROTOCOL.md#native-chat-picker-internal-inte
 | Action | Scope / availability |
 | --- | --- |
 | Show status | Timed reveal of the clicked view; disabled by `--no-bubble`. |
-| Copy session ID | Immediately after Show status; copies the exact attached activity/session ID, including a retained disconnected pin. Disabled unattached; independent of `--no-bubble`. |
+| Change attachment / Attach to app / chat | Second, after Show status whenever attachment controls are present; Change attachment when bound, Attach to app / chat when unbound. Existing live view only; eligible connected exact targets, with frozen choices and authoritative commit checks above. |
+| Copy session ID | Follows the attachment submenu (or Show status when absent); copies the exact attached activity/session ID, including a retained disconnected pin. Disabled unattached; independent of `--no-bubble`. |
 | Open chat | Immediately after Copy session ID; current live Djinn attachment on macOS only, independent of `--no-bubble`. Launches/focuses a full chat viewer via Wisp; enabled state is not an installed-capability probe. |
 | Go to mouse | Clicked view only, with live navigation and an available pointer reader; preserves pause. |
 | Pause / Resume | Only the clicked view's animation/motion pause state. |
-| Settings | Three existing fields and preset sets below; one field per selection, live service only. |
+| Settings | Three existing fields and preset sets below when editable; one field per selection, live service only. May contain Forget alone when editable settings are unavailable. Omitted when empty. |
+| Settings → Forget saved preferences | After a separator below existing fields, or alone without a leading separator; writable bound view only. Removes remembered style/placement, leaving the current view unchanged. Independent of editable settings support. |
 | Open another familiar | Live-service-only, service-scoped unattached Open; worker rechecks graphical support/capacity, then canonical Store Open with no target. No optimistic window or source execution; unlike Quit it does not exit. |
-| Change attachment / Attach to app / chat | Existing live view only; eligible connected exact targets, with frozen choices and authoritative commit checks above. |
-| Forget saved preferences | Writable bound view only; removes remembered style/placement, leaving the current view unchanged. |
 | Close familiar | Only the clicked familiar, using the existing bounded close/retry path; last Close keeps the service. |
 | Quit Numen (all familiars) | Normal root shutdown of the entire Numen service, never Djinn or another source app. |
 
