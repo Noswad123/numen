@@ -564,9 +564,37 @@ fn presets_are_available_without_a_service() {
     let (_dir, socket) = fixture();
     assert_eq!(
         control(&socket, &["presets"]),
-        json!({"presets":[{"id":"djinn","name":"Djinn","capabilities":["open","open-attached"]}]})
+        json!({"presets":[
+            {"id":"random","name":"Random (unused first)","capabilities":["open","open-attached"]},
+            {"id":"amethyst","name":"Amethyst","capabilities":["open","open-attached"]},
+            {"id":"ruby","name":"Ruby","capabilities":["open","open-attached"]},
+            {"id":"saphire","name":"Saphire","capabilities":["open","open-attached"]},
+            {"id":"emerald","name":"Emerald","capabilities":["open","open-attached"]}
+        ]})
     );
     assert!(!socket.exists());
+}
+
+#[test]
+fn check_assets_validates_all_bundled_characters_without_a_service() {
+    let (dir, socket) = fixture();
+    let mut child = ChildGuard(command(&socket).arg("check-assets").spawn().unwrap());
+    let status = child.wait_until(Instant::now() + LIMIT);
+    let (stdout, stderr) = child.output();
+    assert!(status.success(), "{stderr}");
+    for character in [
+        "Amethyst (amethyst)",
+        "Ruby (ruby)",
+        "Saphire (saphire)",
+        "Emerald (emerald)",
+    ] {
+        assert!(
+            stdout.contains(&format!("{character}: validated embedded RGBA atlas")),
+            "{stdout}"
+        );
+    }
+    assert_eq!(stdout.matches(" frames,").count(), 36, "{stdout}");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -590,9 +618,14 @@ fn headless_discovery_reports_live_targets_but_no_lifecycle_capabilities() {
     );
     let attachment = json!({"source":"djinn","instance":"one","activity":"a"});
     let familiars = control(&socket, &["familiars"]);
+    let preset = familiars["familiars"][0]["preset"].as_str().unwrap();
+    assert!(
+        matches!(preset, "amethyst" | "ruby" | "saphire" | "emerald"),
+        "{familiars}"
+    );
     assert_eq!(
         familiars,
-        json!({"familiars":[{"id":"main","preset":"djinn","attachment":attachment,
+        json!({"familiars":[{"id":"main","preset":preset,"attachment":attachment,
             "available":true,"capabilities":[],"settings":{"sprite_scale":0.5,"font_size":12.0,"bubble_duration":5.0}}],"offset":0,"total":1,"next_offset":null})
     );
     assert_eq!(
@@ -1137,7 +1170,7 @@ fn direct_unattached_open_never_bootstraps_and_validates_ack_ids() {
         let (status, stdout, stderr) = mock_control_result(
             &["open"],
             None,
-            json!({"version":1,"type":"familiar.open","items":[{"id":null,"preset":"djinn"}]}),
+            json!({"version":1,"type":"familiar.open","items":[{"id":null,"preset":"random"}]}),
             data,
         );
         assert!(!status.success());
@@ -1149,7 +1182,7 @@ fn direct_unattached_open_never_bootstraps_and_validates_ack_ids() {
 #[test]
 fn lifecycle_commands_serialize_each_selection_and_print_ack_data() {
     let open = json!([
-        {"id":"first","preset":"djinn","source":"djinn","instance":"one","activity":"a"},
+        {"id":"first","preset":"amethyst","source":"djinn","instance":"one","activity":"a"},
         {"source":"build","activity":"b"},
         {}
     ]);
@@ -1170,10 +1203,30 @@ fn lifecycle_commands_serialize_each_selection_and_print_ack_data() {
         json!({"attached":["first","second"]}),
     );
     for (args, item) in [
-        (vec!["open"], json!({"id":null,"preset":"djinn"})),
+        (vec!["open"], json!({"id":null,"preset":"random"})),
+        (
+            vec!["open", "--preset", "random"],
+            json!({"id":null,"preset":"random"}),
+        ),
+        (
+            vec!["open", "--preset", "amethyst"],
+            json!({"id":null,"preset":"amethyst"}),
+        ),
+        (
+            vec!["open", "--preset", "ruby"],
+            json!({"id":null,"preset":"ruby"}),
+        ),
+        (
+            vec!["open", "--preset", "saphire"],
+            json!({"id":null,"preset":"saphire"}),
+        ),
+        (
+            vec!["open", "--preset", "emerald"],
+            json!({"id":null,"preset":"emerald"}),
+        ),
         (
             vec!["open", "--source", "djinn", "--activity", "a"],
-            json!({"id":null,"preset":"djinn","source":"djinn","instance":null,"activity":"a"}),
+            json!({"id":null,"preset":"random","source":"djinn","instance":null,"activity":"a"}),
         ),
         (
             vec![
@@ -1187,9 +1240,9 @@ fn lifecycle_commands_serialize_each_selection_and_print_ack_data() {
                 "--id",
                 "second",
                 "--preset",
-                "djinn",
+                "amethyst",
             ],
-            json!({"id":"second","preset":"djinn","source":"build","instance":"two","activity":"b"}),
+            json!({"id":"second","preset":"amethyst","source":"build","instance":"two","activity":"b"}),
         ),
         (
             vec![
@@ -1404,7 +1457,7 @@ fn raw_batches_reject_recursive_duplicate_keys_before_socket_or_ancestor_io() {
         r#"[{"source":null,"source":"a","activity":"b","id":"x"}]"#,
         r#"[{"id":null,"id":"x","source":"a","activity":"b"}]"#,
         r#"[{"id":"x","source":"a","source":"c","activity":"b"}]"#,
-        r#"[{"id":"x","source":"a","activity":"b","preset":{"name":null,"name":"djinn"}}]"#,
+        r#"[{"id":"x","source":"a","activity":"b","preset":{"name":null,"name":"amethyst"}}]"#,
         r#"[{"id":"x","target":{"source":null,"source":"a","activity":"b"}}]"#,
         r#"[{"id":"x","source":"a","activity":"b","metadata":{"rows":[{"key":null,"key":"value"}]}}]"#,
         r#"[{"id":"x","source":"a","activity":"b","metadata":null,"metadata":{}}]"#,
@@ -1568,6 +1621,13 @@ fn invalid_batches_and_selections_are_rejected_before_connecting() {
             "duplicate familiar ID",
         ),
         (vec!["go-to-mouse"], None, "required"),
+        (vec!["open", "--preset", "djinn"], None, "unknown preset"),
+        (
+            vec!["open", "--preset", "hexa-glasses"],
+            None,
+            "unknown preset",
+        ),
+        (vec!["open", "--preset", "sapphire"], None, "unknown preset"),
         (
             vec!["go-to-mouse", "--familiar"],
             None,
@@ -2581,12 +2641,16 @@ fn doctor_legacy_and_future_diagnostics_remain_unknown() {
     assert_eq!(legacy["build_comparison"], "unknown");
     assert_eq!(legacy["service"]["settings"], Value::Null);
     assert_eq!(legacy["service"]["diagnostics"], Value::Null);
-    data["diagnostics"] = json!({"version":2,"executable":"bad\npath","hotkeys":{"option_i":{"state":"registered"},"option_c":"bad"}});
+    data["diagnostics"] = json!({"version":2,"executable":"future-diagnostics-must-not-leak\npath","hotkeys":{"option_i":{"state":"registered"},"option_c":"future-diagnostics-must-not-leak"}});
     let future = doctor_data(&data);
     assert_eq!(future["service_state"], "unsupported_diagnostics");
     assert_eq!(future["build_comparison"], "unknown");
     assert_eq!(future["service"]["diagnostics"], Value::Null);
-    assert!(!future.to_string().contains("bad"));
+    assert!(
+        !future
+            .to_string()
+            .contains("future-diagnostics-must-not-leak")
+    );
     let reply = json!({"version":1,"ok":true,"data":legacy_service()}).to_string();
     let (status, stdout, stderr) = doctor_mock(Some(&reply), true);
     assert!(status.success(), "{stderr}");
@@ -2733,7 +2797,7 @@ fn menu_with_mock_fzf_and_pty_dispatches_info_without_a_gui() {
                     "service_instance":"mock-menu-service"})
                 );
                 discovered = true;
-                json!({"familiars":[{"id":"main","preset":"djinn","attachment":null,
+                json!({"familiars":[{"id":"main","preset":"amethyst","attachment":null,
                     "available":false,"summary":null,"capabilities":["info"]}],
                     "offset":0,"total":1,"next_offset":null})
             }
@@ -2856,7 +2920,7 @@ printf '\n%s\n' "$selected"
                         json!({"version":1,"type":"familiar.list","offset":0,
                         "service_instance":"settings-generation"})
                     );
-                    json!({"familiars":[{"id":"main","preset":"djinn","attachment":null,
+                    json!({"familiars":[{"id":"main","preset":"amethyst","attachment":null,
                         "available":false,"capabilities":["settings"],
                         "settings":{"sprite_scale":0.5,"font_size":12.0,"bubble_duration":5.0}}],
                         "offset":0,"total":1,"next_offset":null})

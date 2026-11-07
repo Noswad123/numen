@@ -8,11 +8,50 @@ use crate::animation::Animation;
 
 pub const CELL_WIDTH: u32 = 192;
 pub const CELL_HEIGHT: u32 = 208;
-// Temporary global default, independent of activity producer source IDs.
-pub const DEFAULT_CHARACTER_ID: &str = "djinn";
-pub const DEFAULT_CHARACTER_NAME: &str = "Djinn";
+// Deterministic manual/demo default, independent of activity producer source IDs.
+pub const DEFAULT_CHARACTER_ID: &str = "amethyst";
+pub const DEFAULT_CHARACTER_NAME: &str = "Amethyst";
+pub const RANDOM_PRESET: &str = "random";
 const MANIFEST: &str = include_str!("../assets/djinn/manifest.json");
 const SPRITESHEET: &[u8] = include_bytes!("../assets/djinn/spritesheet.png");
+
+pub struct Character {
+    pub id: &'static str,
+    pub name: &'static str,
+    manifest: &'static str,
+    png: &'static [u8],
+}
+
+pub const CHARACTERS: &[Character] = &[
+    Character {
+        id: DEFAULT_CHARACTER_ID,
+        name: DEFAULT_CHARACTER_NAME,
+        manifest: MANIFEST,
+        png: SPRITESHEET,
+    },
+    Character {
+        id: "ruby",
+        name: "Ruby",
+        manifest: include_str!("../assets/ruby/manifest.json"),
+        png: include_bytes!("../assets/ruby/spritesheet.png"),
+    },
+    Character {
+        id: "saphire",
+        name: "Saphire",
+        manifest: include_str!("../assets/hexa-glasses/manifest.json"),
+        png: include_bytes!("../assets/hexa-glasses/spritesheet.png"),
+    },
+    Character {
+        id: "emerald",
+        name: "Emerald",
+        manifest: include_str!("../assets/emerald/manifest.json"),
+        png: include_bytes!("../assets/emerald/spritesheet.png"),
+    },
+];
+
+pub fn character(id: &str) -> Option<&'static Character> {
+    CHARACTERS.iter().find(|character| character.id == id)
+}
 
 pub struct Clip {
     pub frame_durations: Vec<Duration>,
@@ -137,7 +176,13 @@ impl Manifest {
 
 impl SpriteAtlas {
     pub fn load() -> Result<Self> {
-        Self::from_bytes(MANIFEST, SPRITESHEET)
+        Self::load_character(DEFAULT_CHARACTER_ID)
+    }
+
+    pub fn load_character(id: &str) -> Result<Self> {
+        let character = character(id).with_context(|| format!("unknown character: {id}"))?;
+        Self::from_bytes(character.manifest, character.png)
+            .with_context(|| format!("cannot load character: {id}"))
     }
 
     fn from_bytes(json: &str, png: &[u8]) -> Result<Self> {
@@ -197,76 +242,137 @@ mod tests {
 
     #[test]
     fn default_character_identity() {
-        assert_eq!(DEFAULT_CHARACTER_ID, "djinn");
-        assert_eq!(DEFAULT_CHARACTER_NAME, "Djinn");
+        assert_eq!(DEFAULT_CHARACTER_ID, "amethyst");
+        assert_eq!(DEFAULT_CHARACTER_NAME, "Amethyst");
+        let default = character(DEFAULT_CHARACTER_ID).unwrap();
+        assert_eq!(default.name, DEFAULT_CHARACTER_NAME);
+        let atlas = SpriteAtlas::load().unwrap();
+        let explicit = SpriteAtlas::load_character(DEFAULT_CHARACTER_ID).unwrap();
+        for animation in Animation::ALL {
+            assert_eq!(atlas.frame(animation, 0), explicit.frame(animation, 0));
+        }
+    }
+
+    #[test]
+    fn catalog_identity_and_lookup() {
+        assert_eq!(RANDOM_PRESET, "random");
+        assert_eq!(
+            CHARACTERS
+                .iter()
+                .map(|c| (c.id, c.name))
+                .collect::<Vec<_>>(),
+            [
+                ("amethyst", "Amethyst"),
+                ("ruby", "Ruby"),
+                ("saphire", "Saphire"),
+                ("emerald", "Emerald")
+            ]
+        );
+        let mut ids = HashSet::new();
+        for entry in CHARACTERS {
+            assert!(ids.insert(entry.id));
+            assert_eq!(character(entry.id).unwrap().name, entry.name);
+        }
+        for id in [
+            "",
+            "unknown",
+            "Ruby",
+            "djinn",
+            "hexa-glasses",
+            "sapphire",
+            RANDOM_PRESET,
+        ] {
+            assert!(character(id).is_none());
+            let error = SpriteAtlas::load_character(id).err().unwrap();
+            assert!(error.to_string().contains("unknown character:"));
+        }
     }
 
     #[test]
     fn exact_manifest_rows_timings_and_cached_rgba() {
-        let manifest = Manifest::parse(MANIFEST).unwrap();
-        let atlas = SpriteAtlas::load().unwrap();
-        let source = image::load_from_memory(SPRITESHEET).unwrap().into_rgba8();
-        let expected: [(Animation, u32, &[u64]); 9] = [
-            (Animation::Idle, 0, &[280, 110, 110, 140, 140, 320]),
-            (
-                Animation::RunningRight,
-                1,
-                &[120, 120, 120, 120, 120, 120, 120, 220],
-            ),
-            (
-                Animation::RunningLeft,
-                2,
-                &[120, 120, 120, 120, 120, 120, 120, 220],
-            ),
-            (Animation::Waving, 3, &[140, 140, 140, 280]),
-            (Animation::Succeeded, 4, &[140, 140, 140, 140, 280]),
-            (
-                Animation::Failed,
-                5,
-                &[140, 140, 140, 140, 140, 140, 140, 240],
-            ),
-            (Animation::Waiting, 6, &[150, 150, 150, 150, 150, 260]),
-            (Animation::Working, 7, &[120, 120, 120, 120, 120, 220]),
-            (Animation::Review, 8, &[150, 150, 150, 150, 150, 280]),
-        ];
-        for (animation, row, timings) in expected {
-            assert_eq!(manifest.clips[&animation].row, row);
-            let clip = atlas.clip(animation);
-            assert_eq!(
-                clip.frame_durations,
-                timings
-                    .iter()
-                    .map(|&ms| Duration::from_millis(ms))
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(clip.frames.len(), timings.len());
-            for index in 0..timings.len() {
-                let frame = atlas.frame(animation, index);
-                assert_eq!(frame.len(), (CELL_WIDTH * CELL_HEIGHT * 4) as usize);
-                let expected = image::imageops::crop_imm(
-                    &source,
-                    index as u32 * CELL_WIDTH,
-                    row * CELL_HEIGHT,
-                    CELL_WIDTH,
-                    CELL_HEIGHT,
-                )
-                .to_image();
-                assert_eq!(frame, expected.as_raw());
-                assert!(std::ptr::eq(frame, atlas.frame(animation, index)));
+        for character in CHARACTERS {
+            let manifest = Manifest::parse(character.manifest).unwrap();
+            let atlas = SpriteAtlas::load_character(character.id).unwrap();
+            let decoded = image::load_from_memory(character.png).unwrap();
+            assert_eq!(decoded.color(), image::ColorType::Rgba8);
+            let source = decoded.into_rgba8();
+            assert_eq!(source.dimensions(), (1536, 2288));
+            let expected: [(Animation, u32, &[u64]); 9] = [
+                (Animation::Idle, 0, &[280, 110, 110, 140, 140, 320]),
+                (
+                    Animation::RunningRight,
+                    1,
+                    &[120, 120, 120, 120, 120, 120, 120, 220],
+                ),
+                (
+                    Animation::RunningLeft,
+                    2,
+                    &[120, 120, 120, 120, 120, 120, 120, 220],
+                ),
+                (Animation::Waving, 3, &[140, 140, 140, 280]),
+                (Animation::Succeeded, 4, &[140, 140, 140, 140, 280]),
+                (
+                    Animation::Failed,
+                    5,
+                    &[140, 140, 140, 140, 140, 140, 140, 240],
+                ),
+                (Animation::Waiting, 6, &[150, 150, 150, 150, 150, 260]),
+                (Animation::Working, 7, &[120, 120, 120, 120, 120, 220]),
+                (Animation::Review, 8, &[150, 150, 150, 150, 150, 280]),
+            ];
+            for (animation, row, timings) in expected {
+                assert_eq!(manifest.clips[&animation].row, row);
+                let clip = atlas.clip(animation);
+                assert_eq!(
+                    clip.looping,
+                    !matches!(
+                        animation,
+                        Animation::Waving | Animation::Succeeded | Animation::Failed
+                    )
+                );
+                assert_eq!(
+                    clip.frame_durations,
+                    timings
+                        .iter()
+                        .map(|&ms| Duration::from_millis(ms))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(clip.frames.len(), timings.len());
+                for index in 0..timings.len() {
+                    let frame = atlas.frame(animation, index);
+                    assert_eq!(frame.len(), (CELL_WIDTH * CELL_HEIGHT * 4) as usize);
+                    let expected = image::imageops::crop_imm(
+                        &source,
+                        index as u32 * CELL_WIDTH,
+                        row * CELL_HEIGHT,
+                        CELL_WIDTH,
+                        CELL_HEIGHT,
+                    )
+                    .to_image();
+                    assert_eq!(frame, expected.as_raw());
+                    assert!(std::ptr::eq(frame, atlas.frame(animation, index)));
+                    assert!(frame.chunks_exact(4).any(|pixel| pixel[3] == 0));
+                    assert!(frame.chunks_exact(4).any(|pixel| pixel[3] == 255));
+                    assert!(
+                        frame
+                            .chunks_exact(4)
+                            .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
+                    );
+                }
             }
+            assert!(
+                atlas
+                    .frame(Animation::Idle, 0)
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] == 0)
+            );
+            assert!(
+                atlas
+                    .frame(Animation::Idle, 0)
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] > 0)
+            );
         }
-        assert!(
-            atlas
-                .frame(Animation::Idle, 0)
-                .chunks_exact(4)
-                .any(|pixel| pixel[3] == 0)
-        );
-        assert!(
-            atlas
-                .frame(Animation::Idle, 0)
-                .chunks_exact(4)
-                .any(|pixel| pixel[3] > 0)
-        );
     }
 
     #[test]

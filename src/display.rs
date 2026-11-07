@@ -180,7 +180,7 @@ mod tests {
         let mailbox = Mailbox::<Vec<crate::activity::FamiliarPresentation>>::default();
         assert!(mailbox.post(vec![crate::activity::FamiliarPresentation {
             id: "main".into(),
-            preset: "djinn".into(),
+            preset: "amethyst".into(),
             settings: crate::protocol::FamiliarSettings::default(),
             runtime_binding: crate::activity::AttachmentBinding {
                 target: None,
@@ -200,7 +200,7 @@ mod tests {
         let mailbox = Mailbox::default();
         let mut view = FamiliarPresentation {
             id: "new".into(),
-            preset: "djinn".into(),
+            preset: "amethyst".into(),
             settings: FamiliarSettings::default(),
             runtime_binding: crate::activity::AttachmentBinding {
                 target: None,

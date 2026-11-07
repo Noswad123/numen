@@ -449,8 +449,7 @@ impl FamiliarControl {
 
     /// Queue acceptance only; registry snapshots report committed opens.
     pub fn open_unattached(&self, preset: &str) -> Result<()> {
-        protocol::validate_id(preset)?;
-        ensure!(preset == "djinn", "unknown preset");
+        protocol::validate_preset(preset)?;
         self.sender
             .try_send(FamiliarCommand::OpenUnattached {
                 preset: preset.into(),
@@ -1916,32 +1915,40 @@ mod tests {
             sender,
             target_memo: TargetCache::default(),
         };
-        for preset in ["", "bad/id", "unknown"] {
+        for preset in ["", "bad/id", "unknown", "djinn", "hexa-glasses", "sapphire"] {
             assert!(control.open_unattached(preset).is_err());
         }
         assert!(receiver.try_recv().is_err());
+        for preset in std::iter::once(crate::assets::RANDOM_PRESET)
+            .chain(crate::assets::CHARACTERS.iter().map(|c| c.id))
+        {
+            control.open_unattached(preset).unwrap();
+            assert!(
+                matches!(receiver.try_recv().unwrap(), FamiliarCommand::OpenUnattached { preset: queued } if queued == preset)
+            );
+        }
         control.close("main").unwrap();
         for _ in 0..31 {
-            control.open_unattached("djinn").unwrap();
+            control.open_unattached("amethyst").unwrap();
         }
         let start = Instant::now();
-        assert!(control.open_unattached("djinn").is_err());
+        assert!(control.open_unattached("amethyst").is_err());
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(matches!(receiver.try_recv().unwrap(), FamiliarCommand::Close(id) if id == "main"));
         for _ in 0..31 {
             assert!(
-                matches!(receiver.try_recv().unwrap(), FamiliarCommand::OpenUnattached { preset } if preset == "djinn")
+                matches!(receiver.try_recv().unwrap(), FamiliarCommand::OpenUnattached { preset } if preset == "amethyst")
             );
         }
         drop(receiver);
-        assert!(control.open_unattached("djinn").is_err());
+        assert!(control.open_unattached("amethyst").is_err());
     }
 
     #[test]
     fn unattached_worker_is_service_scoped_atomic_at_capacity_and_headless_rejected() {
         let (mut store, mut controls) = picker_store();
         let command = || FamiliarCommand::OpenUnattached {
-            preset: "djinn".into(),
+            preset: "amethyst".into(),
         };
         controls.multi = false;
         let before = store.list(0);
@@ -1993,7 +2000,10 @@ mod tests {
             assert_eq!(snapshot.targets.len(), 1);
             assert!(snapshot.targets[0].claimed_by.is_none());
             assert!(receiver.try_recv().is_err());
-            server.familiar_control().open_unattached("djinn").unwrap();
+            server
+                .familiar_control()
+                .open_unattached("amethyst")
+                .unwrap();
             let views = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
             assert_eq!(views.len(), 2);
             assert!(
@@ -2089,7 +2099,7 @@ mod tests {
                 &(1..16)
                     .map(|index| protocol::OpenRequest {
                         id: Some(format!("picker-{index:02}")),
-                        preset: "djinn".into(),
+                        preset: "amethyst".into(),
                         target: Some(protocol::TargetRequest {
                             source: "source-00".into(),
                             instance: Some("one".into()),
@@ -2458,7 +2468,7 @@ mod tests {
                     store
                         .open(&[protocol::OpenRequest {
                             id: Some("other".into()),
-                            preset: "djinn".into(),
+                            preset: "amethyst".into(),
                             target: Some(protocol::TargetRequest {
                                 source: "test".into(),
                                 instance: Some("one".into()),
@@ -4604,6 +4614,8 @@ mod tests {
         )
         .unwrap();
         let initial = views.recv_timeout(IO_TIMEOUT).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert!(crate::assets::character(&initial[0].preset).is_some());
         assert_eq!(
             initial,
             vec![FamiliarPresentation {
@@ -4614,7 +4626,7 @@ mod tests {
                 preference: None,
                 settings: FamiliarSettings::default(),
                 id: "main".into(),
-                preset: "djinn".into(),
+                preset: initial[0].preset.clone(),
                 presentation: Presentation::default()
             }]
         );
@@ -4632,11 +4644,14 @@ mod tests {
         let both = views.recv_timeout(IO_TIMEOUT).unwrap();
         assert_eq!(both.len(), 2);
         assert_eq!(both[0], main[0]);
+        assert_ne!(both[0].preset, both[1].preset);
+        assert!(crate::assets::character(&both[1].preset).is_some());
         assert!(both[1].presentation.cue.is_none());
         let list = control(&path, json!({"version":1,"type":"familiar.list"})).unwrap();
         let rows = list["familiars"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
-        for row in rows {
+        for (row, view) in rows.iter().zip(&both) {
+            assert_eq!(row["preset"], view.preset);
             assert_eq!(row["capabilities"], json!(["info", "attach", "close"]));
         }
         producer

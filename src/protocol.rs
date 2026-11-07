@@ -121,7 +121,15 @@ impl TargetRequest {
 }
 
 fn default_preset() -> String {
-    "djinn".into()
+    crate::assets::RANDOM_PRESET.into()
+}
+
+pub(crate) fn validate_preset(preset: &str) -> Result<()> {
+    ensure!(
+        preset == crate::assets::RANDOM_PRESET || crate::assets::character(preset).is_some(),
+        "unknown preset"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -434,7 +442,7 @@ impl Request {
                     if let Some(id) = &item.id {
                         validate_id(id)?;
                     }
-                    ensure!(item.preset == "djinn", "unknown preset");
+                    validate_preset(&item.preset)?;
                     if let Some(target) = &item.target {
                         target.validate()?;
                     }
@@ -486,6 +494,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opens_accept_random_and_every_catalog_id_without_resolving_them() {
+        for preset in std::iter::once(crate::assets::RANDOM_PRESET)
+            .chain(crate::assets::CHARACTERS.iter().map(|c| c.id))
+        {
+            let packet =
+                serde_json::json!({"version":1,"type":"familiar.open","items":[{"preset":preset}]});
+            let Event::Open { items } = Request::parse(&serde_json::to_vec(&packet).unwrap())
+                .unwrap()
+                .event
+            else {
+                panic!("expected open");
+            };
+            assert_eq!(items[0].preset, preset);
+        }
+        for preset in [
+            "",
+            "unknown",
+            "Random",
+            "bad/id",
+            "djinn",
+            "hexa-glasses",
+            "sapphire",
+        ] {
+            assert!(validate_preset(preset).is_err());
+            let packet =
+                serde_json::json!({"version":1,"type":"familiar.open","items":[{"preset":preset}]});
+            assert!(Request::parse(&serde_json::to_vec(&packet).unwrap()).is_err());
+        }
+    }
+
+    #[test]
     fn open_target_is_flat_complete_or_entirely_absent() {
         for item in [
             r#"{}"#,
@@ -514,7 +553,7 @@ mod tests {
             r#"{"target":null}"#,
             r#"{"source":"a","activity":"bad/id"}"#,
             r#"{"id":null,"id":"x"}"#,
-            r#"{"preset":"djinn","preset":"djinn"}"#,
+            r#"{"preset":"amethyst","preset":"amethyst"}"#,
             r#"{"source":"a","source":"a","activity":"b"}"#,
             r#"{"source":"a","activity":"b","activity":"b"}"#,
             r#"{"source":"a","activity":"b","instance":null,"instance":null}"#,
@@ -744,7 +783,7 @@ mod tests {
         let Event::Open { items } = request.event else {
             panic!("expected open");
         };
-        assert_eq!(items[0].preset, "djinn");
+        assert_eq!(items[0].preset, crate::assets::RANDOM_PRESET);
         assert!(items[0].id.is_none());
     }
 

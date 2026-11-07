@@ -1,8 +1,15 @@
-# Djinn runtime assets
+# Amethyst runtime assets
 
-Djinn (`djinn`) is Numen's current temporary global default character. The
-eventual mapping of app source `djinn` to character `djinn` is separate from
-the future global default; activity source IDs do not define character identity.
+Amethyst (`amethyst`) is one of Numen's bundled characters alongside Ruby (`ruby`),
+Saphire (`saphire`) and Emerald (`emerald`) in the shared
+`assets::CHARACTERS` catalog. Normal live creation uses unused-first random
+selection; explicit `--preset amethyst` selects Amethyst exactly. Manual/demo retain
+Amethyst as their deterministic default. Activity source IDs do not define character
+identity; no source-to-character mapping is implemented.
+
+The directory remains `assets/djinn` to preserve artwork import provenance;
+`djinn` is not a legacy character alias. Djinn application/source/CLI integration
+names are unchanged by the runtime character rename.
 
 `spritesheet.png` is imported without modification from
 `final/spritesheet-extended.png` inside the owner's local `djinn-artifacts.zip`.

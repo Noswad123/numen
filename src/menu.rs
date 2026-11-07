@@ -25,7 +25,17 @@ pub struct MenuOptions {
 
 /// The offline preset catalog is also used by the CLI's `presets` command.
 pub fn presets() -> Value {
-    json!({"presets": [{"id": "djinn", "name": "Djinn", "capabilities": ["open", "open-attached"]}]})
+    let rows: Vec<_> = std::iter::once((crate::assets::RANDOM_PRESET, "Random (unused first)"))
+        .chain(
+            crate::assets::CHARACTERS
+                .iter()
+                .map(|character| (character.id, character.name)),
+        )
+        .map(
+            |(id, name)| json!({"id": id, "name": name, "capabilities": ["open", "open-attached"]}),
+        )
+        .collect();
+    json!({"presets": rows})
 }
 
 pub fn run(path: &Path, options: MenuOptions) -> Result<()> {
@@ -1151,7 +1161,7 @@ mod tests {
         value
     }
     fn familiar(id: &str, capabilities: &[&str]) -> Value {
-        json!({"id": id, "preset": "djinn", "attachment": null, "available": false, "capabilities": capabilities})
+        json!({"id": id, "preset": "amethyst", "attachment": null, "available": false, "capabilities": capabilities})
     }
     fn familiar_page(rows: Vec<Value>) -> Value {
         json!({"total": rows.len(), "offset": 0, "next_offset": null, "familiars": rows})
@@ -1551,9 +1561,9 @@ mod tests {
                 info["unattached_open"] = json!(true);
             }
             let attached = json!({"version":1,"type":"familiar.open","items":[{
-                "preset":"djinn","source":"djinn","instance":"i","activity":"one"}]});
+                "preset":"amethyst","source":"djinn","instance":"i","activity":"one"}]});
             let unattached =
-                json!({"version":1,"type":"familiar.open","items":[{"preset":"djinn"}]});
+                json!({"version":1,"type":"familiar.open","items":[{"preset":"amethyst"}]});
             let mut sealed = attached.clone();
             sealed["service_instance"] = json!("generation");
             let mut replies = vec![
@@ -1593,7 +1603,7 @@ mod tests {
         let requests = vec![
             request("familiar.list", None, 0),
             request("companion.targets", Some("a"), 0),
-            json!({"version":1,"type":"familiar.open","items":[{"preset":"djinn","source":"djinn","instance":"i","activity":"one"}]}),
+            json!({"version":1,"type":"familiar.open","items":[{"preset":"amethyst","source":"djinn","instance":"i","activity":"one"}]}),
             json!({"version":1,"type":"familiar.attach","items":[item("a", "one")]}),
             json!({"version":1,"type":"familiar.close","ids":["a"]}),
             json!({"version":1,"type":"familiar.go-to-mouse","ids":["a"]}),
@@ -1666,10 +1676,20 @@ mod tests {
         let (catalog, _) = catalog(&mut backend).unwrap();
         assert_eq!(
             presets(),
-            json!({"presets":[{"id":"djinn","name":"Djinn","capabilities":["open","open-attached"]}]})
+            json!({"presets":[
+                {"id":"random","name":"Random (unused first)","capabilities":["open","open-attached"]},
+                {"id":"amethyst","name":"Amethyst","capabilities":["open","open-attached"]},
+                {"id":"ruby","name":"Ruby","capabilities":["open","open-attached"]},
+                {"id":"saphire","name":"Saphire","capabilities":["open","open-attached"]},
+                {"id":"emerald","name":"Emerald","capabilities":["open","open-attached"]}
+            ]})
         );
-        assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].row.key, "preset:djinn");
+        assert_eq!(catalog.len(), crate::assets::CHARACTERS.len() + 1);
+        assert_eq!(catalog[0].row.key, "preset:random");
+        for (choice, character) in catalog[1..].iter().zip(crate::assets::CHARACTERS) {
+            assert_eq!(choice.row.key, format!("preset:{}", character.id));
+            assert_eq!(preset_name(character.id), character.name);
+        }
         let mut picker = Script::new(vec![Pick::Cancel]);
         assert!(menu(&mut backend, &mut picker, false).unwrap().is_none());
         assert_eq!(backend.starts, 0);
@@ -1690,12 +1710,16 @@ mod tests {
         );
         let (catalog, _) = catalog(&mut backend).unwrap();
         assert_eq!(catalog[0].row.key, "familiar:djinn");
-        assert_eq!(catalog[1].row.key, "preset:djinn");
+        assert_eq!(catalog[1].row.key, "preset:random");
+        assert_eq!(catalog[2].row.key, "preset:amethyst");
+        assert_eq!(catalog[3].row.key, "preset:ruby");
+        assert_eq!(catalog[4].row.key, "preset:saphire");
+        assert_eq!(catalog[5].row.key, "preset:emerald");
         assert!(
             catalog[0]
                 .row
                 .label
-                .contains("Waiting | Djinn [djinn] | a red line")
+                .contains("Waiting | Amethyst [djinn] | a red line")
         );
         assert!(
             !commands(&catalog[..1])
@@ -1723,7 +1747,7 @@ mod tests {
             choices[0]
                 .row
                 .label
-                .starts_with("Unattached | Djinn [free]")
+                .starts_with("Unattached | Amethyst [free]")
         );
         assert!(!choices[0].row.label.contains("Waiting"));
     }
@@ -1985,21 +2009,21 @@ mod tests {
         for action in ["open", "open-attached"] {
             let mut backend = FakeBackend::new(false, vec![]);
             let mut picker = Script::new(vec![
-                select(&["preset:djinn"]),
+                select(&["preset:amethyst"]),
                 select(&[action]),
                 Pick::Cancel,
                 Pick::Cancel,
             ]);
             assert!(menu(&mut backend, &mut picker, true).unwrap().is_none());
             assert!(picker.shown[2].2.contains("--no-start"));
-            assert_eq!(picker.shown[3].1, vec!["preset:djinn"]);
+            assert_eq!(picker.shown[3].1, vec!["preset:amethyst"]);
             assert_eq!(backend.starts, 0);
             assert!(backend.calls.is_empty());
         }
     }
 
     #[test]
-    fn open_attached_bootstraps_then_queries_and_uses_generated_ids() {
+    fn emerald_open_attached_bootstraps_then_queries_and_uses_generated_ids() {
         let mut backend = FakeBackend::new(
             false,
             vec![
@@ -2008,13 +2032,13 @@ mod tests {
                     Ok(target_page(vec![target("one", None, true)])),
                 ),
                 (
-                    json!({"version":1,"type":"familiar.open","items":[{"preset":"djinn","source":"djinn","instance":"i","activity":"one"}]}),
+                    json!({"version":1,"type":"familiar.open","items":[{"preset":"emerald","source":"djinn","instance":"i","activity":"one"}]}),
                     Ok(json!({"opened":["familiar-1"]})),
                 ),
             ],
         );
         let mut picker = Script::new(vec![
-            select(&["preset:djinn"]),
+            select(&["preset:emerald"]),
             select(&["open-attached"]),
             select(&["target:0"]),
         ]);
@@ -2027,13 +2051,49 @@ mod tests {
     }
 
     #[test]
+    fn random_and_all_character_menu_opens_preserve_the_selected_preset() {
+        for preset in
+            std::iter::once("random").chain(crate::assets::CHARACTERS.iter().map(|c| c.id))
+        {
+            for action in ["open", "open-attached"] {
+                let mut item = json!({"preset":preset});
+                let mut replies = Vec::new();
+                let mut steps = vec![select(&[&format!("preset:{preset}")]), select(&[action])];
+                if action == "open-attached" {
+                    replies.push((
+                        request("companion.targets", None, 0),
+                        Ok(target_page(vec![target("one", None, true)])),
+                    ));
+                    item["source"] = json!("djinn");
+                    item["instance"] = json!("i");
+                    item["activity"] = json!("one");
+                    steps.push(select(&["target:0"]));
+                }
+                replies.push((
+                    json!({"version":1,"type":"familiar.open","items":[item]}),
+                    Ok(json!({"opened":["new"]})),
+                ));
+                let mut backend = FakeBackend::new(false, replies);
+                let mut picker = Script::new(steps);
+                assert_eq!(
+                    menu(&mut backend, &mut picker, false).unwrap().unwrap(),
+                    format!("Accepted {action}: new")
+                );
+                assert_eq!(backend.starts, 1);
+                assert!(backend.replies.is_empty());
+                assert!(picker.steps.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn open_is_unattached_and_never_queries_targets_or_uses_picker() {
         for graphical in [false, true] {
             let mut backend = FakeBackend::new(graphical, vec![]);
             let (choices, _) = catalog(&mut FakeBackend::new(false, vec![])).unwrap();
             let selection = vec![choices[0].clone(), choices[0].clone()];
             backend.replies.push_back((
-                json!({"version":1,"type":"familiar.open","items":[{"preset":"djinn"},{"preset":"djinn"}]}),
+                json!({"version":1,"type":"familiar.open","items":[{"preset":"random"},{"preset":"random"}]}),
                 Ok(json!({"opened":["familiar-1","familiar-2"]})),
             ));
             let mut picker = Script::new(vec![]);
@@ -2243,7 +2303,7 @@ mod tests {
             }
         }
         let mut picker = Script::new(vec![
-            select(&["preset:djinn"]),
+            select(&["preset:amethyst"]),
             select(&["open"]),
             Pick::Cancel,
             Pick::Cancel,
@@ -2253,8 +2313,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(picker.shown[0].0.len(), 1);
-        assert_eq!(picker.shown[0].0[0].key, "preset:djinn");
+        assert_eq!(picker.shown[0].0.len(), crate::assets::CHARACTERS.len() + 1);
+        assert_eq!(picker.shown[0].0[0].key, "preset:random");
         assert!(picker.shown[0].2.contains("unsupported"));
         assert!(picker.shown[2].2.contains("will not be replaced"));
     }
@@ -2270,7 +2330,7 @@ mod tests {
             ],
         );
         let mut picker = Script::new(vec![
-            select(&["familiar:djinn", "preset:djinn"]),
+            select(&["familiar:djinn", "preset:amethyst"]),
             select(&["back"]),
             Pick::Cancel,
         ]);
@@ -2346,11 +2406,11 @@ mod tests {
             )],
         );
         let preset = Choice {
-            id: "djinn".into(),
+            id: "amethyst".into(),
             preset: true,
             row: Row {
-                key: "preset:djinn".into(),
-                label: "Preset | Djinn [djinn]".into(),
+                key: "preset:amethyst".into(),
+                label: "Preset | Amethyst [amethyst]".into(),
             },
             capabilities: vec!["open".into()],
             settings: None,

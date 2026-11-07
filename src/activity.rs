@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::preferences;
+use crate::{
+    assets::{CHARACTERS, RANDOM_PRESET, character},
+    preferences,
+};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +153,7 @@ pub(crate) struct Store {
 
 #[derive(Default)]
 struct Familiar {
+    preset: &'static str,
     settings: FamiliarSettings,
     cue: Option<(Cue, Instant)>,
     next_cue: u64,
@@ -374,6 +378,7 @@ impl Store {
                 BTreeMap::from([(
                     "main".into(),
                     Familiar {
+                        preset: choose_preset(&Default::default(), random_index),
                         settings: defaults,
                         attachment_generation: 1,
                         ..Familiar::default()
@@ -392,6 +397,23 @@ impl Store {
             preference_capacity: false,
             auto_select_main: true,
         }
+    }
+}
+
+fn random_index(count: u32) -> u32 {
+    // arc4random_uniform has no preconditions and avoids modulo bias.
+    unsafe { libc::arc4random_uniform(count) }
+}
+
+fn choose_preset(
+    used: &std::collections::BTreeSet<&str>,
+    mut choose: impl FnMut(u32) -> u32,
+) -> &'static str {
+    let unused: Vec<_> = CHARACTERS.iter().filter(|c| !used.contains(c.id)).collect();
+    if unused.is_empty() {
+        CHARACTERS[choose(CHARACTERS.len() as u32) as usize].id
+    } else {
+        unused[choose(unused.len() as u32) as usize].id
     }
 }
 
@@ -888,9 +910,9 @@ impl Store {
                     })
                 }),
                 settings: self.familiars[&id].settings,
+                preset: self.familiars[&id].preset.into(),
                 presentation: self.presentation_for(&id, now),
                 id,
-                preset: "djinn".into(),
             })
             .collect()
     }
@@ -923,6 +945,14 @@ impl Store {
     }
 
     pub fn open(&mut self, items: &[crate::protocol::OpenRequest]) -> Result<Vec<String>> {
+        self.open_with_chooser(items, random_index)
+    }
+
+    fn open_with_chooser(
+        &mut self,
+        items: &[crate::protocol::OpenRequest],
+        mut choose: impl FnMut(u32) -> u32,
+    ) -> Result<Vec<String>> {
         use crate::protocol::{MAX_FAMILIARS, validate_id};
         ensure!(
             (1..=MAX_FAMILIARS).contains(&items.len()),
@@ -937,8 +967,14 @@ impl Store {
         let mut ids = Vec::new();
         // Reserve explicit IDs before generating any IDs, independent of batch order.
         let mut reserved = std::collections::BTreeSet::new();
+        let mut used_presets: std::collections::BTreeSet<_> =
+            self.familiars.values().map(|f| f.preset).collect();
         for item in items {
-            ensure!(item.preset == "djinn", "unknown preset");
+            crate::protocol::validate_preset(&item.preset)?;
+            // Exact requests reserve their types even when later in the batch.
+            if let Some(character) = character(&item.preset) {
+                used_presets.insert(character.id);
+            }
             if let Some(id) = &item.id {
                 validate_id(id)?;
                 let historical_generated = id
@@ -989,9 +1025,16 @@ impl Store {
                 }
             };
             let saved = target.as_ref().and_then(|target| self.saved(target));
+            let preset = if item.preset == RANDOM_PRESET {
+                choose_preset(&used_presets, &mut choose)
+            } else {
+                character(&item.preset).expect("validated preset").id
+            };
+            used_presets.insert(preset);
             pending.insert(
                 id.clone(),
                 Familiar {
+                    preset,
                     settings: saved.map_or(self.defaults, |r| r.settings),
                     placement: saved.and_then(|r| r.placement),
                     generation: 1,
@@ -1081,7 +1124,7 @@ impl Store {
     pub fn list(&self, offset: usize) -> serde_json::Value {
         let rows: Vec<_> = self.familiars.iter().skip(offset).take(STATUS_PAGE_SIZE).map(|(id, f)| {
             let live = self.focused(id);
-            let mut row = serde_json::json!({"id":id,"preset":"djinn","attachment":f.focus,"available":live.is_some(),"capabilities":["info","attach","close"]});
+            let mut row = serde_json::json!({"id":id,"preset":f.preset,"attachment":f.focus,"available":live.is_some(),"capabilities":["info","attach","close"]});
             row["settings"] = serde_json::json!(f.settings);
             if let Some(summary) = live.as_ref().map(|s| &s.summary).unwrap_or(&f.focus_summary) { row["summary"] = summary.clone().into(); }
             row
@@ -1136,9 +1179,227 @@ mod tests {
     fn unattached() -> OpenRequest {
         OpenRequest {
             id: None,
-            preset: "djinn".into(),
+            preset: "amethyst".into(),
             target: None,
         }
+    }
+
+    fn random_request() -> OpenRequest {
+        OpenRequest {
+            preset: RANDOM_PRESET.into(),
+            ..unattached()
+        }
+    }
+
+    #[test]
+    fn chooser_exposes_every_unused_candidate_and_then_the_full_catalog() {
+        let empty = Default::default();
+        for (index, character) in CHARACTERS.iter().enumerate() {
+            assert_eq!(
+                choose_preset(&empty, |count| {
+                    assert_eq!(count as usize, CHARACTERS.len());
+                    index as u32
+                }),
+                character.id
+            );
+        }
+        let used = CHARACTERS.iter().map(|c| c.id).collect();
+        for (index, character) in CHARACTERS.iter().enumerate() {
+            assert_eq!(
+                choose_preset(&used, |count| {
+                    assert_eq!(count as usize, CHARACTERS.len());
+                    index as u32
+                }),
+                character.id
+            );
+            let others = CHARACTERS
+                .iter()
+                .map(|c| c.id)
+                .filter(|id| *id != character.id)
+                .collect();
+            assert_eq!(
+                choose_preset(&others, |count| {
+                    assert_eq!(count, 1);
+                    0
+                }),
+                character.id
+            );
+        }
+    }
+
+    #[test]
+    fn random_batches_reserve_types_and_close_releases_them() {
+        let mut store = Store::empty();
+        let requests = vec![random_request(); CHARACTERS.len()];
+        let ids = store.open_with_chooser(&requests, |_| 0).unwrap();
+        let selected: std::collections::BTreeSet<_> =
+            ids.iter().map(|id| store.familiars[id].preset).collect();
+        assert_eq!(selected.len(), CHARACTERS.len());
+        // Once exhausted, any catalog entry is eligible, including duplicates.
+        let extra = store
+            .open_with_chooser(&[random_request()], |count| {
+                assert_eq!(count as usize, CHARACTERS.len());
+                count - 1
+            })
+            .unwrap();
+        assert_eq!(
+            store.familiars[&extra[0]].preset,
+            CHARACTERS.last().unwrap().id
+        );
+        let released = store.familiars[&ids[0]].preset;
+        store.close(&[ids[0].clone()]).unwrap();
+        let reopened = store
+            .open_with_chooser(&[random_request()], |count| {
+                assert_eq!(count, 1);
+                0
+            })
+            .unwrap();
+        assert_eq!(store.familiars[&reopened[0]].preset, released);
+    }
+
+    #[test]
+    fn sequential_random_opens_fill_the_catalog_before_repeating() {
+        let mut store = Store::empty();
+        let mut selected = std::collections::BTreeSet::new();
+        for remaining in (1..=CHARACTERS.len()).rev() {
+            let ids = store
+                .open_with_chooser(&[random_request()], |count| {
+                    assert_eq!(count as usize, remaining);
+                    count - 1
+                })
+                .unwrap();
+            assert!(selected.insert(store.familiars[&ids[0]].preset));
+        }
+        assert_eq!(selected, CHARACTERS.iter().map(|c| c.id).collect());
+        let ids = store
+            .open_with_chooser(&[random_request()], |count| {
+                assert_eq!(count as usize, CHARACTERS.len());
+                0
+            })
+            .unwrap();
+        assert_eq!(store.familiars[&ids[0]].preset, CHARACTERS[0].id);
+    }
+
+    #[test]
+    fn mixed_batches_reserve_explicit_types_before_random_in_either_order() {
+        for (reversed, candidate) in [false, true]
+            .into_iter()
+            .flat_map(|reversed| (0..CHARACTERS.len() - 1).map(move |i| (reversed, i)))
+        {
+            let mut store = Store::empty();
+            let mut requests = vec![
+                random_request(),
+                OpenRequest {
+                    preset: "ruby".into(),
+                    ..unattached()
+                },
+            ];
+            if reversed {
+                requests.reverse();
+            }
+            let ids = store
+                .open_with_chooser(&requests, |count| {
+                    assert_eq!(count as usize, CHARACTERS.len() - 1);
+                    candidate as u32
+                })
+                .unwrap();
+            let random = usize::from(reversed);
+            let selected = store.familiars[&ids[random]].preset;
+            assert!(character(selected).is_some());
+            assert_ne!(selected, "ruby");
+            assert_eq!(
+                selected,
+                CHARACTERS
+                    .iter()
+                    .filter(|c| c.id != "ruby")
+                    .nth(candidate)
+                    .unwrap()
+                    .id
+            );
+            assert_eq!(store.familiars[&ids[1 - random]].preset, "ruby");
+            // Explicit requests remain exact, even when already in use.
+            let exact = store.open(&[unattached()]).unwrap();
+            assert_eq!(store.familiars[&exact[0]].preset, "amethyst");
+        }
+    }
+
+    #[test]
+    fn failed_random_batch_does_not_reserve_types_ids_or_targets() {
+        let mut store = Store::empty();
+        let now = Instant::now();
+        store
+            .register(id("a"), vec![a(1, ActivityState::Working)], now)
+            .unwrap();
+        let mut explicit = random_request();
+        explicit.id = Some("reserved".into());
+        let before = store.presentations(now);
+        assert!(
+            store
+                .open_with_chooser(
+                    &[explicit, open_request("a"), open_request("missing")],
+                    |_| 0
+                )
+                .is_err()
+        );
+        assert_eq!(store.presentations(now), before);
+        assert_eq!(store.next_familiar, 1);
+        assert!(!store.used_ids.contains("reserved"));
+        assert!(store.live_targets()[0].claimed_by.is_none());
+        let ids = store
+            .open_with_chooser(&[random_request()], |count| {
+                assert_eq!(count as usize, CHARACTERS.len());
+                0
+            })
+            .unwrap();
+        assert_eq!(ids, ["familiar-1"]);
+        assert_eq!(store.familiars[&ids[0]].preset, CHARACTERS[0].id);
+    }
+
+    #[test]
+    fn resolved_types_survive_lifecycle_changes_and_main_reserves_its_type() {
+        let now = Instant::now();
+        let mut store = Store::default();
+        let main = store.familiars["main"].preset;
+        assert!(character(main).is_some());
+        let ids = store.open_with_chooser(&[random_request()], |_| 0).unwrap();
+        let selected = store.familiars[&ids[0]].preset;
+        assert_ne!(selected, main);
+        store.close(&["main".into()]).unwrap();
+        for source in ["a", "b"] {
+            store
+                .register(id(source), vec![a(1, ActivityState::Working)], now)
+                .unwrap();
+        }
+        store
+            .attach(&[AttachRequest {
+                id: ids[0].clone(),
+                target: target("a"),
+            }])
+            .unwrap();
+        update(&mut store, "a", a(2, ActivityState::Failed), now).unwrap();
+        store.focus_for(&ids[0], "b", None, "task").unwrap();
+        store.cycle_for(&ids[0]).unwrap();
+        store
+            .settings(
+                &ids,
+                SettingsPatch {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.disconnect(&id("a"));
+        store.disconnect(&id("b"));
+        assert_eq!(store.presentations(now)[0].preset, selected);
+        assert_eq!(store.list(0)["familiars"][0]["preset"], selected);
+        // A disconnected familiar still occupies its concrete type.
+        let next = store
+            .open_with_chooser(&[random_request()], |count| {
+                assert_eq!(count as usize, CHARACTERS.len() - 1);
+                0
+            })
+            .unwrap();
+        assert_ne!(store.familiars[&next[0]].preset, selected);
     }
 
     #[test]
@@ -1307,6 +1568,7 @@ mod tests {
         store.familiars.insert(
             "main".into(),
             Familiar {
+                preset: "amethyst",
                 attachment_generation: 1,
                 ..Familiar::default()
             },
@@ -2106,7 +2368,7 @@ mod tests {
     fn open_request(source: &str) -> OpenRequest {
         OpenRequest {
             id: None,
-            preset: "djinn".into(),
+            preset: "amethyst".into(),
             target: Some(target(source)),
         }
     }
@@ -2454,7 +2716,7 @@ mod tests {
             .enumerate()
             .map(|(n, activity)| OpenRequest {
                 id: Some(format!("{n:096}")),
-                preset: "djinn".into(),
+                preset: "amethyst".into(),
                 target: Some(TargetRequest {
                     source: source.clone(),
                     instance: Some(instance.clone()),

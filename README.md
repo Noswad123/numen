@@ -3,7 +3,7 @@
 ![numen](img/numen.jpg)
 An independent, event-driven familiar that gives visible expression to what your tools are doing.
 
-**Status:** multi-familiar foundation, macOS Go to mouse/Option+M and random corners/Option+C, runtime settings, native familiar click menu, advanced fzf menu, opt-in Wisp action installer, bounded empty-service bootstrap, graceful graphical quit and read-only `doctor` are implemented. Only the Djinn preset is available; targets come from connected protocol sources, not OS scanning. Prior USER-REPORTED working click/menu/settings/hotkey use is not exhaustive acceptance or proof of the new Wisp migration. See [Wisp setup, migration status and evidence boundaries](WISP.md).
+**Status:** multi-familiar foundation, macOS Go to mouse/Option+M and random corners/Option+C, runtime settings, native familiar click menu, advanced fzf menu, opt-in Wisp action installer, bounded empty-service bootstrap, graceful graphical quit and read-only `doctor` are implemented. Bundled characters are Amethyst, Ruby, Saphire and Emerald, with unused-first random creation by default; targets come from connected protocol sources, not OS scanning. Prior USER-REPORTED working click/menu/settings/hotkey use is not exhaustive acceptance or proof of the new Wisp migration. See [Wisp setup, migration status and evidence boundaries](WISP.md).
 
 Numen means divine power or presence: an unseen, animating presence in the machine. The CLI spelling is `numen`; a local Cargo debug installation is supported below. General packaging and autostart remain future work.
 
@@ -48,7 +48,7 @@ Production live `run` (including menu-bootstrapped `run --empty`) now remembers 
 
 `run --no-preferences` bypasses **all** preference path resolution, reads and writes while retaining runtime Settings. `run --preferences-file /absolute/private/preferences.json` overrides the default and conflicts with `--no-preferences`. Manual, demo and headless modes do no preference I/O.
 
-The remembered key is **only `(source, activity)`**, never producer instance or familiar ID. **Assumption:** a source keeps activity IDs stable for the same logical chat across producer restarts. Stored data is the three settings (`sprite_scale`, `font_size`, `bubble_duration`) plus optional manually chosen foot-center `{x,y}` in desktop logical points. No titles/prompts, runtime pins, open-window list, autostart, cues, pause or navigation state is saved. Named profiles and character selection remain future work.
+The remembered key is **only `(source, activity)`**, never producer instance or familiar ID. **Assumption:** a source keeps activity IDs stable for the same logical chat across producer restarts. Stored data is the three settings (`sprite_scale`, `font_size`, `bubble_duration`) plus optional manually chosen foot-center `{x,y}` in desktop logical points. No titles/prompts, runtime pins, open-window list, autostart, cues, pause, navigation state or character choice is saved. Named profiles and saved character-choice persistence remain future work.
 
 - Explicit Open uses remembered style/placement when present, otherwise the **original startup defaults**; saved style takes precedence over startup fallback flags. Attach, focus and next keep the live appearance and location and associate future explicit edits with the new key.
 - Production Main starts unattached and never source-auto-selects. First manual Attach preserves live style/location without destination restore; unattached edits have no saved key. The old bootstrap first-selection preference rule is compatibility-only, not user UI.
@@ -73,6 +73,18 @@ Background I/O keeps one pending plus one in-flight document, with at most 200 m
 
 **Delivery and validation:** main-agent confirmation is **367 passed (323 unit + 7 build-fingerprint + 37 CLI), one existing visual-preview test ignored**, with formatting, strict all-target Clippy and offline locked tests/build green. A private Apple Metal GUI harness passed five service cycles covering seeded placement/style restore, asynchronous durability, cross-instance restart/Open, Forget, fallback, corrupt-file preservation and full opt-out; [details and limits below](#saved-preferences-validation-status). No physical OS drag was performed: end-to-end drag saving, mixed-DPI restoration and focus remain manual. The prior USER-REPORTED working click/menu/settings/hotkey workflow is separate evidence. **Latest saved-preferences build installation into `~/.local/bin/numen` is confirmed**, including installed-command help checks for the new flags; see below. This docs edit performs no installation, commands, Rust edits, commits, home configuration changes or user-service control. Loading the new code in an older running service still requires **one explicit user-chosen Numen restart**, not a Djinn restart.
 
+### Character selection
+
+Bare `numen`, default CLI/wire Open (omitted `preset`), live startup Main and native **Open another familiar** choose uniformly among character types unused by currently open familiars. Unattached, disconnected and paused views all count. Once every type is used, selection is uniform across the full catalog; Close releases that view's type reservation. An explicit catalog character ID in `numen open --preset ID` selects exactly that character and may intentionally duplicate it.
+
+Selection happens once in the canonical Store and stays fixed through attachment, reconnect, expression/settings changes and movement. Atomic batches reserve all explicit types first, then each staged random choice; failed batches reserve nothing. `random` is a request token, never a concrete snapshot character. `numen presets` and the fzf menu list **Random (unused first)**, **Amethyst**, **Ruby**, **Saphire**, **Emerald**, in that order, with IDs `random`, `amethyst`, `ruby`, `saphire`, `emerald`. Manual/demo remain deterministic Amethyst. Character choice is runtime-only, not saved to disk. There are no legacy character-ID aliases; Djinn application/source/CLI identities remain unchanged.
+
+Ruby was imported from `~/Downloads/ruby-artifacts.zip`; see [Ruby provenance](assets/ruby/README.md). This character update performs no installation or user-service restart; historical delivery evidence below does not establish its deployment.
+
+Saphire, catalog ID `saphire`, uses artwork imported from `~/Downloads/hexa-glasses-artifacts.zip`; see [Saphire provenance](assets/hexa-glasses/README.md). Amethyst (`amethyst`) uses the artwork in [assets/djinn](assets/djinn/README.md). The asset directory names `assets/djinn` and `assets/hexa-glasses` remain unchanged for import provenance, as do original archives and internal generation metadata. Selection behavior is unchanged; this character rename performs no installation or restart.
+
+Emerald (`emerald`), the fourth character, uses artwork from `~/Downloads/groove-artifacts.zip` in `assets/emerald`; see [Emerald provenance](assets/emerald/README.md). Original generation metadata retains the name Groove; the runtime name is Emerald. The unused-first selection policy and manual/demo Amethyst default are unchanged. No installation or restart was performed for this addition.
+
 ## Product principles
 
 - Independent of Djinn; Djinn is the first integration, not the owner.
@@ -91,6 +103,11 @@ Requires Rust 1.89 or newer (edition 2024) and a graphical desktop for `run`. Re
 numen # Default: one unattached familiar; reuse service or bounded bootstrap
 numen # Another independent unattached familiar in that service
 numen open # Same unattached Open, but requires a RUNNING graphical service
+numen open --preset ruby # Exact Ruby; intentional duplicates allowed
+numen open --preset amethyst # Exact Amethyst, independent of attachment source
+numen open --preset saphire # Exact Saphire
+numen open --preset emerald # Exact Emerald
+numen presets # Ordered catalog; see Character selection above
 cargo run --locked -- check-assets
 cargo run --locked -- run
 cargo run --locked -- run --bubble-duration 3 # Timed notifications and reveals
@@ -134,7 +151,7 @@ djinn -s REF
 # Or:
 djinn session chat REF
 # Separately, use bare numen then click Attach to app / chat; or restore with
-# Djinn preset → Open attached… → the chat target:
+# Amethyst preset → Open attached… → the chat target:
 ~/Projects/numen/target/debug/numen menu
 ```
 
@@ -213,7 +230,7 @@ Doctor makes **one bounded read-only `companion.service` query**, with private-s
 
 **Deployment confirmed:** the main agent installed the latest debug binary with `cargo install --path . --debug --locked --offline --root ~/.local --force`. Bare `numen` resolves to `~/.local/bin/numen` and doctor works. No home configuration changed and no user apps were restarted. The updated doctor works against an old service immediately. An old running service cannot retroactively report new fields: **one user-chosen Numen restart** with the updated binary adds diagnostics. No Djinn restart is needed for this change; doctor never triggers the restart itself.
 
-`check-assets` validates the embedded atlas without opening a window. `run` starts with the undecorated, draggable `main` view and **starts the socket listener by default**; IPC can open additional views. `listen` runs the activity service without a GUI or asset decoding and prints legacy `main` presentation changes, not a raw audit. It supports discovery but not graphical lifecycle commands. `publish` also needs no GUI or asset decoding.
+`check-assets` validates every character's embedded PNG/manifest without opening a window. `run` starts with the undecorated, draggable `main` view and **starts the socket listener by default**; IPC can open additional views. `listen` runs the activity service without a GUI or asset decoding and prints legacy `main` presentation changes, not a raw audit. It supports discovery but not graphical lifecycle commands. `publish` also needs no GUI or asset decoding.
 
 `font-license` prints the full embedded SIL Open Font License 1.1 text for the bundled fallback. `listen`, `publish`, `status`, `focus`, `bubbles`, `check-assets`, and `font-license` do not initialize fonts.
 
@@ -221,7 +238,7 @@ Doctor makes **one bounded read-only `companion.service` query**, with private-s
 
 `menu [--no-start] [--fzf PATH]` requires stdin and stderr TTYs and installed fzf (already installed on the validation machine). Use Wisp **run/summon**, not exec. It lists clearly labeled running/waiting familiars and presets, with distinct `familiar:` / `preset:` identities. Tab multi-selects up to 16; Enter advances to commands. Command Escape/Back retains the familiar selection; target Escape/Back discards the **entire** pending batch. Ctrl-R refreshes the current stage. One accepted action exits the menu so the Wisp Kitty floater can close.
 
-Commands are the capability intersection of **all** selected rows: presets support `open` and `open-attached` (**Open** / **Open attached…**); active familiars support Info, Go to Mouse, Settings, Attach and Close as advertised. Default Open immediately creates unattached views. Open attached…/Attach fetch fresh target pages per selection, excluding other owners and earlier pending choices while allowing one's own attachment. Target Back/Esc cancels the whole batch. Only connected supported protocol targets appear; empty lists offer Refresh/Back. Mixed selections with no common command get an explanation, never partial execution. Backend revalidation is atomic; with one Djinn preset, repeat invocations to open more copies.
+Commands are the capability intersection of **all** selected rows: presets support `open` and `open-attached` (**Open** / **Open attached…**); active familiars support Info, Go to Mouse, Settings, Attach and Close as advertised. Default Open immediately creates unattached views. Open attached…/Attach fetch fresh target pages per selection, excluding other owners and earlier pending choices while allowing one's own attachment. Target Back/Esc cancels the whole batch. Only connected supported protocol targets appear; empty lists offer Refresh/Back. Mixed selections with no common command get an explanation, never partial execution. Backend revalidation is atomic; each selected preset row opens one familiar.
 
 Merely entering the menu or discovering sources never spawns a service or writes files. Choosing Open while offline starts the current executable as detached `run --empty`, unless `--no-start` requests a visible error instead. It creates no unattached `main`; source updates alone keep the registry empty. Startup uses a private 0600 `service.log` beside the socket and a five-second control-readiness wait, not GPU readiness. Concurrent starts reuse the winning graphical listener. Existing headless, outdated or unsafe services are never replaced or killed: stop an old foreground service manually once or choose another `--socket`. **Direct CLI `open` still requires an already-running graphical service.**
 
@@ -405,7 +422,7 @@ Actual startup `run` options seed Main and immutable defaults for future Opens, 
 ~/Projects/numen/target/debug/numen menu
 ```
 
-Then use `numen` and click Attach to app / chat; to restore remembered style/position instead, choose Djinn preset → Open attached…. **No Djinn restart is needed** for this Numen update. A legacy service without quit support must be stopped manually; Numen never auto-replaces it. Runtime edits need no restart.
+Then use `numen` and click Attach to app / chat; to restore remembered style/position instead, choose Amethyst preset → Open attached…. **No Djinn restart is needed** for this Numen update. A legacy service without quit support must be stopped manually; Numen never auto-replaces it. Runtime edits need no restart.
 
 The same one-time explicit Numen restart enables Option+M, the native click menu and saved preferences in an older running service; rebuilding alone leaves it unchanged. Use the rebuilt full path above: an older Homebrew `numen` may not be current. Restart only when explicitly chosen by the user, never automatically. No Djinn restart or Wisp reinstallation is required. Production live startup now uses the preference path above; development must leave the existing user process/home untouched.
 
@@ -415,10 +432,10 @@ One service supports **16 familiars**. Bindings are exclusive exact `(source, in
 
 | Command | Contract |
 | --- | --- |
-| `presets` | Offline JSON: `{"presets":[{"id":"djinn","name":"Djinn","capabilities":["open","open-attached"]}]}`. |
+| `presets` | Offline JSON rows in [catalog order](#character-selection); each advertises `["open","open-attached"]`. No legacy character aliases. |
 | `familiars --offset N` | Four records/page: `id`, `preset`, `attachment`, `available`, optional `summary`, `capabilities`, complete `settings`. GUI capabilities: `info`, `attach`, `close`, plus `settings`, `go-to-mouse`, and writable-bound `preferences` independently; headless/legacy handlers: `[]`. |
 | `targets --offset N [--familiar ID]` | Four connected protocol-advertised activities/page with `claimed_by` and `eligible`; an owner may reselect its own target. The menu filters eligible entries; supported Djinn chats publish here by default unless opted out, without OS scanning. |
-| `open [--source NAME --activity A [--instance I]] [--id ID] [--preset djinn]` | No target opens unattached; complete target opens attached/restores preferences. Requires a running graphical service, unlike bare `numen`. |
+| `open [--source NAME --activity A [--instance I]] [--id ID] [--preset ID]` | Accepts `random` (default) or an explicit catalog character ID; no target opens unattached; complete target opens attached/restores preferences. Requires a running graphical service, unlike bare `numen`. |
 | `attach --familiar ID --source NAME --activity A [--instance I]` | Retargets an existing familiar, never executes/stops the source. |
 | `close --familiar ID1 ID2` | Atomically removes selected familiars, not their applications. |
 | `go-to-mouse --familiar ID1 ID2` | Explicit 1–16 unique existing IDs; no implicit all. ACK data `{"moving":["ID1","ID2"]}` means accepted, not arrived. Requires graphical navigation support (currently macOS). |
@@ -426,10 +443,10 @@ One service supports **16 familiars**. Bindings are exclusive exact `(source, in
 Open/Attach alternatively accept `--batch FILE` or `--batch -` (stdin): a **root JSON array**. Open can mix unattached and flattened targeted entries atomically; Attach still requires targets. Use item field `id`, not `familiar`:
 
 ```json
-[{"id":"free-pet"},{"id":"build-pet","preset":"djinn","source":"build","instance":"worker-2","activity":"task"}]
+[{"id":"free-pet"},{"id":"build-pet","preset":"amethyst","source":"build","instance":"worker-2","activity":"task"}]
 ```
 
-Attach requires `id` and does not use `preset`; Open defaults `preset` to `djinn` and can generate `id`. Duplicate owners/targets/IDs, unknown presets, unavailable targets or ambiguous omitted instances reject the entire batch without changes. Attach cannot swap targets currently owned by another familiar, even when both owners are in the batch. Revalidation happens at mutation. ACK data contains `opened`, `attached` or `closed` ID arrays: accepted does not mean rendered. Asynchronous native/GPU creation can fail and remove only the bad view.
+Attach requires `id` and does not use `preset`; Open defaults `preset` to `random` and can generate `id`. Duplicate owners/targets/IDs, unknown presets, unavailable targets or ambiguous omitted instances reject the entire batch without changes. Attach cannot swap targets currently owned by another familiar, even when both owners are in the batch. Revalidation happens at mutation. ACK data contains `opened`, `attached` or `closed` ID arrays: accepted does not mean rendered. Asynchronous native/GPU creation can fail and remove only the bad view.
 
 Open target fields must be entirely absent or contain non-null `source` **and** `activity`, with optional `instance` (including legacy attached `instance: null`). Partial targets, null source/activity, instance-only entries (even null) and nested `target` reject. Arbitrary other unique keys remain tolerated; duplicate JSON keys reject.
 
@@ -468,7 +485,7 @@ Supply metadata with `publish --summary 'Investigating retry backoff'`. Summarie
 
 Publishers → Unix socket → canonical source/activity store → per-familiar binding, cue and summary cache → complete latest-only familiar snapshots → independent expression controllers, players and pixels surfaces. External waiting maps to `review`; attention waiting maps to `waiting`. Terminal records retain identity but rest after fresh success/failure one-shots unless that same activity has resumed work. Background work is never restored into another familiar. The outer App routes native window IDs to views; source/activity IDs appear in logs and window titles.
 
-Graphical startup validates the embedded `assets/djinn/` PNG/manifest through the generic `SpriteAtlas` and caches RGBA frames. The temporary global default is character ID `djinn`, display name **Djinn**, so all tools currently render Djinn as a fallback. Source names are producer identities, not character identities. The future plan is a different global default plus an explicit application-source `djinn` → character `djinn` mapping; that mapping is not implemented. No external extraction is needed. The local, gitignored `djinn-artifacts.zip` retains its original generation metadata unchanged as provenance. See [Architecture](ARCHITECTURE.md), [Protocol](PROTOCOL.md), and [Modes](MODES.md).
+The shared [`assets::CHARACTERS`](src/assets.rs) catalog embeds the `assets/djinn/`, `assets/ruby/`, `assets/hexa-glasses/` and `assets/emerald/` PNG/manifest pairs. Graphical rendering caches each type's decoded atlas once and shares it across that type's views. Source names are producer identities, not character identities; no source-to-character mapping is implemented. No external extraction is needed at runtime. For a future character, add an asset directory with a compatible PNG and manifest plus an entry in `assets::CHARACTERS`; menu/discovery and unused-first selection pick it up automatically. See [Architecture](ARCHITECTURE.md), [Protocol](PROTOCOL.md), and [Modes](MODES.md).
 
 ## Edge Cases
 
@@ -482,7 +499,7 @@ Graphical startup validates the embedded `assets/djinn/` PNG/manifest through th
 - Selected font data is limited to 32 MiB with a bounded read; system metadata discovery by `fontdb` is outside that cap. The glyph cache holds at most 512 entries at one exact physical pixel size and clears on size/DPI changes. Fonts load once at bubble-capable GUI initialization even while initially hidden. `--no-bubble` skips font discovery/loading entirely, even for a nonexistent family or invalid file; CLI syntax, conflicts and numeric validation still apply.
 - Removal, snapshot omission, disconnect and expiry retain the selected identity and last summary with Unavailable status. A replacement record with absent/null summary clears that summary; changing focus replaces the cache, never borrowing another chat's text. Background updates cannot change the bubble. Metadata-only updates repaint even while paused or on the same animation, without restarting it or requesting focus.
 - Only initial `main` can request startup focus with explicit `--focus`; subsequently opened views never do. Animation/reveal never requests focus. macOS uses accessory activation policy, with no Dock icon.
-- Views share an `Arc<SpriteAtlas>` and parsed font (`Typeface::fork`), with independent glyph caches, Window/Pixels, Player, pause, visibility and geometry. Native/GPU failures close only the failed live view and retry registry removal if needed; shared font initialization remains fatal. Global exit deadlines run even with zero views.
+- Views of the same character share a cached `Arc<SpriteAtlas>`; all views share the parsed font (`Typeface::fork`), with independent glyph caches, Window/Pixels, Player, pause, visibility and geometry. Native/GPU failures close only the failed live view and retry registry removal if needed; shared font initialization remains fatal. Global exit deadlines run even with zero views.
 - Always-on-top, transparency, and native drag depend on desktop support. GPU logs do not prove correct visual composition or focus behavior.
 - The latest-only headless output slot and detached stdout writer keep an unread pipe from blocking the service or `--exit-after`. Slow readers may miss intermediate presentations; the latest pending value is retained. Process shutdown terminates a blocked writer and may truncate the last diagnostic line.
 - Active socket collisions refuse startup. Only safely identified, user-owned stale sockets whose connection is refused are replaced. Normal drop removes only the owned inode; abrupt termination can leave a stale socket for recovery at next startup.
@@ -490,7 +507,7 @@ Graphical startup validates the embedded `assets/djinn/` PNG/manifest through th
 - Completion is not idle or disconnect. Only new success/failure transitions of the focused conversation can cue; repeated terminal states, snapshots and selection of historical terminal records do not replay outcomes. Focused attention clears/drops cues rather than queuing them. Background attention, failure and success never take over.
 - Movement commits the hidden sprite anchor so bubble expiry does not snap back to the pre-command position. Pointer reading is read-only: fresh macOS `CGEvent` snapshots from `CombinedSessionState`, no cursor warp, event posting, event tap, permission request or OS process scan. Other platforms currently advertise no navigation capability.
 - Menu labels/summaries are sanitized and never shell-interpolated. fzf default-options/options-file/default-command environment variables are removed; unoffered or duplicate output identities are rejected, with a 64 KiB output cap.
-- Next: broader adapter coverage and an unrelated runner. Other [mode choices](MODES.md), app-signaled following, different per-view characters/additional options, named profiles, general installation/autostart, packaging, gaze and roaming remain future work. General saved appearance/manual-placement preferences are delivered.
+- Next: broader adapter coverage and an unrelated runner. Other [mode choices](MODES.md), app-signaled following, saved character-choice persistence, additional character options, named profiles, general installation/autostart, packaging, gaze and roaming remain future work. General saved appearance/manual-placement preferences are delivered.
 
 ## Validation
 

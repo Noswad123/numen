@@ -21,7 +21,7 @@ use crate::RunOptions;
 use crate::activity::{AttachmentBinding, FamiliarPresentation, FocusTarget, Presentation};
 use crate::activity::{PreferenceBinding, PreferencePresentation};
 use crate::animation::{Animation, Player};
-use crate::assets::{DEFAULT_CHARACTER_ID, DEFAULT_CHARACTER_NAME, SpriteAtlas};
+use crate::assets::{Character, DEFAULT_CHARACTER_ID, RANDOM_PRESET, SpriteAtlas, character};
 use crate::bubble;
 use crate::context_menu::{self, Action, AttachmentContext, ChatChoice};
 use crate::diagnostics::{RuntimeDiagnostics, ShortcutReason, ShortcutState, ShortcutStatus};
@@ -657,6 +657,7 @@ impl CachedRaster {
 
 struct FamiliarView {
     id: String,
+    character: &'static Character,
     // Drop the GPU surface before the window (the surface also holds its own Arc).
     pixels: Option<Pixels<'static>>,
     window: Option<Arc<Window>>,
@@ -978,7 +979,12 @@ impl FamiliarView {
         }
     }
 
-    fn new(id: String, atlas: Arc<SpriteAtlas>, options: RunOptions) -> Self {
+    fn new(
+        id: String,
+        character: &'static Character,
+        atlas: Arc<SpriteAtlas>,
+        options: RunOptions,
+    ) -> Self {
         let now = Instant::now();
         let settings = familiar_settings(&options);
         let mut display = LiveDisplay::default();
@@ -996,6 +1002,7 @@ impl FamiliarView {
         }
         Self {
             id,
+            character,
             pixels: None,
             window: None,
             player: Player::new(options.animation),
@@ -1106,7 +1113,7 @@ impl FamiliarView {
         let (canvas_width, canvas_height) =
             bubble::dimensions(self.bubble_visible, self.options.sprite_scale);
         let attributes = Window::default_attributes()
-            .with_title(format!("Numen — {DEFAULT_CHARACTER_NAME}"))
+            .with_title(self.title(&self.latest_view))
             .with_inner_size(LogicalSize::new(
                 f64::from(canvas_width) * self.options.scale,
                 f64::from(canvas_height) * self.options.scale,
@@ -1167,11 +1174,12 @@ impl FamiliarView {
         self.window = Some(window);
         info!(
             familiar = %self.id,
-            character = DEFAULT_CHARACTER_ID,
+            character = self.character.id,
+            character_name = self.character.name,
             animation = self.player.animation().label(),
             navigation_shortcut = self.navigation_available.then_some("Option+M/go to mouse"),
             corner_shortcut = self.corner_available.then_some("Option+C/random corner"),
-            "{DEFAULT_CHARACTER_NAME} ready; click/menu (macOS), drag/move, Option+I/bubbles, Tab/next conversation, 1–9/manual, L/live, Space/pause, Esc/Q/Close familiar"
+            "Familiar ready; click/menu (macOS), drag/move, Option+I/bubbles, Tab/next conversation, 1–9/manual, L/live, Space/pause, Esc/Q/Close familiar"
         );
         Ok(())
     }
@@ -1911,6 +1919,24 @@ impl FamiliarView {
 }
 
 impl FamiliarView {
+    fn title(&self, view: &Presentation) -> String {
+        let name = self.character.name;
+        let represented = view
+            .cue
+            .as_ref()
+            .map(|cue| &cue.selection)
+            .or(view.base.as_ref());
+        match represented {
+            Some(selection) => format!(
+                "Numen — {name} [{} / {}: {}]",
+                selection.source,
+                selection.activity,
+                selection.state.label()
+            ),
+            None => format!("Numen — {name}"),
+        }
+    }
+
     fn update(&mut self, event_loop: &ActiveEventLoop, view: Presentation) {
         if self.latest_view != view {
             self.visibility.observe(&view, Instant::now());
@@ -1923,19 +1949,11 @@ impl FamiliarView {
                 info!(familiar = %self.id, source = %selection.source, activity = %selection.activity,
                     state = selection.state.label(), attention = selection.attention,
                     "Live activity changed");
-                if let Some(window) = &self.window {
-                    window.set_title(&format!(
-                        "Numen — {DEFAULT_CHARACTER_NAME} [{} / {}: {}]",
-                        selection.source,
-                        selection.activity,
-                        selection.state.label()
-                    ));
-                }
             } else {
                 info!(familiar = %self.id, "No live activity; resting");
-                if let Some(window) = &self.window {
-                    window.set_title(&format!("Numen — {DEFAULT_CHARACTER_NAME}"));
-                }
+            }
+            if let Some(window) = &self.window {
+                window.set_title(&self.title(&view));
             }
             self.latest_view = view.clone();
             self.scene_dirty = true;
@@ -2238,7 +2256,7 @@ impl FamiliarView {
 
 struct App {
     views: BTreeMap<String, FamiliarView>,
-    atlas: Arc<SpriteAtlas>,
+    atlases: BTreeMap<&'static str, Arc<SpriteAtlas>>,
     options: RunOptions,
     mailbox: Arc<Mailbox<Vec<FamiliarPresentation>>>,
     reveal_pending: Arc<RevealMailbox>,
@@ -2267,7 +2285,8 @@ impl App {
     fn new(atlas: SpriteAtlas, options: RunOptions, live: bool) -> Self {
         Self {
             views: BTreeMap::new(),
-            atlas: Arc::new(atlas),
+            // The caller's default atlas is also used unchanged by manual/demo mode.
+            atlases: BTreeMap::from([(DEFAULT_CHARACTER_ID, Arc::new(atlas))]),
             options,
             mailbox: Arc::new(Mailbox::default()),
             reveal_pending: Arc::new(RevealMailbox::default()),
@@ -2337,17 +2356,38 @@ impl App {
             if self.failed.contains(&id) {
                 continue;
             }
-            if familiar.preset != DEFAULT_CHARACTER_ID {
+            let Some(character) = character(&familiar.preset) else {
                 warn!(%id, preset = %familiar.preset, "Unsupported familiar preset");
                 self.views.remove(&id);
                 self.pending_close.insert(id.clone());
                 self.failed.insert(id);
                 continue;
+            };
+            if self
+                .views
+                .get(&id)
+                .is_some_and(|view| view.character.id != character.id)
+            {
+                self.views.remove(&id);
             }
             if !self.views.contains_key(&id) {
+                let atlas = match self.atlases.entry(character.id) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        match SpriteAtlas::load_character(character.id) {
+                            Ok(atlas) => entry.insert(Arc::new(atlas)).clone(),
+                            Err(error) => {
+                                warn!(%id, preset = character.id, %error, "Cannot load familiar atlas");
+                                self.pending_close.insert(id.clone());
+                                self.failed.insert(id);
+                                continue;
+                            }
+                        }
+                    }
+                };
                 let mut options = self.options.clone();
                 options.focus = self.initial_snapshot && id == "main" && options.focus;
-                let mut view = FamiliarView::new(id.clone(), self.atlas.clone(), options);
+                let mut view = FamiliarView::new(id.clone(), character, atlas, options);
                 view.focus_control = self.control.clone();
                 view.global_hotkey_registered = self.global_hotkey_registered;
                 view.global_navigation_registered = self.global_navigation_registered;
@@ -2768,7 +2808,7 @@ impl App {
             }
             Action::OpenFamiliar => {
                 if let Some(control) = &self.control
-                    && let Err(error) = control.open_unattached(DEFAULT_CHARACTER_ID)
+                    && let Err(error) = control.open_unattached(RANDOM_PRESET)
                 {
                     warn!(%error, "Could not queue opening another familiar");
                 }
@@ -4589,7 +4629,7 @@ mod tests {
     }
 
     #[test]
-    fn service_open_outlives_clicked_view_and_only_commits_new_default_view() {
+    fn service_open_outlives_clicked_view_and_only_commits_new_concrete_view() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("private/open.sock");
         let (send, receive) = std::sync::mpsc::channel();
@@ -4649,6 +4689,12 @@ mod tests {
         );
         assert_eq!(existing.last_tick, tick);
         let new = &app.views["familiar-2"];
+        assert!(
+            crate::assets::CHARACTERS
+                .iter()
+                .any(|c| c.id == new.character.id)
+        );
+        assert_ne!(new.character.id, RANDOM_PRESET);
         assert_eq!(new.settings, defaults);
         assert_eq!(new.runtime_binding.target, None);
         assert!(new.runtime_binding.generation > 0);
@@ -4885,6 +4931,7 @@ mod tests {
     fn test_view() -> FamiliarView {
         FamiliarView::new(
             "test".into(),
+            character(DEFAULT_CHARACTER_ID).unwrap(),
             Arc::new(SpriteAtlas::load().unwrap()),
             options(),
         )
@@ -5552,7 +5599,12 @@ mod tests {
             let mut opts = options();
             opts.scale = 1.5;
             opts.sprite_scale = sprite_scale;
-            let mut view = FamiliarView::new("first".into(), atlas.clone(), opts);
+            let mut view = FamiliarView::new(
+                "first".into(),
+                character(DEFAULT_CHARACTER_ID).unwrap(),
+                atlas.clone(),
+                opts,
+            );
             injected_corner(&mut view, Instant::now());
             let Some(Navigation::Corner {
                 target: original_target,
@@ -5610,7 +5662,12 @@ mod tests {
         let atlas = Arc::new(SpriteAtlas::load().unwrap());
         for backing in [1.0, 1.25, 1.5, 2.0] {
             for after_arrival in [false, true] {
-                let mut view = FamiliarView::new("first".into(), atlas.clone(), options());
+                let mut view = FamiliarView::new(
+                    "first".into(),
+                    character(DEFAULT_CHARACTER_ID).unwrap(),
+                    atlas.clone(),
+                    options(),
+                );
                 let now = Instant::now();
                 injected_corner(&mut view, now);
                 let scale = view.options.sprite_scale;
@@ -5688,7 +5745,12 @@ mod tests {
     fn nonmoving_corner_steps_preserve_saved_bubble_anchor() {
         let atlas = Arc::new(SpriteAtlas::load().unwrap());
         for step in [PursuitStep::Arrived, PursuitStep::Blocked("injected stall")] {
-            let mut view = FamiliarView::new("first".into(), atlas.clone(), options());
+            let mut view = FamiliarView::new(
+                "first".into(),
+                character(DEFAULT_CHARACTER_ID).unwrap(),
+                atlas.clone(),
+                options(),
+            );
             injected_corner(&mut view, Instant::now());
             let saved = Some(PhysicalPosition::new(-350, 240));
             view.hidden_position = saved;
@@ -6456,6 +6518,163 @@ mod tests {
     }
 
     #[test]
+    fn mixed_presets_share_cached_atlases_and_use_character_titles() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let mut ruby = familiar("ruby-one");
+        ruby.preset = "ruby".into();
+        let mut second_ruby = ruby.clone();
+        second_ruby.id = "ruby-two".into();
+        let updates = app.stage_snapshot(vec![familiar("main"), ruby.clone(), second_ruby]);
+        assert_eq!(updates.len(), 3);
+        let amethyst = &app.views["main"];
+        let ruby_view = &app.views["ruby-one"];
+        assert_eq!(amethyst.title(&Presentation::default()), "Numen — Amethyst");
+        assert_eq!(ruby_view.title(&Presentation::default()), "Numen — Ruby");
+        assert!(Arc::ptr_eq(&ruby_view.atlas, &app.views["ruby-two"].atlas));
+        assert!(!Arc::ptr_eq(&amethyst.atlas, &ruby_view.atlas));
+        let expected = SpriteAtlas::load_character("ruby").unwrap();
+        for animation in Animation::ALL {
+            assert_eq!(
+                ruby_view.atlas.frame(animation, 0),
+                expected.frame(animation, 0)
+            );
+        }
+        assert_ne!(
+            amethyst.atlas.frame(Animation::Idle, 0),
+            ruby_view.atlas.frame(Animation::Idle, 0)
+        );
+        let active = source(crate::protocol::ActivityState::Working, None);
+        assert!(
+            ruby_view
+                .title(&active)
+                .starts_with("Numen — Ruby [source / ")
+        );
+        let cue = source(crate::protocol::ActivityState::Succeeded, Some(7));
+        assert!(ruby_view.title(&cue).starts_with("Numen — Ruby [source / "));
+        assert!(
+            app.views
+                .values()
+                .all(|view| view.window.is_none() && view.pixels.is_none())
+        );
+
+        let cached = ruby_view.atlas.clone();
+        app.stage_snapshot(vec![]);
+        app.stage_snapshot(vec![ruby]);
+        assert!(Arc::ptr_eq(&cached, &app.views["ruby-one"].atlas));
+        assert_eq!(app.atlases.len(), 2);
+    }
+
+    #[test]
+    fn amethyst_attached_to_djinn_keeps_source_identity_and_chat_access() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let target = FocusTarget {
+            source: "djinn".into(),
+            instance: "one".into(),
+            activity: "task".into(),
+        };
+        let mut snapshot = familiar("main");
+        snapshot.runtime_binding = AttachmentBinding {
+            target: Some(target.clone()),
+            generation: 1,
+        };
+        snapshot.presentation = source(crate::protocol::ActivityState::Working, None);
+        snapshot.presentation.base.as_mut().unwrap().source = target.source.clone();
+        let updates = app.stage_snapshot(vec![snapshot]);
+        let view = &app.views["main"];
+        assert_eq!(view.character.id, "amethyst");
+        assert_eq!(
+            view.title(&updates[0].1),
+            "Numen — Amethyst [djinn / task: working]"
+        );
+        assert_eq!(view.runtime_binding.target.as_ref(), Some(&target));
+        let menu = MenuAttachment {
+            binding: RuntimeBinding {
+                service_instance: "service-1".into(),
+                attachment: view.runtime_binding.clone(),
+            },
+            choices: vec![ChatChoice {
+                target,
+                incarnation: 1,
+                summary: None,
+            }],
+        };
+        assert_eq!(menu.open_chat_index(&view.runtime_binding), Some(0));
+    }
+
+    #[test]
+    fn each_character_renders_each_animation_and_reuses_cache_without_native_windows() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        for character in crate::assets::CHARACTERS {
+            let mut snapshot = familiar("character");
+            snapshot.preset = character.id.into();
+            app.stage_snapshot(vec![familiar("main"), snapshot.clone()]);
+            let view = &app.views["character"];
+            assert_eq!(view.character.name, character.name);
+            assert!(
+                view.title(&Presentation::default())
+                    .contains(character.name)
+            );
+            assert!(view.window.is_none() && view.pixels.is_none());
+            assert_eq!(
+                Arc::ptr_eq(&view.atlas, &app.views["main"].atlas),
+                character.id == DEFAULT_CHARACTER_ID
+            );
+            let expected = SpriteAtlas::load_character(character.id).unwrap();
+            for animation in Animation::ALL {
+                let sprite = view.atlas.frame(animation, 0);
+                assert_eq!(sprite, expected.frame(animation, 0));
+                let mut painted = vec![0; 192 * 208 * 4];
+                bubble::Renderer::new(None, 12.0).compose(
+                    &mut painted,
+                    (192, 208),
+                    sprite,
+                    &view.latest_view,
+                    None,
+                    false,
+                );
+                assert!(painted.chunks_exact(4).any(|pixel| pixel[3] > 0));
+            }
+            let cached = view.atlas.clone();
+            app.stage_snapshot(vec![]);
+            app.stage_snapshot(vec![snapshot]);
+            assert!(Arc::ptr_eq(&cached, &app.views["character"].atlas));
+        }
+        assert_eq!(app.atlases.len(), crate::assets::CHARACTERS.len());
+    }
+
+    #[test]
+    fn manual_and_demo_keep_the_supplied_default_atlas() {
+        for demo in [false, true] {
+            let mut opts = options();
+            opts.demo = demo;
+            opts.manual = !demo;
+            let atlas = SpriteAtlas::load().unwrap();
+            let frame = atlas.frame(Animation::Idle, 0).as_ptr();
+            let mut app = App::new(atlas, opts, false);
+            app.stage_snapshot(vec![familiar("main")]);
+            let view = &app.views["main"];
+            assert_eq!(view.character.id, DEFAULT_CHARACTER_ID);
+            assert_eq!(view.atlas.frame(Animation::Idle, 0).as_ptr(), frame);
+            assert!(view.display.is_manual());
+            assert_eq!(app.atlases.len(), 1);
+            assert!(view.window.is_none());
+        }
+    }
+
+    #[test]
+    fn unresolved_random_is_not_a_renderable_preset() {
+        let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
+        let mut unresolved = familiar("bad");
+        unresolved.preset = RANDOM_PRESET.into();
+        app.stage_snapshot(vec![unresolved, familiar("main")]);
+        assert_eq!(app.views.len(), 1);
+        assert!(app.views.contains_key("main"));
+        assert!(app.failed.contains("bad"));
+        assert!(app.pending_close.contains("bad"));
+        assert_eq!(app.atlases.len(), 1);
+    }
+
+    #[test]
     fn unexpected_presets_and_failed_views_wait_for_registry_removal() {
         let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
         let mut unsupported = familiar("bad");
@@ -6666,6 +6885,7 @@ mod tests {
             options.animation = selected;
             let mut app = FamiliarView::new(
                 "main".into(),
+                character(DEFAULT_CHARACTER_ID).unwrap(),
                 Arc::new(SpriteAtlas::load().unwrap()),
                 options,
             );
