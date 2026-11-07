@@ -183,32 +183,23 @@ Use the same `SDKROOT=...` prefix for `cargo test`, `cargo clippy`, or `cargo ru
 
 ### Local debug installation
 
-From this checkout, install or refresh the current debug build:
+From this checkout, install or refresh an isolated development build (only when
+explicitly authorized):
 
 ```sh
-cargo install --path . --debug --locked --offline --root "$HOME/.local" --force
+cargo install --path . --debug --locked --offline --root "$HOME/.local/libexec/arcana-dev/numen" --force
 ```
 
-This installs `~/.local/bin/numen`; keep that directory on `PATH`. Apply the
+This installs `~/.local/libexec/arcana-dev/numen/bin/numen`, not a competing
+`~/.local/bin/numen`. Do not add this isolated tree to global `PATH`; use its full
+path for standalone development or let Arcana own the public dispatcher. Apply the
 command-scoped SDK prefix above on machines that need the macOS workaround.
 `--offline` assumes dependencies are already downloaded. `--force` refreshes an
 existing same-version installation after source changes.
 
-On the validation machine, the older Homebrew Numen command was unlinked (not
-uninstalled) because `/opt/homebrew/bin` precedes `~/.local/bin`. No shell files
-were edited. `brew link numen` restores the Homebrew command if desired.
-
-In an already-open zsh terminal, run `rehash` once if it cached the old command:
-
-```sh
-rehash
-command -v numen # Expected: ~/.local/bin/numen
-numen menu
-```
-
-Installing does not restart a running service. To load new code, explicitly run
-`numen quit`, then `numen` for an unattached familiar. Use Open attached… to restore a chat. Future menu and
-control commands no longer need the checkout's full executable path.
+Installing does not restart a running service. Any service restart or public
+dispatcher migration is a separate user-authorized operation. Historical
+installation reports below describe earlier validation, not current install advice.
 
 ## API / Interfaces
 
@@ -256,6 +247,16 @@ Merely entering the menu or discovering sources never spawns a service or writes
 ```
 
 The generated entry is `id=numen`, title **Numen**, `kind=exec`, key **n**, with exactly `[absoluteExecutable, "--socket", absoluteSocket]` and **no `menu`**. Native Palette dispatches bare launch without Kitty/fzf; explicit `numen menu` still requires a TTY and Wisp `run`/`summon`. Installation remains opt-in and strict: no automatic old-entry replacement, and another action whose trimmed, ASCII-case-folded key is `n` rejects before writes even when Numen already matches. See [WISP.md](WISP.md#installer-safety-and-recovery) for manual review, `$` path rejection and two-backup recovery.
+
+`wisp-action --executable /absolute/public/numen` overrides the generated executable.
+Otherwise the generator uses `ARCANA_PUBLIC_NUMEN` when present, then the current
+executable for standalone use. Arcana should export this per-app variable only
+for Numen dispatch, naming the stable absolute public path. Supplied paths must
+be absolute, valid UTF-8 and free of `$`; empty values fail. They are persisted
+verbatim without canonicalization or existence checks, so symlinks and future
+dispatcher paths stay stable. Generic `ARCANA_PUBLIC_COMMAND` and other apps'
+identity variables are ignored. This only affects action generation, not the
+current-executable service bootstrap.
 
 Global `--socket PATH` works before or after the subcommand. Default: nonempty `$XDG_RUNTIME_DIR/numen/events.sock`, otherwise the standard temporary directory plus `numen-UID/events.sock`. Paths are limited to 100 bytes. Use a user-owned private parent (0700); the server creates only its leaf directory if its ancestor exists and never chmods an existing directory. The socket is user-owned, mode 0600. See [Protocol](PROTOCOL.md) for safety and lifecycle details.
 

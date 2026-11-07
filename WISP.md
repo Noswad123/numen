@@ -60,6 +60,7 @@ Synchronous native tracking suspends Rust GUI ticks; a 25 ms AppKit timer cancel
 | --- | --- |
 | `numen menu [--no-start] [--fzf PATH]` | Interactive stdin/stderr TTYs required. Uses installed fzf; launch via Wisp run/summon, not exec. |
 | `numen wisp-action` | Prints TOML **only**, with no writes or catalog lookup. |
+| `numen wisp-action --executable ABS` | Overrides the generated executable with an absolute public path; also works with `--install`. |
 | `numen wisp-action --install [--file PATH]` | Explicitly appends to the catalog reported by `wisp actions path`, or the supplied path. Parent must already exist. |
 | `numen run --empty` | Graphical service with zero initial familiars/no Main; conflicts with manual/demo. |
 | `numen service-info` | Queries API version 1, PID, unique `service_instance`, and graphical/lifecycle/navigation booleans; control readiness, not GPU readiness. |
@@ -71,7 +72,16 @@ Generated TOML has `id = "numen"`, `title = "Numen"`, `kind = "exec"`, `key = "n
 [absoluteExecutable, "--socket", absoluteResolvedSocket]
 ```
 
-Paths are captured from the current executable and resolved socket when generated. Leading `--socket` avoids Wisp's work-directory heuristic. The argv array preserves quoting, and **Numen need not be installed on PATH**. Wisp applies `os.ExpandEnv` to every action argument, so Numen rejects any `$` in the executable or socket path, including a literal dollar sign, before catalog lookup or writes. Use paths without `$`; TOML quoting does not disable that expansion. Regenerate if the binary or socket path changes; a different existing `numen` entry is refused for manual resolution. There is no `--replace` flag.
+The executable is selected from `--executable ABS`, else `ARCANA_PUBLIC_NUMEN`
+when present, else the current executable for standalone use. Arcana exports the
+per-app variable only on Numen dispatch, with the stable absolute public path;
+generic `ARCANA_PUBLIC_COMMAND` and other apps' identity variables are ignored.
+Overrides (including environment values) must be absolute, valid UTF-8 and
+nonempty. They are preserved verbatim, without canonicalization or existence
+checks, including symlinks, `..` and future dispatcher paths. This does not change
+service bootstrap, which still uses the current executable.
+
+The socket is resolved to an absolute path when generated. Leading `--socket` avoids Wisp's work-directory heuristic. The argv array preserves quoting, and **Numen need not be installed on PATH**. Wisp applies `os.ExpandEnv` to every action argument, so Numen rejects any `$` in the executable or socket path, including a literal dollar sign, before catalog lookup or writes. Use paths without `$`; TOML quoting does not disable that expansion. Regenerate if the public executable or socket path changes; a different existing `numen` entry is refused for manual resolution. There is no `--replace` flag.
 
 ## Data Flow
 

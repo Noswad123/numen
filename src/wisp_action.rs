@@ -30,6 +30,9 @@ pub struct ActionOptions {
     /// Catalog path for --install (parent must already exist; ignored for preview).
     #[arg(long)]
     pub file: Option<PathBuf>,
+    /// Absolute public executable path (else ARCANA_PUBLIC_NUMEN, then current executable).
+    #[arg(long)]
+    pub executable: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -76,7 +79,13 @@ fn stanza(executable: &Path, socket: &Path) -> Result<String> {
 }
 
 pub fn run(options: ActionOptions, socket: Option<&Path>) -> Result<()> {
-    let executable = std::env::current_exe().context("locate Numen executable")?;
+    let executable = match options
+        .executable
+        .or_else(|| std::env::var_os("ARCANA_PUBLIC_NUMEN").map(PathBuf::from))
+    {
+        Some(path) => path,
+        None => std::env::current_exe().context("locate Numen executable")?,
+    };
     let socket = match socket {
         Some(path) => path.to_owned(),
         None => crate::ipc::default_socket_path()?,
@@ -617,6 +626,18 @@ mod tests {
             let error = stanza(Path::new(binary), Path::new(socket)).unwrap_err();
             assert!(error.to_string().contains("Wisp expands '$'"));
         }
+    }
+
+    #[test]
+    fn public_executable_is_absolute_but_not_canonicalized() {
+        let socket = Path::new("/tmp/private/events.sock");
+        for executable in ["", "numen", "relative/numen", "~/bin/numen"] {
+            assert!(stanza(Path::new(executable), socket).is_err());
+        }
+        let executable = "/missing/arcana/../public/numen";
+        let text = stanza(Path::new(executable), socket).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(value["action"][0]["command"][0].as_str(), Some(executable));
     }
 
     #[test]

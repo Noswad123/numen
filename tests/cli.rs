@@ -73,6 +73,7 @@ fn command(socket: &Path) -> Command {
         .env("XDG_CONFIG_HOME", socket.parent().unwrap().join("config"))
         .env("XDG_RUNTIME_DIR", socket.parent().unwrap())
         .env("RUST_LOG", "numen=info,wgpu=warn")
+        .env_remove("ARCANA_PUBLIC_NUMEN")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
@@ -1731,6 +1732,93 @@ fn invalid_batches_and_selections_are_rejected_before_connecting() {
 }
 
 #[test]
+fn wisp_action_public_executable_precedence_and_verbatim_persistence() {
+    let (dir, socket) = fixture();
+    let public = "/future/Arcana Public/../bin/numen";
+    let explicit = "/override/public/numen";
+    for (override_path, expected) in [(None, public), (Some(explicit), explicit)] {
+        let mut cmd = command(&socket);
+        cmd.arg("wisp-action")
+            .env("ARCANA_PUBLIC_NUMEN", public)
+            .env("ARCANA_PUBLIC_COMMAND", "/wrong/coven")
+            .env("ARCANA_PUBLIC_COVEN", "/wrong/coven")
+            .env("PATH", dir.path());
+        if let Some(path) = override_path {
+            cmd.args(["--executable", path]);
+        }
+        let mut child = ChildGuard(cmd.spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (stdout, stderr) = child.output();
+        assert!(status.success(), "{stderr}");
+        let value: toml::Value = toml::from_str(&stdout).unwrap();
+        assert_eq!(value["action"][0]["command"][0].as_str(), Some(expected));
+        assert!(!socket.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    let catalog = dir.path().join("actions.toml");
+    for explicit_override in [false, true] {
+        if catalog.exists() {
+            fs::remove_file(&catalog).unwrap();
+        }
+        let mut cmd = command(&socket);
+        cmd.args(["wisp-action", "--install", "--file"])
+            .arg(&catalog)
+            .env(
+                "ARCANA_PUBLIC_NUMEN",
+                if explicit_override { "invalid" } else { public },
+            );
+        if explicit_override {
+            cmd.args(["--executable", public]);
+        }
+        let mut child = ChildGuard(cmd.spawn().unwrap());
+        let status = child.wait_until(Instant::now() + LIMIT);
+        let (_, stderr) = child.output();
+        assert!(status.success(), "{stderr}");
+        let value: toml::Value = toml::from_str(&fs::read_to_string(&catalog).unwrap()).unwrap();
+        assert_eq!(value["action"][0]["command"][0].as_str(), Some(public));
+    }
+}
+
+#[test]
+fn wisp_action_rejects_invalid_public_executables_before_writes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let (dir, socket) = fixture();
+    let catalog = dir.path().join("actions.toml");
+    let original = b"# untouched\n";
+    fs::write(&catalog, original).unwrap();
+    for path in [
+        std::ffi::OsString::from(""),
+        "relative/numen".into(),
+        "/public/$HOME/numen".into(),
+        std::ffi::OsString::from_vec(b"/public/\xff/numen".to_vec()),
+    ] {
+        for explicit_override in [false, true] {
+            let mut cmd = command(&socket);
+            cmd.args(["wisp-action", "--install", "--file"])
+                .arg(&catalog)
+                .env("PATH", dir.path());
+            if explicit_override {
+                cmd.arg("--executable")
+                    .arg(&path)
+                    .env("ARCANA_PUBLIC_NUMEN", "/valid/public/numen");
+            } else {
+                cmd.env("ARCANA_PUBLIC_NUMEN", &path);
+            }
+            let mut child = ChildGuard(cmd.spawn().unwrap());
+            let status = child.wait_until(Instant::now() + LIMIT);
+            let (stdout, stderr) = child.output();
+            assert!(!status.success(), "{path:?}");
+            assert!(stdout.is_empty());
+            assert!(!stderr.is_empty());
+            assert_eq!(fs::read(&catalog).unwrap(), original);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+            assert!(!socket.exists());
+        }
+    }
+}
+
+#[test]
 fn wisp_action_prints_absolute_argv_without_writing_home_or_catalog() {
     let (dir, socket) = fixture();
     let home = dir.path().join("home");
@@ -1741,6 +1829,8 @@ fn wisp_action_prints_absolute_argv_without_writing_home_or_catalog() {
     for explicit_file in [false, true] {
         let mut cmd = command(&socket);
         cmd.arg("wisp-action")
+            .env("ARCANA_PUBLIC_COMMAND", "/wrong/coven")
+            .env("ARCANA_PUBLIC_COVEN", "/wrong/coven")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("PATH", &home);
