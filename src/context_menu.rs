@@ -1,6 +1,7 @@
 //! Declarative familiar controls. Native callbacks only record a selection; the
 //! caller revalidates lifecycle/capabilities and executes it after tracking ends.
-// The native catalog is exercised by portable tests but consumed only by AppKit.
+// The catalog is shared by AppKit and the Wayland pointer menu. Some actions and
+// native adapters are intentionally unavailable on other desktop backends.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::sync::{Arc, atomic::AtomicBool};

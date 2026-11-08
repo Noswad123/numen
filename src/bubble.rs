@@ -222,7 +222,7 @@ impl Renderer {
         }
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     pub fn compose_bubble(
         &mut self,
         frame: &mut [u8],
@@ -238,6 +238,183 @@ impl Renderer {
                 &Canvas::for_dimensions(size, bubble_dimensions()),
                 view,
                 preview,
+            );
+        }
+    }
+
+    /// Reflow in scene units; only display density and scene scale affect glyph size.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn compose_bubble_layout(
+        &mut self,
+        frame: &mut [u8],
+        size: (u32, u32),
+        layout: crate::bubble_layout::BubbleLayout,
+        scene_scale: f64,
+        content: (&Presentation, Option<Animation>),
+    ) {
+        use crate::bubble_layout::TailEdge;
+        assert_eq!(frame.len(), size.0 as usize * size.1 as usize * 4);
+        frame.fill(0);
+        if size.0 == 0
+            || size.1 == 0
+            || layout.size.0 == 0
+            || layout.size.1 == 0
+            || !scene_scale.is_finite()
+            || scene_scale <= 0.0
+        {
+            return;
+        }
+        let density = (size.0 / layout.size.0).min(size.1 / layout.size.1);
+        let scale = scene_scale as f32 * density as f32;
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let (width, height) = (
+            layout.size.0 as f32 / scene_scale as f32,
+            layout.size.1 as f32 / scene_scale as f32,
+        );
+        if !width.is_finite() || !height.is_finite() || !(self.font_size * scale).is_finite() {
+            return;
+        }
+        let mut canvas = Canvas {
+            size,
+            scale,
+            x: 0.0,
+            y: 0.0,
+            content_clip: None,
+        };
+        let tail = layout.tail.filter(|_| width >= 32.0 && height >= 32.0);
+        let (mut left, mut top, mut right, mut bottom) = (4.0, 4.0, width - 4.0, height - 4.0);
+        if let Some(tail) = tail {
+            match tail.edge {
+                TailEdge::Top => top = 18.0,
+                TailEdge::Bottom => bottom = height - 18.0,
+                TailEdge::Left => left = 18.0,
+                TailEdge::Right => right = width - 18.0,
+            }
+        }
+        if right <= left + 2.0 || bottom <= top + 2.0 {
+            return;
+        }
+        let radius = 13.0_f32.min((right - left) / 2.0).min((bottom - top) / 2.0);
+        canvas.rounded(
+            frame,
+            (left, top, right - left, bottom - top),
+            radius,
+            BORDER,
+        );
+        canvas.rounded(
+            frame,
+            (
+                left + 1.0,
+                top + 1.0,
+                right - left - 2.0,
+                bottom - top - 2.0,
+            ),
+            (radius - 1.0).max(0.0),
+            IVORY,
+        );
+        if let Some(tail) = tail {
+            let horizontal = matches!(tail.edge, TailEdge::Top | TailEdge::Bottom);
+            let length = if horizontal { width } else { height };
+            let position = (tail.position as f32 / scene_scale as f32).clamp(6.0, length - 6.0);
+            for (depth, radius) in [(6.0, 5.5), (15.0, 2.5)] {
+                let (x, y) = match tail.edge {
+                    TailEdge::Top => (position, top - depth),
+                    TailEdge::Bottom => (position, bottom + depth),
+                    TailEdge::Left => (left - depth, position),
+                    TailEdge::Right => (right + depth, position),
+                };
+                canvas.rounded(
+                    frame,
+                    (x - radius, y - radius, radius * 2.0, radius * 2.0),
+                    radius,
+                    BORDER,
+                );
+                let inner = radius - 1.0;
+                canvas.rounded(
+                    frame,
+                    (x - inner, y - inner, inner * 2.0, inner * 2.0),
+                    inner,
+                    IVORY,
+                );
+            }
+        }
+        let rect = (
+            left + 12.0,
+            top + 8.0,
+            right - left - 24.0,
+            bottom - top - 16.0,
+        );
+        if rect.2 <= 0.0 || rect.3 <= 0.0 {
+            return;
+        }
+        canvas.content_clip = Some(rect);
+        let Some(face) = self.typeface.as_mut() else {
+            return;
+        };
+        let content = text(content.0, content.1);
+        let px = self.font_size * scale;
+        let metrics = face.line_metrics(px);
+        let line_height = metrics.new_line_size.max(metrics.ascent - metrics.descent);
+        let width = rect.2 * scale;
+        let left = rect.0 * scale;
+        let mut top = rect.1 * scale;
+        let mut bottom = (rect.1 + rect.3) * scale;
+        let identity = clip(face, &clean(&content.identity), px, width);
+        let status = clip(face, &clean(&content.status), px, width);
+        let (above, below) = ink_extents(face, &identity, px);
+        let (status_above, status_below) = ink_extents(face, &status, px);
+        let gap = 3.0 * scale;
+        // Status is essential; summary and identity use only the remaining space.
+        if bottom - top >= status_above + status_below {
+            let accent = match content
+                .status
+                .strip_prefix("Preview: ")
+                .unwrap_or(&content.status)
+            {
+                "Needs your input" | "Waiting on dependency" => [130, 83, 25, 255],
+                "Failed" => [151, 53, 48, 255],
+                "Working" | "Completed" => [51, 103, 83, 255],
+                _ => MUTED,
+            };
+            canvas.rounded(
+                frame,
+                (
+                    rect.0 - 9.0,
+                    bottom / scale - status_above / scale - 1.0,
+                    5.0,
+                    5.0,
+                ),
+                2.0,
+                accent,
+            );
+            canvas.paint_text(
+                frame,
+                face,
+                (left, bottom - status_below),
+                &status,
+                px,
+                accent,
+            );
+            bottom -= status_above + status_below + gap;
+        }
+        if bottom - top >= above + below + gap + line_height {
+            canvas.paint_text(frame, face, (left, top + above), &identity, px, MUTED);
+            top += above + below + gap;
+        }
+        let lines = ((bottom - top) / line_height).floor().clamp(0.0, 3.0) as usize;
+        for (index, line) in wrap(face, &content.summary, px, width, lines)
+            .iter()
+            .enumerate()
+        {
+            canvas.paint_text(
+                frame,
+                face,
+                (left, top + index as f32 * line_height + metrics.ascent),
+                line,
+                px,
+                INK,
             );
         }
     }
@@ -439,6 +616,7 @@ struct Canvas {
     scale: f32,
     x: f32,
     y: f32,
+    content_clip: Option<(f32, f32, f32, f32)>,
 }
 
 impl Canvas {
@@ -453,6 +631,7 @@ impl Canvas {
             scale,
             x: (size.0 as f32 - logical.0 as f32 * scale) / 2.0,
             y: (size.1 as f32 - logical.1 as f32 * scale) / 2.0,
+            content_clip: None,
         }
     }
 
@@ -493,7 +672,7 @@ impl Canvas {
         px: f32,
         color: [u8; 4],
     ) {
-        let (x0, y0, x1, y1) = self.bounds((16.0, 12.0, 352.0, 108.0));
+        let (x0, y0, x1, y1) = self.bounds(self.content_clip.unwrap_or((16.0, 12.0, 352.0, 108.0)));
         let mut previous = None;
         for c in value.chars() {
             pen += previous.map_or(0.0, |p| face.kern(p, c, px));
@@ -540,6 +719,374 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn responsive_frame(
+        renderer: &mut Renderer,
+        size: (u32, u32),
+        scale: f64,
+        tail: Option<crate::bubble_layout::Tail>,
+        view: &Presentation,
+    ) -> Vec<u8> {
+        let mut frame = vec![99; size.0 as usize * size.1 as usize * 4];
+        renderer.compose_bubble_layout(
+            &mut frame,
+            size,
+            crate::bubble_layout::BubbleLayout {
+                origin: (0, 0),
+                size,
+                tail,
+            },
+            scale,
+            (view, None),
+        );
+        frame
+    }
+
+    #[test]
+    fn responsive_reflow_keeps_glyph_density_and_line_metrics() {
+        let face = Typeface::bundled().unwrap();
+        let mut renderer = Renderer::new(Some(face.fork()), 16.0);
+        let mut view = view(ActivityState::Working, false);
+        view.following.as_mut().unwrap().summary = Some("word ".repeat(80));
+        for (scale, density) in [(1.0, 1), (1.375, 2), (2.0, 3)] {
+            let px = 16.0 * scale as f32 * density as f32;
+            let wide = wrap(
+                &face,
+                &text(&view, None).summary,
+                px,
+                352.0 * scale as f32 * density as f32,
+                3,
+            );
+            let narrow = wrap(
+                &face,
+                &text(&view, None).summary,
+                px,
+                168.0 * scale as f32 * density as f32,
+                3,
+            );
+            assert!(wide[0].len() > narrow[0].len());
+            assert!(narrow[2].ends_with('\u{2026}'));
+            let mut frames = Vec::new();
+            for width in [384, 200] {
+                let logical = (
+                    (f64::from(width) * scale).ceil() as u32,
+                    (144.0 * scale).ceil() as u32,
+                );
+                let size = (logical.0 * density, logical.1 * density);
+                let mut frame = vec![0; size.0 as usize * size.1 as usize * 4];
+                renderer.compose_bubble_layout(
+                    &mut frame,
+                    size,
+                    crate::bubble_layout::BubbleLayout {
+                        origin: (9, -20),
+                        size: logical,
+                        tail: None,
+                    },
+                    scale,
+                    (&view, None),
+                );
+                // The title and first summary word use the same raster and baselines.
+                let unit = scale as f32 * density as f32;
+                let crop: Vec<_> = ((12.0 * unit).ceil() as usize..(55.0 * unit).floor() as usize)
+                    .flat_map(|y| {
+                        let frame = &frame;
+                        ((16.0 * unit).ceil() as usize..(48.0 * unit).floor() as usize).flat_map(
+                            move |x| frame[(y * size.0 as usize + x) * 4..][..4].iter().copied(),
+                        )
+                    })
+                    .collect();
+                frames.push(crop);
+            }
+            assert_eq!(frames[0], frames[1], "reflow must not shrink glyphs");
+        }
+    }
+
+    #[test]
+    fn responsive_tails_repaint_each_edge_without_flipping_text() {
+        use crate::bubble_layout::{Tail, TailEdge};
+        let view = view(ActivityState::Working, false);
+        let mut renderer = Renderer::new(Some(Typeface::bundled().unwrap()), 12.0);
+        let mut background = Renderer::new(None, 12.0);
+        let size = (384, 144);
+        for edges in [
+            [TailEdge::Top, TailEdge::Bottom],
+            [TailEdge::Left, TailEdge::Right],
+        ] {
+            let mut glyphs = Vec::new();
+            for edge in edges {
+                let horizontal = matches!(edge, TailEdge::Top | TailEdge::Bottom);
+                let position = if horizontal { 190 } else { 70 };
+                let tail = Some(Tail { edge, position });
+                let frame = responsive_frame(&mut renderer, size, 1.0, tail, &view);
+                let blank = responsive_frame(&mut background, size, 1.0, tail, &view);
+                let (dot_x, dot_y) = match edge {
+                    TailEdge::Top => (190, 3),
+                    TailEdge::Bottom => (190, 141),
+                    TailEdge::Left => (3, 70),
+                    TailEdge::Right => (381, 70),
+                };
+                assert_eq!(&frame[(dot_y * 384 + dot_x) * 4..][..4], IVORY);
+                assert_eq!(&frame[..4], &[0; 4]);
+                let (left, top) = (
+                    if edge == TailEdge::Left { 30 } else { 16 },
+                    if edge == TailEdge::Top { 26 } else { 12 },
+                );
+                let ink: Vec<_> = (top..top + 70)
+                    .flat_map(|y| {
+                        let frame = &frame;
+                        let blank = &blank;
+                        (left..left + 310).filter_map(move |x| {
+                            let offset = (y * 384 + x) * 4;
+                            if frame[offset..offset + 4] != blank[offset..offset + 4] {
+                                Some((x - left, y - top, frame[offset..offset + 4].to_vec()))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
+                assert!(!ink.is_empty());
+                glyphs.push(ink);
+                let shifted = responsive_frame(
+                    &mut renderer,
+                    size,
+                    1.0,
+                    Some(Tail {
+                        edge,
+                        position: position + 20,
+                    }),
+                    &view,
+                );
+                assert_ne!(frame, shifted);
+                assert_eq!(
+                    frame,
+                    responsive_frame(&mut renderer, size, 1.0, tail, &view)
+                );
+                let clamped = responsive_frame(
+                    &mut renderer,
+                    size,
+                    1.0,
+                    Some(Tail {
+                        edge,
+                        position: u32::MAX,
+                    }),
+                    &view,
+                );
+                assert_eq!(
+                    clamped,
+                    responsive_frame(
+                        &mut renderer,
+                        size,
+                        1.0,
+                        Some(Tail {
+                            edge,
+                            position: if horizontal { size.0 } else { size.1 }
+                        }),
+                        &view
+                    )
+                );
+            }
+            assert_eq!(glyphs[0], glyphs[1], "tail orientation cannot flip text");
+        }
+    }
+
+    #[test]
+    fn responsive_minimum_sizes_preserve_status_raster_at_requested_density() {
+        use crate::bubble_layout::{BubbleLayout, Tail, TailEdge};
+        let mut face = Typeface::bundled().unwrap();
+        for font in [8.0_f32, 12.0, 24.0, 32.0] {
+            for (scene_scale, density) in [(1.0, 1), (1.375, 2)] {
+                let unit = scene_scale as f32 * density as f32;
+                let logical = (
+                    (f64::from((font * 6.0 + 32.0).clamp(160.0, 384.0)) * scene_scale).ceil()
+                        as u32,
+                    (f64::from((font * 2.5 + 24.0).clamp(80.0, 144.0)) * scene_scale).ceil() as u32,
+                );
+                let size = (logical.0 * density, logical.1 * density);
+                for edge in [
+                    TailEdge::Top,
+                    TailEdge::Bottom,
+                    TailEdge::Left,
+                    TailEdge::Right,
+                ] {
+                    let layout = BubbleLayout {
+                        origin: (0, 0),
+                        size: logical,
+                        tail: Some(Tail { edge, position: 40 }),
+                    };
+                    let (width, height) = (
+                        logical.0 as f32 / scene_scale as f32,
+                        logical.1 as f32 / scene_scale as f32,
+                    );
+                    let left = if edge == TailEdge::Left { 30.0 } else { 16.0 };
+                    let right = width - if edge == TailEdge::Right { 30.0 } else { 16.0 };
+                    let top = if edge == TailEdge::Top { 26.0 } else { 12.0 };
+                    let bottom = height - if edge == TailEdge::Bottom { 26.0 } else { 12.0 };
+                    let canvas = Canvas {
+                        size,
+                        scale: unit,
+                        x: 0.0,
+                        y: 0.0,
+                        content_clip: Some((left, top, right - left, bottom - top)),
+                    };
+                    let mut frames = Vec::new();
+                    for (state, attention, accent) in [
+                        (ActivityState::Waiting, true, [130, 83, 25, 255]),
+                        (ActivityState::Waiting, false, [130, 83, 25, 255]),
+                        (ActivityState::Failed, false, [151, 53, 48, 255]),
+                    ] {
+                        let view = view(state, attention);
+                        let px = font * unit;
+                        let status =
+                            clip(&face, &text(&view, None).status, px, (right - left) * unit);
+                        let (above, below) = ink_extents(&mut face, &status, px);
+                        assert!(above + below <= (bottom - top) * unit);
+                        let mut expected = IVORY.repeat(size.0 as usize * size.1 as usize);
+                        canvas.paint_text(
+                            &mut expected,
+                            &mut face,
+                            (left * unit, bottom * unit - below),
+                            &status,
+                            px,
+                            accent,
+                        );
+                        let mut actual = vec![0; expected.len()];
+                        Renderer::new(Some(face.fork()), font).compose_bubble_layout(
+                            &mut actual,
+                            size,
+                            layout,
+                            scene_scale,
+                            (&view, None),
+                        );
+                        let (x0, _, x1, y1) =
+                            canvas.bounds((left, top, right - left, bottom - top));
+                        let y0 = (bottom * unit - above - below).round() as usize;
+                        let mut ink_pixels = 0;
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                let offset = (y * size.0 as usize + x) * 4;
+                                assert_eq!(
+                                    &actual[offset..offset + 4],
+                                    &expected[offset..offset + 4],
+                                    "status ink clipped, omitted, or rescaled: font {font}, edge {edge:?}, status {status}"
+                                );
+                                ink_pixels += usize::from(expected[offset..offset + 4] != IVORY);
+                            }
+                        }
+                        assert!(
+                            ink_pixels > 0,
+                            "must compare status glyphs, not just the accent"
+                        );
+                        frames.push(actual);
+                    }
+                    assert_ne!(
+                        frames[0], frames[1],
+                        "attention changes must remain visible"
+                    );
+                    assert_ne!(frames[0], frames[2], "failure must remain visible");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_accented_identity_keeps_full_ink_inside_content() {
+        let mut face = Typeface::bundled().unwrap();
+        let mut view = view(ActivityState::Waiting, true);
+        view.following.as_mut().unwrap().source = "\u{c9}gj\u{e9}".into();
+        for font in [8.0, 12.0, 24.0, 32.0] {
+            let size = (384, 200);
+            let actual = responsive_frame(
+                &mut Renderer::new(Some(face.fork()), font),
+                size,
+                1.0,
+                None,
+                &view,
+            );
+            let identity = text(&view, None).identity;
+            let (above, below) = ink_extents(&mut face, &identity, font);
+            let canvas = Canvas {
+                size,
+                scale: 1.0,
+                x: 0.0,
+                y: 0.0,
+                content_clip: Some((16.0, 12.0, 352.0, 176.0)),
+            };
+            let mut expected = IVORY.repeat(size.0 as usize * size.1 as usize);
+            canvas.paint_text(
+                &mut expected,
+                &mut face,
+                (16.0, 12.0 + above),
+                &identity,
+                font,
+                MUTED,
+            );
+            let mut ink_pixels = 0;
+            for y in 12..(12.0 + above + below).ceil() as usize {
+                for x in 16..368 {
+                    let offset = (y * 384 + x) * 4;
+                    assert_eq!(&actual[offset..offset + 4], &expected[offset..offset + 4]);
+                    ink_pixels += usize::from(expected[offset..offset + 4] != IVORY);
+                }
+            }
+            assert!(above > 0.0 && below > 0.0 && ink_pixels > 0);
+        }
+    }
+
+    #[test]
+    fn responsive_tiny_and_invalid_geometry_stays_safe_and_transparent() {
+        use crate::bubble_layout::{Tail, TailEdge};
+        let mut renderer = Renderer::new(Some(Typeface::bundled().unwrap()), 32.0);
+        for size in [(0, 0), (0, 144), (1, 1), (8, 8), (16, 31), (32, 32)] {
+            for edge in [
+                TailEdge::Top,
+                TailEdge::Bottom,
+                TailEdge::Left,
+                TailEdge::Right,
+            ] {
+                for scale in [
+                    0.0,
+                    -1.0,
+                    f64::NAN,
+                    f64::INFINITY,
+                    f64::MIN_POSITIVE,
+                    f64::MAX,
+                    1.0,
+                ] {
+                    let frame = responsive_frame(
+                        &mut renderer,
+                        size,
+                        scale,
+                        Some(Tail {
+                            edge,
+                            position: u32::MAX,
+                        }),
+                        &Presentation::default(),
+                    );
+                    assert_eq!(frame.len(), size.0 as usize * size.1 as usize * 4);
+                    assert!(
+                        frame
+                            .chunks_exact(4)
+                            .filter(|p| p[3] == 0)
+                            .all(|p| p == [0; 4])
+                    );
+                }
+            }
+        }
+        let mut frame = vec![99; 16 * 16 * 4];
+        renderer.compose_bubble_layout(
+            &mut frame,
+            (16, 16),
+            crate::bubble_layout::BubbleLayout {
+                origin: (0, 0),
+                size: (0, 144),
+                tail: None,
+            },
+            1.0,
+            (&Presentation::default(), None),
+        );
+        assert!(frame.iter().all(|&byte| byte == 0));
+    }
 
     #[test]
     fn split_composition_matches_combined_at_equal_density() {

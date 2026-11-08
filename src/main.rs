@@ -3,6 +3,8 @@ mod animation;
 mod assets;
 mod bootstrap;
 mod bubble;
+#[cfg(any(target_os = "linux", test))]
+mod bubble_layout;
 mod build_info;
 mod chat;
 mod context_menu;
@@ -20,6 +22,8 @@ mod menu;
 mod motion;
 mod native_window;
 mod pointer;
+#[cfg(any(target_os = "linux", test))]
+mod pointer_menu;
 mod preferences;
 mod protocol;
 mod typography;

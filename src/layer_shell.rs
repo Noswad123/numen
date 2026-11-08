@@ -59,16 +59,18 @@ use smithay_client_toolkit::{
 };
 use tracing::{debug, info, warn};
 
+mod popup;
 mod software;
 use software::{
-    CloseRequest, Gesture, Reveals, bubble_origin, clamp_origin, fallback_cursor, framebuffer_fits,
+    CloseRequest, Gesture, Reveals, clamp_origin, fallback_cursor, framebuffer_fits,
     initial_origin, input_rectangles, raster_scale, write_argb,
 };
 
 use crate::{
     RunOptions,
-    activity::FamiliarPresentation,
+    activity::{FamiliarPresentation, PreferencePresentation},
     assets::{DEFAULT_CHARACTER_ID, SpriteAtlas, character},
+    bubble_layout::{self, BubbleLayout},
     desktop_scene::FamiliarScene,
     diagnostics::{ShortcutReason, ShortcutState, ShortcutStatus},
     display::Mailbox,
@@ -121,6 +123,7 @@ pub(crate) fn prepare() -> Result<Prepared> {
             compositor,
             raw_compositor: raw,
             layers,
+            xdg: smithay_client_toolkit::shell::xdg::XdgShell::bind(&globals, &qh).ok(),
             shm,
             subs,
             views: BTreeMap::new(),
@@ -132,6 +135,7 @@ pub(crate) fn prepare() -> Result<Prepared> {
             options: None,
             typeface: None,
             atlases: BTreeMap::new(),
+            next_parent: 0,
         };
         queue
             .roundtrip(&mut state)
@@ -271,7 +275,7 @@ impl Prepared {
             } else {
                 "disabled in live mode"
             },
-            "Layer-shell controls: left click reveal, drag move, middle click pause/resume, right click close; integer output scaling; no global navigation or keyboard focus"
+            "Layer-shell controls: left click reveal, drag move, middle click pause/resume, right click menu; integer output scaling; no global navigation or keyboard focus"
         );
         loop {
             let now = Instant::now();
@@ -292,6 +296,7 @@ impl Prepared {
             }
             let mut deadline = exit_at;
             state.refresh_surfaces(&qh, now)?;
+            state.service_popups(&qh, now, &mut deadline);
             for view in state.views.values_mut() {
                 if view.native.is_none() && !view.failed {
                     earliest(
@@ -386,6 +391,7 @@ struct State {
     compositor: CompositorState,
     raw_compositor: wl_compositor::WlCompositor,
     layers: LayerShell,
+    xdg: Option<smithay_client_toolkit::shell::xdg::XdgShell>,
     shm: Shm,
     subs: SubcompositorState,
     pointers: Vec<SeatPointer>,
@@ -397,13 +403,18 @@ struct State {
     options: Option<RunOptions>,
     typeface: Option<Typeface>,
     atlases: BTreeMap<&'static str, Arc<SpriteAtlas>>,
+    next_parent: u64,
 }
 
 struct View {
+    runtime_binding: Option<crate::activity::AttachmentBinding>,
+    preference: Option<PreferencePresentation>,
+    settings: FamiliarSettings,
     scene: FamiliarScene,
     native: Option<Native>,
     rejected_outputs: Vec<(wl_output::WlOutput, Instant)>,
     close: CloseRequest,
+    closing: bool,
     failed: bool,
 }
 
@@ -475,16 +486,23 @@ impl State {
             self.options.as_ref().unwrap().clone(),
             self.typeface.as_ref().map(Typeface::fork),
         );
-        if let Some(settings) = settings {
-            scene.apply_settings(settings)?;
-        }
+        let settings = settings.unwrap_or_else(|| FamiliarSettings {
+            sprite_scale: scene.options.sprite_scale.into(),
+            font_size: scene.options.font_size.into(),
+            bubble_duration: scene.options.bubble_duration.as_secs_f64(),
+        });
+        scene.apply_settings(settings)?;
         self.views.insert(
             id,
             View {
+                runtime_binding: None,
+                preference: None,
+                settings,
                 scene,
                 native: None,
                 rejected_outputs: Vec::new(),
                 close: CloseRequest::default(),
+                closing: false,
                 failed: false,
             },
         );
@@ -510,6 +528,20 @@ impl State {
                 )?;
             }
             let view = self.views.get_mut(&familiar.id).unwrap();
+            if (view.runtime_binding.as_ref() != Some(&familiar.runtime_binding)
+                || view.settings != familiar.settings
+                || view.preference.as_ref().map(|p| (&p.binding, p.writable))
+                    != familiar
+                        .preference
+                        .as_ref()
+                        .map(|p| (&p.binding, p.writable)))
+                && let Some(native) = &mut view.native
+            {
+                native.popup = None;
+            }
+            view.runtime_binding = Some(familiar.runtime_binding);
+            view.preference = familiar.preference;
+            view.settings = familiar.settings;
             if view.scene.apply_settings(familiar.settings)? {
                 view.failed = false;
             }
@@ -582,7 +614,10 @@ impl State {
             layer.commit();
             view.scene.sprite_dirty = true;
             view.scene.bubble_dirty = true;
+            self.next_parent += 1;
             view.native = Some(Native {
+                identity: self.next_parent,
+                popup: None,
                 layer,
                 child,
                 subsurface,
@@ -600,12 +635,13 @@ impl State {
                 layout_dirty: true,
                 sprite_size: (0, 0),
                 bubble_visible: false,
+                bubble_layout: None,
                 input_rectangles: 0,
                 gesture: Gesture::default(),
             });
             info!(familiar = %view.scene.id, character = view.scene.character.id,
                 side_button = if view.scene.options.manual || view.scene.options.demo { "preview" } else { "ignored in live mode" },
-                "Familiar ready; left click reveal, drag move, middle click pause/resume, right click close");
+                "Familiar ready; left click reveal, drag move, middle click pause/resume, right click menu");
         }
         Ok(())
     }
@@ -671,6 +707,8 @@ fn available_buffer(
 }
 
 struct Native {
+    identity: u64,
+    popup: Option<popup::NativePopup>,
     layer: LayerSurface,
     child: wl_surface::WlSurface,
     subsurface: wl_subsurface::WlSubsurface,
@@ -688,12 +726,14 @@ struct Native {
     layout_dirty: bool,
     sprite_size: (u32, u32),
     bubble_visible: bool,
+    bubble_layout: Option<BubbleLayout>,
     input_rectangles: usize,
     gesture: Gesture,
 }
 
 impl Drop for Native {
     fn drop(&mut self) {
+        self.popup = None;
         self.subsurface.destroy();
         self.child.destroy();
     }
@@ -707,20 +747,40 @@ impl Native {
         qh: &QueueHandle<State>,
     ) -> Result<bool> {
         let size = scene.sprite_size();
-        let bubble_size = scene.bubble_size();
-        let visible = scene.bubble_visible();
+        let origin = clamp_origin(self.origin, self.output_size, size);
+        let preferred_bubble = scene.bubble_size();
+        let layout = bubble_layout::layout(
+            origin,
+            size,
+            preferred_bubble,
+            scene.minimum_bubble_size(),
+            self.output_size,
+        );
+        let bubble_size = layout.map_or(preferred_bubble, |layout| layout.size);
+        let requested_visible = scene.bubble_visible();
+        let visible = requested_visible && layout.is_some();
+        let paint_layout_changed =
+            self.bubble_layout.map(|l| (l.size, l.tail)) != layout.map(|l| (l.size, l.tail));
+        let placement_changed = self.bubble_layout != layout;
         let density = raster_scale(self.scale, size, bubble_size)
             .context("logical layer size exceeds raster budget even at scale one")?;
         let density_changed = density != self.raster_scale;
         let resized = self.sprite_size != size;
+        if resized || density_changed || self.origin != self.committed_origin {
+            self.popup = None;
+        }
         let sprite_dirty = scene.sprite_dirty || resized || density_changed;
         let bubble_dirty = scene.bubble_dirty
             || self.layout_dirty
             || resized
             || density_changed
+            || placement_changed
             || visible != self.bubble_visible;
-        let bubble_pixels_dirty =
-            visible && (scene.bubble_dirty || !self.bubble_visible || density_changed);
+        let bubble_pixels_dirty = visible
+            && (scene.bubble_dirty
+                || !self.bubble_visible
+                || density_changed
+                || paint_layout_changed);
         if !sprite_dirty && !bubble_dirty && !self.layout_dirty {
             return Ok(true);
         }
@@ -750,7 +810,7 @@ impl Native {
         let parent = self.layer.wl_surface();
         if resized {
             self.layer.set_size(size.0, size.1);
-            self.origin = clamp_origin(self.origin, self.output_size, size);
+            self.origin = origin;
             self.layout_dirty = true;
             self.gesture = Gesture::default();
         }
@@ -759,9 +819,12 @@ impl Native {
         }
         parent.set_buffer_scale(density);
         self.child.set_buffer_scale(density);
-        let (bubble_x, bubble_y) = bubble_origin(self.origin, size, bubble_size, self.output_size);
-        self.subsurface
-            .set_position(bubble_x - self.origin.0, bubble_y - self.origin.1);
+        if let Some(layout) = layout {
+            self.subsurface.set_position(
+                layout.origin.0 - self.origin.0,
+                layout.origin.1 - self.origin.1,
+            );
+        }
         if let Some(index) = sprite_slot {
             let rgba = scene.render_sprite(sprite_physical);
             let region = compositor.create_region(qh, ());
@@ -783,7 +846,10 @@ impl Native {
         }
         if bubble_dirty {
             if let Some(index) = bubble_slot {
-                let rgba = scene.render_bubble(bubble_physical);
+                let rgba = scene.render_bubble_layout(
+                    bubble_physical,
+                    layout.expect("visible bubble has layout"),
+                );
                 let buffer = &self.bubble_buffers[index].buffer;
                 write_argb(&rgba, self.pool.canvas(buffer).unwrap(), false);
                 buffer.attach_to(&self.child)?;
@@ -804,12 +870,17 @@ impl Native {
             bubble_visible = visible, input_rectangles = self.input_rectangles, raster_scale = density, "Layer sprite presented");
         if bubble_dirty {
             debug!(familiar = %scene.id, visible, logical_width = bubble_size.0,
-                logical_height = bubble_size.1, input_empty = true, "Layer bubble presented");
+                logical_height = bubble_size.1, input_empty = true,
+                requested_visible, suppressed = requested_visible && !visible,
+                reflowed = bubble_size != preferred_bubble,
+                tail_edge = ?layout.and_then(|l| l.tail).map(|t| t.edge),
+                "Layer bubble presented");
         }
         self.sprite_size = size;
         self.raster_scale = density;
         self.committed_origin = self.origin;
         self.bubble_visible = visible;
+        self.bubble_layout = layout;
         self.layout_dirty = false;
         Ok(true)
     }
@@ -829,6 +900,7 @@ impl CompositorHandler for State {
                 && n.scale != factor.max(1)
             {
                 n.scale = factor.max(1);
+                n.popup = None;
                 n.layout_dirty = true;
                 n.gesture = Gesture::default();
                 view.scene.sprite_dirty = true;
@@ -852,6 +924,11 @@ impl CompositorHandler for State {
         _: u32,
     ) {
         for view in self.views.values_mut() {
+            if let Some(popup) = view.native.as_mut().and_then(|n| n.popup.as_mut())
+                && popup.role.wl_surface() == surface
+            {
+                popup.frame();
+            }
             if let Some(n) = &mut view.native
                 && n.layer.wl_surface() == surface
             {
@@ -934,6 +1011,7 @@ impl OutputHandler for State {
                 && n.output == output
             {
                 if n.output_size != size {
+                    n.popup = None;
                     n.output_size = size;
                     if let Some((w, h)) = size {
                         let sprite = view.scene.sprite_size();
@@ -943,6 +1021,7 @@ impl OutputHandler for State {
                     n.gesture = Gesture::default();
                 }
                 if n.scale != factor {
+                    n.popup = None;
                     n.scale = factor;
                     n.layout_dirty = true;
                     n.gesture = Gesture::default();
@@ -1021,6 +1100,12 @@ impl State {
         for pointer in self.pointers.iter().filter(|p| &p.seat == seat) {
             for view in self.views.values_mut() {
                 if let Some(n) = &mut view.native {
+                    if n.popup
+                        .as_ref()
+                        .is_some_and(|p| p.owner() == pointer.themed.pointer().id().protocol_id())
+                    {
+                        n.popup = None;
+                    }
                     n.gesture
                         .cancel(pointer.themed.pointer().id().protocol_id());
                 }
@@ -1043,12 +1128,17 @@ impl PointerHandler for State {
     fn pointer_frame(
         &mut self,
         connection: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         let pointer_id = pointer.id().protocol_id();
         for event in events {
+            // An active menu belongs to its opening pointer, including its parent
+            // toggle and leave grace. Other seats cannot replace or interact with it.
+            if !self.popup_accepts_pointer(pointer_id) {
+                continue;
+            }
             if let PointerEventKind::Enter { serial } = event.kind
                 && let Some(cursor) = self
                     .pointers
@@ -1057,6 +1147,34 @@ impl PointerHandler for State {
                 && let Err(error) = cursor.default_cursor(connection, serial, &self.shm)
             {
                 warn!(%error, "Cannot display layer-shell cursor");
+            }
+            if self.popup_pointer(pointer_id, event) {
+                continue;
+            }
+            let parent_id = self
+                .views
+                .iter()
+                .find(|(_, v)| {
+                    v.native
+                        .as_ref()
+                        .is_some_and(|n| n.layer.wl_surface() == &event.surface)
+                })
+                .map(|(id, _)| id.clone());
+            if let Some(id) = parent_id.as_deref() {
+                if matches!(event.kind, PointerEventKind::Press { button: 0x111, .. }) {
+                    let toggle = self.views[id]
+                        .native
+                        .as_ref()
+                        .is_some_and(|n| n.popup.is_some());
+                    self.dismiss_popups();
+                    if !toggle
+                        && let Err(error) = self.open_popup(id, event.position, pointer_id, qh)
+                    {
+                        warn!(%error, "Cannot open familiar menu");
+                    }
+                    continue;
+                }
+                self.popup_parent_pointer(id, pointer_id, &event.kind);
             }
             let Some(view) = self.views.values_mut().find(|v| {
                 v.native
@@ -1092,10 +1210,6 @@ impl PointerHandler for State {
                     if view.scene.options.manual || view.scene.options.demo =>
                 {
                     view.scene.cycle(Instant::now())
-                }
-                PointerEventKind::Press { button: 0x111, .. } => {
-                    view.close.request(Instant::now());
-                    n.gesture = Gesture::default();
                 }
                 _ => {}
             }

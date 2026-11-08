@@ -240,6 +240,22 @@ fn logical_size(line: &str) -> (u32, u32) {
     )
 }
 
+fn bubble_dimensions(line: &str) -> (u32, u32) {
+    let size = logical_size(line);
+    // Default scene scale is 1.5: preferred 384x144, readability floor 160x80.
+    let preferred = (576, 216);
+    assert!(size.0 >= 240 && size.0 <= preferred.0, "{line}");
+    assert!(size.1 >= 120 && size.1 <= preferred.1, "{line}");
+    if line.contains("reflowed=true") {
+        assert_ne!(size, preferred, "{line}");
+    } else {
+        assert!(line.contains("reflowed=false"), "{line}");
+        assert_eq!(size, preferred, "unreflowed bubble resized: {line}");
+    }
+    assert!(line.contains("input_empty=true"), "{line}");
+    size
+}
+
 /// cargo test --test linux_layer_shell -- --ignored --nocapture
 #[test]
 #[ignore = "requires a running Wayland desktop with layer-shell support"]
@@ -299,7 +315,7 @@ fn auto_native_lifecycle_concurrent_presets_settings_and_transient_bubbles() {
             start,
             &["Layer bubble presented", &familiar, "input_empty=true"],
         );
-        let bubble = logical_size(&line);
+        let bubble = bubble_dimensions(&line);
         assert!(bubble.0 > 0 && bubble.1 > 0, "{line}");
         assert_ne!(
             bubble, sprite,
@@ -327,7 +343,7 @@ fn auto_native_lifecycle_concurrent_presets_settings_and_transient_bubbles() {
             ],
         );
         // A frame queued before the settings ACK can still carry the old size.
-        let (initial, bubble_size) = initial_sizes[id];
+        let (initial, _) = initial_sizes[id];
         let width = format!("logical_width={} ", initial.0 * 3 / 2);
         let height = format!("logical_height={} ", initial.1 * 3 / 2);
         let (applied_end, applied) = observed(
@@ -350,11 +366,9 @@ fn auto_native_lifecycle_concurrent_presets_settings_and_transient_bubbles() {
             applied_end,
             &["Layer bubble presented", &familiar, "input_empty=true"],
         );
-        assert_eq!(
-            logical_size(&line),
-            bubble_size,
-            "settings resized bubble: {line}"
-        );
+        // Settings may reduce available space by enlarging the sprite. Reflow is
+        // bounded above; reveal and expiry below must retain this applied size.
+        let bubble_size = bubble_dimensions(&line);
         assert_ne!(bubble_size, size);
         let mut offset = 0;
         let entry = loop {
@@ -410,12 +424,21 @@ fn auto_native_lifecycle_concurrent_presets_settings_and_transient_bubbles() {
                 &[
                     "Layer bubble presented",
                     &familiar,
-                    "visible=true",
+                    " visible=true ",
+                    "requested_visible=true",
+                    "suppressed=false",
                     "input_empty=true",
                 ],
             );
+            assert!(
+                ["Bottom", "Top", "Left", "Right"]
+                    .iter()
+                    .any(|edge| line.contains(&format!("tail_edge=Some({edge})"))),
+                "visible bubble must have a directional tail: {line}"
+            );
+            eprintln!("native visible commit: {}", line.trim());
             assert_eq!(
-                logical_size(&line),
+                bubble_dimensions(&line),
                 bubble_size,
                 "reveal resized bubble: {line}"
             );
@@ -433,12 +456,14 @@ fn auto_native_lifecycle_concurrent_presets_settings_and_transient_bubbles() {
                 &[
                     "Layer bubble presented",
                     &familiar,
-                    "visible=false",
+                    " visible=false ",
+                    "requested_visible=false",
+                    "suppressed=false",
                     "input_empty=true",
                 ],
             );
             assert_eq!(
-                logical_size(&line),
+                bubble_dimensions(&line),
                 bubble_size,
                 "expiry resized bubble: {line}"
             );

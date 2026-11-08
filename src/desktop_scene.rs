@@ -128,7 +128,14 @@ impl FamiliarScene {
     }
 
     pub fn toggle_pause(&mut self, now: Instant) {
-        self.options.paused = !self.options.paused;
+        self.set_paused(!self.options.paused, now);
+    }
+
+    pub fn set_paused(&mut self, paused: bool, now: Instant) {
+        if self.options.paused == paused {
+            return;
+        }
+        self.options.paused = paused;
         self.last_tick = now;
         self.next_demo = now + DEMO_INTERVAL;
     }
@@ -171,6 +178,15 @@ impl FamiliarScene {
         self.scaled_size(bubble::bubble_dimensions())
     }
 
+    pub fn minimum_bubble_size(&self) -> (u32, u32) {
+        let width = (self.options.font_size * 6.0 + 32.0).clamp(160.0, 384.0);
+        let height = (self.options.font_size * 2.5 + 24.0).clamp(80.0, 144.0);
+        (
+            (f64::from(width) * self.options.scale).ceil() as u32,
+            (f64::from(height) * self.options.scale).ceil() as u32,
+        )
+    }
+
     pub fn render_sprite(&mut self, physical_size: (u32, u32)) -> Vec<u8> {
         let mut frame = vec![0; physical_size.0 as usize * physical_size.1 as usize * 4];
         self.renderer.compose_sprite(
@@ -184,11 +200,31 @@ impl FamiliarScene {
     }
 
     /// Paints the bubble even while hidden; native mapping owns visibility.
+    #[cfg(test)]
     pub fn render_bubble(&mut self, physical_size: (u32, u32)) -> Vec<u8> {
         let mut frame = vec![0; physical_size.0 as usize * physical_size.1 as usize * 4];
         let preview = self.preview();
         self.renderer
             .compose_bubble(&mut frame, physical_size, &self.latest_view, preview);
+        self.bubble_dirty = false;
+        frame
+    }
+
+    /// Layout and mapping are native concerns; painting never changes sprite geometry.
+    pub fn render_bubble_layout(
+        &mut self,
+        physical_size: (u32, u32),
+        layout: crate::bubble_layout::BubbleLayout,
+    ) -> Vec<u8> {
+        let mut frame = vec![0; physical_size.0 as usize * physical_size.1 as usize * 4];
+        let preview = self.preview();
+        self.renderer.compose_bubble_layout(
+            &mut frame,
+            physical_size,
+            layout,
+            self.options.scale,
+            (&self.latest_view, preview),
+        );
         self.bubble_dirty = false;
         frame
     }
@@ -271,6 +307,83 @@ mod tests {
         scene.render_sprite(scene.sprite_size());
         scene.render_bubble(scene.bubble_size());
         assert!(!scene.sprite_dirty && !scene.bubble_dirty);
+    }
+
+    #[test]
+    fn responsive_layout_reflow_and_reveal_are_independent_of_sprite_size() {
+        use crate::bubble_layout::{BubbleLayout, Tail, TailEdge};
+        let mut s = scene(&["--scale", "1.375"]);
+        let now = s.last_tick;
+        let layout = BubbleLayout {
+            origin: (100, 200),
+            size: (275, 198),
+            tail: Some(Tail {
+                edge: TailEdge::Bottom,
+                position: 100,
+            }),
+        };
+        assert_eq!(s.minimum_bubble_size(), (220, 110));
+        let size = (layout.size.0 * 2, layout.size.1 * 2);
+        let first = s.render_bubble_layout(size, layout);
+        assert!(!s.bubble_dirty);
+        let sprite_size = s.sprite_size();
+        s.reveal(now);
+        assert_eq!(s.sprite_size(), sprite_size);
+        assert_eq!(first, s.render_bubble_layout(size, layout));
+        s.apply_settings(FamiliarSettings {
+            sprite_scale: 2.0,
+            ..FamiliarSettings::default()
+        })
+        .unwrap();
+        assert_eq!(first, s.render_bubble_layout(size, layout));
+        assert_ne!(s.sprite_size(), sprite_size);
+        let new_sprite_size = s.sprite_size();
+        let shifted = BubbleLayout {
+            tail: Some(Tail {
+                edge: TailEdge::Bottom,
+                position: 150,
+            }),
+            ..layout
+        };
+        assert_ne!(first, s.render_bubble_layout(size, shifted));
+        assert_eq!(s.sprite_size(), new_sprite_size);
+        s.apply_settings(FamiliarSettings {
+            font_size: 32.0,
+            ..FamiliarSettings::default()
+        })
+        .unwrap();
+        assert_eq!(s.minimum_bubble_size(), (308, 143));
+    }
+
+    #[test]
+    fn minimum_height_bubble_keeps_attention_and_failure_visible() {
+        let mut s = scene(&["--scale", "1"]);
+        let layout = crate::bubble_layout::layout(
+            (144, 80),
+            (96, 104),
+            s.bubble_size(),
+            s.minimum_bubble_size(),
+            Some((384, 264)),
+        )
+        .unwrap();
+        assert_eq!(layout.size, (384, 80));
+        assert_eq!(
+            layout.tail.unwrap().edge,
+            crate::bubble_layout::TailEdge::Bottom
+        );
+        let mut waiting = view(ActivityState::Waiting);
+        waiting.base.as_mut().unwrap().attention = true;
+        s.update(waiting.clone(), s.last_tick);
+        let attention = s.render_bubble_layout(layout.size, layout);
+        waiting.base.as_mut().unwrap().attention = false;
+        s.update(waiting, s.last_tick);
+        let dependency = s.render_bubble_layout(layout.size, layout);
+        s.update(view(ActivityState::Failed), s.last_tick);
+        let failed = s.render_bubble_layout(layout.size, layout);
+        assert_ne!(attention, dependency);
+        assert_ne!(attention, failed);
+        assert_ne!(dependency, failed);
+        assert!(!s.bubble_dirty);
     }
 
     #[test]
@@ -402,6 +515,24 @@ mod tests {
                 !s.options.no_bubble && !s.options.always_bubble
             );
         }
+    }
+
+    #[test]
+    fn menu_pause_is_idempotent_and_resume_discards_paused_elapsed_time() {
+        let mut s = scene(&[]);
+        let now = s.last_tick;
+        s.set_paused(false, now + Duration::from_secs(1));
+        assert_eq!(s.last_tick, now);
+        let paused = now + Duration::from_millis(100);
+        s.set_paused(true, paused);
+        s.set_paused(true, paused + Duration::from_secs(1));
+        assert_eq!(s.last_tick, paused);
+        let resumed = paused + Duration::from_secs(30);
+        s.set_paused(false, resumed);
+        assert!(!s.options.paused);
+        assert_eq!(s.last_tick, resumed);
+        s.tick(resumed);
+        assert_eq!(s.player.frame_index(), 0);
     }
 
     #[test]

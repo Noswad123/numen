@@ -106,33 +106,6 @@ pub fn raster_scale(requested: i32, sprite: (u32, u32), bubble: (u32, u32)) -> O
     })
 }
 
-/// Output-relative origin: prefer above, then below, then clamp without resizing.
-pub fn bubble_origin(
-    origin: (i32, i32),
-    sprite: (u32, u32),
-    bubble: (u32, u32),
-    output: Option<(i32, i32)>,
-) -> (i32, i32) {
-    let (x, y) = (i64::from(origin.0), i64::from(origin.1));
-    let (sw, sh) = (i64::from(sprite.0), i64::from(sprite.1));
-    let (bw, bh) = (i64::from(bubble.0), i64::from(bubble.1));
-    let above = y - bh;
-    let below = y + sh;
-    let fits_y = |top: i64| top >= 0 && output.is_none_or(|(_, h)| top + bh <= i64::from(h));
-    let top = if fits_y(above) {
-        above
-    } else if fits_y(below) {
-        below
-    } else {
-        above
-    };
-    let desired = (
-        (x + (sw - bw) / 2).clamp(0, i64::from(i32::MAX)) as i32,
-        top.clamp(0, i64::from(i32::MAX)) as i32,
-    );
-    clamp_origin(desired, output, bubble)
-}
-
 /// Immutable emergency cursor when neither cursor-shape nor an installed theme works.
 pub fn fallback_cursor() -> Vec<u8> {
     let mut rgba = vec![0; 16 * 24 * 4];
@@ -301,32 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn bubble_placement_prefers_above_then_below_then_clamps_at_edges() {
-        let output = Some((800, 600));
-        let sprite = (100, 100);
-        let bubble = (300, 150);
-        assert_eq!(
-            bubble_origin((350, 400), sprite, bubble, output),
-            (250, 250)
-        );
-        assert_eq!(bubble_origin((350, 20), sprite, bubble, output), (250, 120));
-        assert_eq!(bubble_origin((0, 400), sprite, bubble, output), (0, 250));
-        assert_eq!(
-            bubble_origin((700, 400), sprite, bubble, output),
-            (500, 250)
-        );
-        assert_eq!(
-            bubble_origin((20, 70), sprite, bubble, Some((200, 200))),
-            (0, 0)
-        );
-        assert_eq!(
-            bubble_origin((20, 0), sprite, bubble, Some((80, 80))),
-            (0, 0)
-        );
-        assert_eq!(bubble_origin((350, 20), sprite, bubble, None), (250, 120));
-    }
-
-    #[test]
     fn emergency_cursor_has_visible_opaque_ink_and_transparent_padding() {
         let cursor = fallback_cursor();
         assert_eq!(cursor.len(), 16 * 24 * 4);
@@ -466,6 +413,112 @@ mod tests {
         assert!(!gesture.release(1));
         gesture.press(1, (10.0, 12.0), (100, 200));
         assert!(gesture.release(1));
+    }
+
+    // These model client-side committed coordinates, not compositor confirmation
+    // or physical pointer/compositor event ordering.
+    #[test]
+    fn repeated_motion_before_presentation_does_not_accumulate_pending_origin() {
+        let mut gesture = Gesture::default();
+        let mut committed_origin = (100, 200);
+        gesture.press(1, (10.0, 12.0), committed_origin);
+        for (local, expected) in [
+            ((16.0, 14.0), (106, 202)),
+            ((19.0, 16.0), (109, 204)),
+            ((19.0, 16.0), (109, 204)),
+            ((22.0, 18.0), (112, 206)),
+        ] {
+            let pending_origin = gesture.moved(1, local, committed_origin).unwrap();
+            assert_eq!(pending_origin, expected);
+            assert_eq!(committed_origin, (100, 200));
+        }
+        // Only a modeled successful presentation advances the coordinate basis.
+        committed_origin = (112, 206);
+        assert_eq!(
+            gesture.moved(1, (10.0, 12.0), committed_origin),
+            Some((112, 206))
+        );
+        assert_eq!(
+            gesture.moved(1, (13.0, 14.0), committed_origin),
+            Some((115, 208))
+        );
+        assert!(!gesture.release(1));
+    }
+
+    #[test]
+    fn drag_reverses_from_actual_clamped_committed_origin() {
+        let mut gesture = Gesture::default();
+        let output = Some((200, 160));
+        let sprite = (40, 40);
+        let mut committed_origin = (150, 110);
+        gesture.press(1, (10.0, 10.0), committed_origin);
+        let requested = gesture.moved(1, (40.0, 40.0), committed_origin).unwrap();
+        assert_eq!(requested, (180, 140));
+        let pending_origin = clamp_origin(requested, output, sprite);
+        assert_eq!(pending_origin, (160, 120));
+        // Motion before presentation still uses the old committed coordinates.
+        assert_eq!(
+            clamp_origin(
+                gesture.moved(1, (35.0, 35.0), committed_origin).unwrap(),
+                output,
+                sprite,
+            ),
+            pending_origin
+        );
+        committed_origin = pending_origin;
+        assert_eq!(
+            clamp_origin(
+                gesture.moved(1, (5.0, 5.0), committed_origin).unwrap(),
+                output,
+                sprite,
+            ),
+            (155, 115)
+        );
+        let requested = gesture
+            .moved(1, (-200.0, -200.0), committed_origin)
+            .unwrap();
+        committed_origin = clamp_origin(requested, output, sprite);
+        assert_eq!(committed_origin, (0, 0));
+        assert_eq!(
+            clamp_origin(
+                gesture.moved(1, (15.0, 15.0), committed_origin).unwrap(),
+                output,
+                sprite,
+            ),
+            (5, 5)
+        );
+        assert!(!gesture.release(1));
+    }
+
+    #[test]
+    fn geometry_change_cancellation_prevents_release_click_or_reveal() {
+        for drag in [false, true] {
+            let mut gesture = Gesture::default();
+            gesture.press(1, (10.0, 10.0), (100, 100));
+            if drag {
+                assert_eq!(gesture.moved(1, (20.0, 20.0), (100, 100)), Some((110, 110)));
+            }
+            // Native geometry changes discard the gesture before using new geometry.
+            gesture = Gesture::default();
+            assert_eq!(gesture.moved(1, (20.0, 20.0), (50, 50)), None);
+            assert!(
+                !gesture.release(1),
+                "cancelled release must not request reveal"
+            );
+            gesture.press(1, (10.0, 10.0), (50, 50));
+            gesture.cancel(1);
+            assert!(!gesture.release(1));
+        }
+    }
+
+    #[test]
+    fn wrong_seat_release_does_not_consume_owner_click() {
+        let mut gesture = Gesture::default();
+        gesture.press(1, (10.0, 10.0), (100, 100));
+        assert!(!gesture.release(2));
+        assert_eq!(gesture.moved(1, (13.0, 10.0), (100, 100)), None);
+        assert!(gesture.release(1));
+        assert!(!gesture.release(1));
     }
 
     #[test]
