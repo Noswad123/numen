@@ -9,7 +9,7 @@ Numen means divine power or presence: an unseen, animating presence in the machi
 
 ## Overview
 
-**Linux basic desktop support is implemented**, with native Wayland and X11-backend smoke coverage in Hyprland. This is not full Linux desktop acceptance or parity with macOS; see [Linux build, run and limitations](#linux-build-run-and-limitations).
+**Linux desktop support includes native Wayland layer-shell**, preferred by default `auto` on supported desktops, with ordinary winit windows as fallback. Scoped Hyprland smoke coverage is not full Linux acceptance or macOS parity; see [Linux build, run and limitations](#linux-build-run-and-limitations).
 
 **Current movement update is not installed or restarted.** Earlier installation/check evidence below is historical for this update. Corrected end-to-end multi-display/mixed-DPI movement remains pending; see [movement evidence boundaries](#optionc-validation-and-deployment).
 
@@ -99,7 +99,7 @@ Emerald (`emerald`), the fourth character, uses artwork from `~/Downloads/groove
 
 ## Example usage
 
-Requires Rust 1.89 or newer (edition 2024) and a graphical desktop for `run`. Rendering uses winit 0.30.13, pixels 0.17.2, and image 0.25.8.
+Requires Rust 1.89 or newer (edition 2024) and a graphical desktop for `run`. Linux layer-shell uses CPU/Wayland SHM; ordinary windows use winit 0.30.13 and pixels 0.17.2. Assets use image 0.25.8.
 
 ```sh
 numen # Default: one unattached familiar; reuse service or bounded bootstrap
@@ -175,6 +175,44 @@ An already-running older **Djinn UI needs one restart with the updated Djinn bin
 
 ### Linux build, run and limitations
 
+#### Native Wayland layer-shell (new default)
+
+**Overview:** `run --backend auto` prefers native layer-shell on supported Linux Wayland, falling back to ordinary winit windows when preflight lacks required protocols/resources. Auto chooses winit for `--focus`, `--normal-window-level`, inherited `WAYLAND_SOCKET` (so probing does not consume its FD before fallback), or `WINIT_UNIX_BACKEND=x11`. Forced layer-shell errors if unavailable or combined with either window-mode flag, without fallback. Other platforms use winit; forced layer-shell is Linux-only.
+
+**API / Interfaces:** namespace **`numen`**, compact fixed-size sprite parent in **`Layer::Top`**, not Overlay; no tiling, task-switcher entry or keyboard focus. `exclusive_zone(-1)` reserves nothing and uses full-output-relative placement: familiars **may overlap panels**, with no panel-avoidance or same-layer ordering guarantee. CLI/fzf Open, Attach, Settings, bubbles, Close and Quit work unchanged, including live saved appearance preferences. Output-local placement is not persisted into the old global-coordinate preference schema.
+
+- Left-click release reveals; held movement reaching **5 logical points** starts output-local dragging, clamped to the current output, not cross-output dragging.
+- Middle-click pauses/resumes; right-click closes **only that familiar**.
+- Side-button Preview cycling is **manual/demo-only**; live mode ignores it.
+- Each seat gets a default cursor through cursor-shape/theme support, with a SHM arrow fallback.
+- Q/Esc and other focused keyboard controls apply only to focused winit windows, not layer-shell. Linux has no global hotkeys, global mouse pursuit, random corners or native click menu.
+
+**Data Flow:** service snapshots → independent `FamiliarScene` playback → separate sprite/bubble CPU rasters → premultiplied native-endian **ARGB8888** SHM buffers → compositor. **No GPU is required for layer-shell**; winit/pixels still requires a GPU stack. The bubble is a real synchronized subsurface with explicitly empty input; reveal/expiry never resizes the sprite parent. Parent input derives from rendered sprite alpha, excluding transparent padding.
+
+**Edge Cases:** integer output raster scaling only; allocation bounds can reduce effective integer buffer density without changing logical scale/size. Native fractional-scale/viewporter rendering is not implemented. Output removal recreates surfaces on an available output while preserving the scene; no outputs leaves it waiting. In a live service, per-view buffer/render errors isolate the affected view; standalone manual/demo sessions exit with the error instead of remaining invisible. Connection failure remains service-wide. Last Close retains the live service for later Open. No synthetic input is used.
+
+**Example usage** (for a new foreground service, not an upgrade to a running one):
+
+```sh
+numen run --backend auto # Default
+numen run --backend layer-shell # Require native layer-shell
+numen run --backend winit # Optional ordinary-window fallback
+```
+
+**Validation / deployment boundary:** the auto-selected layer-shell smoke passed on Hyprland with five concurrent preset rows (including random), independent bubble dimensions, empty child input regions, nonempty sprite input shapes, unchanged character size across reveal/expiry, settings, Close/reopen and Quit. These are native commit/log assertions, not screenshots or physical click-through proof. The default suite passed **499 tests, 4 ignored**; native layer-shell and both ordinary Wayland/Xwayland desktop smoke tests passed separately. Formatting, strict production-bin Clippy, embedded assets and diff checks passed. Physical click-through/drag/cursor checks, multi-output/hotplug, fractional-display and macOS regression acceptance remain unverified. Tests used private sockets without changing the existing user service or home configuration.
+
+```sh
+cargo test --locked --test linux_layer_shell -- --ignored --nocapture
+```
+
+The Arcana-selected dev payload was refreshed and the installed public `numen` passed a bounded standalone layer-shell smoke. Read-only Hyprland inspection confirmed a **144 × 156** character layer even with its bubble always visible, and no ordinary application-window entry for that process. The existing service was not restarted. Refreshing the selected Arcana dev payload does not update a running service. Only if you explicitly choose to restart after refresh, **`numen quit` then `numen`** loads the selected build; producers may need to reconnect. No automatic restart or in-place upgrade is performed.
+
+**Related files:** [`src/desktop.rs`](src/desktop.rs), [`src/desktop_scene.rs`](src/desktop_scene.rs), [`src/layer_shell.rs`](src/layer_shell.rs), [`src/layer_shell/software.rs`](src/layer_shell/software.rs), [`tests/linux_layer_shell.rs`](tests/linux_layer_shell.rs). See [backend boundaries](ARCHITECTURE.md#linux-desktop-surface-policy).
+
+#### Ordinary winit fallback and historical evidence
+
+The ordinary backend retains its prior constraints and immediate left-drag/focus and right-click Preview controls. The GPU prerequisites, surface policy and earlier reported evidence below describe **winit**, not layer-shell.
+
 **Overview:** basic Linux graphical startup, all four characters, runtime appearance settings, transient bubbles and service lifecycle are implemented. The Linux build failure from `libc::arc4random_uniform` was removed by using `fastrand` for random selection. Wayland's unsupported `PostMultiplied` startup failure is handled by alpha-mode negotiation; the existing macOS `PostMultiplied` + `REPLACE` preference is unchanged.
 
 **Build / example usage:** use Rust **1.89+**, a native compiler/linker and `pkg-config`, Wayland/X11/xkbcommon runtime libraries, and a working Vulkan loader plus Mesa Vulkan or the appropriate GPU vendor driver. Package names vary by distribution; no installation is performed here. A running graphical session and its display authentication/runtime environment are required. Install `fzf` separately only for the optional terminal menu.
@@ -187,9 +225,9 @@ cargo run --locked -- run --no-preferences
 ./target/debug/numen bubbles
 ./target/debug/numen quit
 
-# Force the ordinary winit application backend via display variables:
-env -u DISPLAY cargo run --locked -- run --no-preferences # Wayland
-env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET cargo run --locked -- run --no-preferences # X11
+# Select the display system for ordinary winit windows:
+env -u DISPLAY cargo run --locked -- run --backend winit --no-preferences # Wayland
+env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET cargo run --locked -- run --backend winit --no-preferences # X11
 ```
 
 **API / Interfaces:** Wayland uses stable **app_id `numen`**; X11 uses **WM_CLASS instance `numen`, class `Numen`**. Use these identities for compositor/window-manager floating rules rather than dynamic conversation titles. No particular compositor-rule syntax is prescribed here. Existing immediate left-drag/focus and right-click Preview controls remain implemented; CLI and fzf controls are usable. Linux has **no global hotkeys, Go to mouse pursuit, random corners, native macOS click menu, native clipboard action or Open chat**.
@@ -203,7 +241,7 @@ WINIT_UNIX_BACKEND=wayland cargo test --locked --test linux_desktop -- --ignored
 WINIT_UNIX_BACKEND=x11 cargo test --locked --test linux_desktop -- --ignored --nocapture
 ```
 
-`WINIT_UNIX_BACKEND` is a **hint interpreted by this test only**, which removes the opposite display variables from child processes; it is not a backend-forcing setting for normal winit 0.30 launches. Use the `env -u ...` examples above for those.
+The desktop test interprets `WINIT_UNIX_BACKEND=wayland|x11` to remove opposite display variables from children. Winit 0.30 itself does not use it to force its display system; use `--backend winit` and the `env -u ...` examples above. Numen's new auto selector separately recognizes `WINIT_UNIX_BACKEND=x11` to bypass layer-shell probing.
 
 **Validation boundary:** the strengthened smoke passed on **native Wayland, Hyprland, AMD RADV/Vulkan**, and on the **X11 backend under Xwayland in the same Hyprland session**—not a full native Xorg acceptance run. Coverage includes all four presets, actual frame presentation after creation/reopen, settings and repeated transient bubble reveal/expiry, close-last with service retained, and quit/socket cleanup. Read-only compositor inspection confirmed Wayland app_id `numen`; `xprop` confirmed X11 `WM_CLASS = "numen", "Numen"`. The default Linux suite passed **468 tests, 3 ignored**; formatting, strict production-binary Clippy, asset validation and diff checks passed. There are no screenshots or proven physical drag/focus, native Xorg, macOS regression or multi-DPI acceptance results. Further Linux/compositor acceptance remains. No installation, home configuration or existing user-service changes were made for this delivery.
 
@@ -231,9 +269,22 @@ cargo install --path . --debug --locked --offline --root "$HOME/.local/libexec/a
 ```
 
 This installs `~/.local/libexec/arcana-dev/numen/bin/numen`, not a competing
-`~/.local/bin/numen`. Do not add this isolated tree to global `PATH`; use its full
-path for standalone development or let Arcana own the public dispatcher. Apply the
-command-scoped SDK prefix above on machines that need the macOS workaround.
+`~/.local/bin/numen`. Do not add this isolated tree to global `PATH`. Use Arcana's
+stable public launcher to select this build on macOS or Linux:
+
+```sh
+arcana source use dev numen
+arcana source status
+numen # Open using the selected build
+# Switch back only after the Homebrew payload is installed:
+arcana source use brew numen
+```
+
+Arcana's managed launcher directory (normally `~/.local/bin`) must precede any
+competing Homebrew/Cargo executable in `PATH`. Selection does not build or install
+payloads, launch an app, or restart a service. Direct payload/checkout paths bypass
+selection and are only for explicit diagnostics. Apply the command-scoped SDK
+prefix above on machines that need the macOS workaround.
 `--offline` assumes dependencies are already downloaded. `--force` refreshes an
 existing same-version installation after source changes.
 
@@ -302,6 +353,7 @@ Global `--socket PATH` works before or after the subcommand. Default: nonempty `
 
 | `run` option | Behavior |
 | --- | --- |
+| `--backend auto\|winit\|layer-shell` | Default `auto` prefers supported Linux Wayland layer-shell; otherwise ordinary winit. See Linux backend selection above for flag/environment exceptions. |
 | `--no-preferences` | Bypasses all preference resolution/read/write; runtime Settings remains available. |
 | `--preferences-file ABS` | Absolute live-GUI preference-file override; conflicts with `--no-preferences`. |
 | `--manual` | Disables the socket and preference I/O; use with `--animation` for a fixed diagnostic selection. |
@@ -324,9 +376,9 @@ Global `--socket PATH` works before or after the subcommand. Default: nonempty `
 | `--focus` | Opts into requesting keyboard focus at startup. |
 | `--exit-after SECONDS` | Finite 0.1–86400; closes automatically for bounded smoke tests. |
 
-With keyboard focus, **Tab** queues next-conversation for that familiar and resumes live control. **1–9** enter manual expression override; **L** resumes its latest live base without switching or replaying cues. **Space** toggles only that view's pause flag; expression changes preserve pause but may change the first frame. **Q/Esc/native close** closes only that live view, not all of Numen. Closing the last view leaves IPC and global hotkeys alive with zero windows; `open` can create another later. `--manual`/`--demo` remain single-view, socket-free sessions: Q/Esc/native close exits the process, and Tab/L cannot enable IPC. On macOS a normal left-click release or right-click opens the native menu; held left movement starts native dragging after the click slop. Other platforms retain immediate left-drag/focus and right-click Preview cycling. **Ctrl-C** quits the service, including from a focused view or the launching terminal.
+In a **focused winit window**, **Tab** queues next-conversation for that familiar and resumes live control. **1–9** enter manual expression override; **L** resumes its latest live base without switching or replaying cues. **Space** toggles only that view's pause flag; expression changes preserve pause but may change the first frame. **Q/Esc/native close** closes only that live view, not all of Numen. Closing the last live view leaves IPC and supported global hotkeys alive; `open` can create another later. `--manual`/`--demo` remain single-view, socket-free sessions: closing exits the process, and Tab/L cannot enable IPC. On macOS a normal left-click release or right-click opens the native menu; held movement starts native dragging after click slop. Other **winit** platforms retain immediate left-drag/focus and right-click Preview cycling. Layer-shell instead uses the pointer-only controls documented above. **Ctrl-C** quits the service from the launching terminal (or a focused winit view).
 
-**1–9** (and right-click on non-macOS) also reveal the Preview bubble; **Tab/L** reveal when resuming live control. A registered global handler owns Option+I even when the pet is focused, preventing duplicate local delivery. If global registration is disabled/unavailable, focused local **Option+I** is the fallback. Demo cycling does not automatically reopen the bubble; use `--always-bubble` for persistent previews.
+In winit, **1–9** (and right-click on non-macOS) also reveal the Preview bubble; **Tab/L** reveal when resuming live control. A registered global handler owns Option+I even when the pet is focused, preventing duplicate local delivery. If global registration is disabled/unavailable, focused local **Option+I** is the fallback. Demo cycling does not automatically reopen the bubble; use `--always-bubble` for persistent previews.
 
 The macOS global shortcut uses Carbon registration via `global-hotkey` 0.9, not an EventTap or all-keystroke capture. Registration failure warns but does not stop the app. Another Numen process may own the chord: use `bubbles --socket PATH` to target the desired service. Option+I is reserved while registered and may override a macOS dead-accent shortcut; opt out with `--no-hotkey`. This non-media Carbon key should not require Accessibility permission, but actual background-focus chord acceptance remains pending; no synthetic OS keyboard input was used.
 

@@ -6,11 +6,16 @@ mod bubble;
 mod build_info;
 mod chat;
 mod context_menu;
+mod desktop;
+#[cfg(target_os = "linux")]
+mod desktop_scene;
 mod diagnostics;
 mod display;
 mod doctor;
 mod hotkey;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod layer_shell;
 mod menu;
 mod motion;
 mod native_window;
@@ -104,6 +109,9 @@ enum Command {
 
 #[derive(Args, Clone)]
 pub struct RunOptions {
+    /// Desktop backend: prefer layer-shell on supported Wayland desktops, or use ordinary windows.
+    #[arg(long, value_enum, default_value = "auto")]
+    backend: desktop::Backend,
     /// Disable the event listener; use only local expression controls.
     #[arg(long)]
     manual: bool,
@@ -629,7 +637,7 @@ fn main() -> Result<()> {
             };
             let atlas = SpriteAtlas::load()
                 .with_context(|| format!("cannot load {DEFAULT_CHARACTER_NAME} runtime assets"))?;
-            window::run(atlas, options, path.as_deref())
+            desktop::run(atlas, options, path.as_deref())
         }
         Command::Listen(options) => listen(socket_path(cli.socket)?, options),
         Command::Publish(options) => publish(socket_path(cli.socket)?, options),

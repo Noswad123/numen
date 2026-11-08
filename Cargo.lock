@@ -1212,6 +1212,7 @@ dependencies = [
  "pixels",
  "serde",
  "serde_json",
+ "smithay-client-toolkit",
  "tempfile",
  "toml",
  "tracing",

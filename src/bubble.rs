@@ -43,6 +43,11 @@ pub fn dimensions(show: bool, sprite_scale: f32) -> (u32, u32) {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+pub fn bubble_dimensions() -> (u32, u32) {
+    (WIDTH as u32, BUBBLE_HEIGHT as u32)
+}
+
 /// Display strings; clipping and whitespace cleanup happen only in paint.
 pub fn text(view: &Presentation, preview: Option<Animation>) -> BubbleText {
     let Some(following) = &view.following else {
@@ -202,79 +207,123 @@ impl Renderer {
         }
         let canvas = Canvas::new(size, show, self.sprite_scale);
         if show {
-            for (rect, radius, color) in [
-                ((4.0, 4.0, 376.0, 122.0), 13.0, BORDER),
-                ((5.0, 5.0, 374.0, 120.0), 12.0, IVORY),
-                ((171.0, 127.0, 11.0, 11.0), 5.0, BORDER),
-                ((172.0, 128.0, 9.0, 9.0), 4.0, IVORY),
-                ((184.0, 139.0, 5.0, 5.0), 2.0, BORDER),
-                ((185.0, 140.0, 3.0, 3.0), 1.0, IVORY),
-            ] {
-                canvas.rounded(frame, rect, radius, color);
-            }
-            if let Some(face) = self.typeface.as_mut() {
-                let content = text(view, preview);
-                let px = self.font_size * canvas.scale;
-                let metrics = face.line_metrics(px);
-                let line_height = metrics.new_line_size.max(metrics.ascent - metrics.descent);
-                let left = canvas.x + 16.0 * canvas.scale;
-                let width = 352.0 * canvas.scale;
-                let top = canvas.y + 12.0 * canvas.scale;
-                let bottom = canvas.y + 120.0 * canvas.scale;
-                let identity = clip(face, &clean(&content.identity), px, width);
-                let status = clip(face, &clean(&content.status), px, width);
-                let (identity_above, identity_below) = ink_extents(face, &identity, px);
-                let (status_above, status_below) = ink_extents(face, &status, px);
-                let status_top = bottom - status_above - status_below;
-                let summary_top = top + identity_above + identity_below + 3.0 * canvas.scale;
-                let lines = ((status_top - 3.0 * canvas.scale - summary_top) / line_height)
-                    .floor()
-                    .clamp(0.0, 3.0) as usize;
-                canvas.paint_text(
-                    frame,
-                    face,
-                    (left, top + identity_above),
-                    &identity,
-                    px,
-                    MUTED,
-                );
-                for (index, line) in wrap(face, &content.summary, px, width, lines)
-                    .iter()
-                    .enumerate()
-                {
-                    canvas.paint_text(
-                        frame,
-                        face,
-                        (
-                            left,
-                            summary_top + index as f32 * line_height + metrics.ascent,
-                        ),
-                        line,
-                        px,
-                        INK,
-                    );
-                }
-                let accent = match content
-                    .status
-                    .strip_prefix("Preview: ")
-                    .unwrap_or(&content.status)
-                {
-                    "Needs your input" | "Waiting on dependency" => [130, 83, 25, 255],
-                    "Failed" => [151, 53, 48, 255],
-                    "Working" | "Completed" => [51, 103, 83, 255],
-                    _ => MUTED,
-                };
-                canvas.rounded(frame, (7.0, 108.0, 5.0, 5.0), 2.0, accent);
-                canvas.paint_text(
-                    frame,
-                    face,
-                    (left, bottom - status_below),
-                    &status,
-                    px,
-                    accent,
-                );
-            }
+            self.paint_bubble(frame, &canvas, view, preview);
         }
+        self.paint_sprite(frame, size, sprite, show);
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn compose_sprite(&mut self, frame: &mut [u8], size: (u32, u32), sprite: &[u8]) {
+        assert_eq!(frame.len(), size.0 as usize * size.1 as usize * 4);
+        assert_eq!(sprite.len(), SPRITE_WIDTH * SPRITE_HEIGHT * 4);
+        frame.fill(0);
+        if size.0 != 0 && size.1 != 0 {
+            self.paint_sprite(frame, size, sprite, false);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn compose_bubble(
+        &mut self,
+        frame: &mut [u8],
+        size: (u32, u32),
+        view: &Presentation,
+        preview: Option<Animation>,
+    ) {
+        assert_eq!(frame.len(), size.0 as usize * size.1 as usize * 4);
+        frame.fill(0);
+        if size.0 != 0 && size.1 != 0 {
+            self.paint_bubble(
+                frame,
+                &Canvas::for_dimensions(size, bubble_dimensions()),
+                view,
+                preview,
+            );
+        }
+    }
+
+    fn paint_bubble(
+        &mut self,
+        frame: &mut [u8],
+        canvas: &Canvas,
+        view: &Presentation,
+        preview: Option<Animation>,
+    ) {
+        for (rect, radius, color) in [
+            ((4.0, 4.0, 376.0, 122.0), 13.0, BORDER),
+            ((5.0, 5.0, 374.0, 120.0), 12.0, IVORY),
+            ((171.0, 127.0, 11.0, 11.0), 5.0, BORDER),
+            ((172.0, 128.0, 9.0, 9.0), 4.0, IVORY),
+            ((184.0, 139.0, 5.0, 5.0), 2.0, BORDER),
+            ((185.0, 140.0, 3.0, 3.0), 1.0, IVORY),
+        ] {
+            canvas.rounded(frame, rect, radius, color);
+        }
+        if let Some(face) = self.typeface.as_mut() {
+            let content = text(view, preview);
+            let px = self.font_size * canvas.scale;
+            let metrics = face.line_metrics(px);
+            let line_height = metrics.new_line_size.max(metrics.ascent - metrics.descent);
+            let left = canvas.x + 16.0 * canvas.scale;
+            let width = 352.0 * canvas.scale;
+            let top = canvas.y + 12.0 * canvas.scale;
+            let bottom = canvas.y + 120.0 * canvas.scale;
+            let identity = clip(face, &clean(&content.identity), px, width);
+            let status = clip(face, &clean(&content.status), px, width);
+            let (identity_above, identity_below) = ink_extents(face, &identity, px);
+            let (status_above, status_below) = ink_extents(face, &status, px);
+            let status_top = bottom - status_above - status_below;
+            let summary_top = top + identity_above + identity_below + 3.0 * canvas.scale;
+            let lines = ((status_top - 3.0 * canvas.scale - summary_top) / line_height)
+                .floor()
+                .clamp(0.0, 3.0) as usize;
+            canvas.paint_text(
+                frame,
+                face,
+                (left, top + identity_above),
+                &identity,
+                px,
+                MUTED,
+            );
+            for (index, line) in wrap(face, &content.summary, px, width, lines)
+                .iter()
+                .enumerate()
+            {
+                canvas.paint_text(
+                    frame,
+                    face,
+                    (
+                        left,
+                        summary_top + index as f32 * line_height + metrics.ascent,
+                    ),
+                    line,
+                    px,
+                    INK,
+                );
+            }
+            let accent = match content
+                .status
+                .strip_prefix("Preview: ")
+                .unwrap_or(&content.status)
+            {
+                "Needs your input" | "Waiting on dependency" => [130, 83, 25, 255],
+                "Failed" => [151, 53, 48, 255],
+                "Working" | "Completed" => [51, 103, 83, 255],
+                _ => MUTED,
+            };
+            canvas.rounded(frame, (7.0, 108.0, 5.0, 5.0), 2.0, accent);
+            canvas.paint_text(
+                frame,
+                face,
+                (left, bottom - status_below),
+                &status,
+                px,
+                accent,
+            );
+        }
+    }
+
+    fn paint_sprite(&self, frame: &mut [u8], size: (u32, u32), sprite: &[u8], show: bool) {
         // Only the artwork is nearest-resampled. Copy straight RGBA, including hidden RGB.
         let projection = SpriteProjection::new(size, show, self.sprite_scale);
         let (x0, y0, x1, y1) = projection.bounds;
@@ -394,7 +443,10 @@ struct Canvas {
 
 impl Canvas {
     fn new(size: (u32, u32), show: bool, sprite_scale: f32) -> Self {
-        let logical = dimensions(show, sprite_scale);
+        Self::for_dimensions(size, dimensions(show, sprite_scale))
+    }
+
+    fn for_dimensions(size: (u32, u32), logical: (u32, u32)) -> Self {
         let scale = (size.0 as f32 / logical.0 as f32).min(size.1 as f32 / logical.1 as f32);
         Self {
             size,
@@ -488,6 +540,85 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_composition_matches_combined_at_equal_density() {
+        let face = Typeface::bundled().unwrap();
+        let sprite: Vec<_> = (0..SPRITE_WIDTH * SPRITE_HEIGHT * 4)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let view = view(ActivityState::Working, false);
+        for scale in [0.25, 0.5, 1.0, 2.0] {
+            for density in [1, 2, 3] {
+                let mut renderer = Renderer::new(Some(face.fork()), 12.0).with_sprite_scale(scale);
+                let logical = dimensions(true, scale);
+                let size = (logical.0 * density, logical.1 * density);
+                let mut combined = vec![99; size.0 as usize * size.1 as usize * 4];
+                renderer.compose(
+                    &mut combined,
+                    size,
+                    &sprite,
+                    &view,
+                    Some(Animation::Review),
+                    true,
+                );
+                let bubble_size = (384 * density, 144 * density);
+                let mut bubble = vec![99; bubble_size.0 as usize * bubble_size.1 as usize * 4];
+                renderer.compose_bubble(&mut bubble, bubble_size, &view, Some(Animation::Review));
+                assert_eq!(bubble, combined[..bubble.len()]);
+                let logical_sprite = dimensions(false, scale);
+                let sprite_size = (logical_sprite.0 * density, logical_sprite.1 * density);
+                let mut split = vec![99; sprite_size.0 as usize * sprite_size.1 as usize * 4];
+                let mut hidden = split.clone();
+                renderer.compose_sprite(&mut split, sprite_size, &sprite);
+                renderer.compose(&mut hidden, sprite_size, &sprite, &view, None, false);
+                assert_eq!(split, hidden);
+                let left = (size.0 - sprite_size.0) / 2;
+                for y in 0..sprite_size.1 {
+                    let source = (y * sprite_size.0) as usize * 4;
+                    let target = ((y + bubble_size.1) * size.0 + left) as usize * 4;
+                    let width = sprite_size.0 as usize * 4;
+                    assert_eq!(
+                        split[source..source + width],
+                        combined[target..target + width]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_canvases_keep_alpha_and_sprite_input_independent() {
+        let mut renderer = Renderer::new(None, 12.0).with_sprite_scale(0.5);
+        let sprite = [80, 60, 40, 0].repeat(SPRITE_WIDTH * SPRITE_HEIGHT);
+        let size = (197, 208);
+        let mut frame = vec![99; size.0 as usize * size.1 as usize * 4];
+        renderer.compose_sprite(&mut frame, size, &sprite);
+        assert!(frame.chunks_exact(4).all(|p| p[3] == 0));
+        let projection = SpriteProjection::new(size, false, 0.5);
+        assert!(projection.alpha(&sprite).iter().all(|&a| a == 0));
+        let mut bubble = vec![99; WIDTH * BUBBLE_HEIGHT * 4];
+        renderer.compose_bubble(
+            &mut bubble,
+            bubble_dimensions(),
+            &Presentation::default(),
+            None,
+        );
+        assert_eq!(&bubble[..4], &[0; 4]);
+        assert!(bubble.chunks_exact(4).any(|p| p[3] == 255));
+        renderer.set_sprite_scale(2.0);
+        let mut other = bubble.clone();
+        renderer.compose_bubble(
+            &mut other,
+            bubble_dimensions(),
+            &Presentation::default(),
+            None,
+        );
+        assert_eq!(bubble, other, "sprite scaling cannot change bubble artwork");
+        assert!(projection.alpha(&sprite).iter().all(|&a| a == 0));
+        renderer.compose_bubble(&mut [], (0, 144), &Presentation::default(), None);
+        renderer.compose_sprite(&mut [], (192, 0), &sprite);
+    }
 
     #[test]
     fn mutable_settings_repaint_at_actual_font_and_sprite_sizes() {

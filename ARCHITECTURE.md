@@ -2,7 +2,7 @@
 
 ## Overview
 
-**Linux basic desktop support is implemented:** native Wayland and the X11 backend under Xwayland passed the scoped Hyprland smoke described in [Linux desktop surface policy](#linux-desktop-surface-policy). This is not native Xorg, physical drag/focus or multi-DPI acceptance. Historical macOS evidence below retains its original scope.
+**Linux desktop support includes native Wayland layer-shell**, preferred by default `auto` on supported desktops, with ordinary winit fallback. Layer-shell and earlier winit Hyprland smoke have separate evidence scopes in [Linux desktop surface policy](#linux-desktop-surface-policy); neither establishes physical input, hotplug or multi-DPI acceptance. Historical macOS evidence retains its original scope.
 
 **Open chat via Wisp:** implemented, not installed or desktop-accepted; earlier installed/test evidence below is historical for this feature. It requires updated Numen and Djinn Rust/UI, with an explicit older-Djinn restart still outstanding; Wisp code is unchanged. Discovery/Attach still cannot execute source commands; only an explicit Open chat selection submits the fixed viewer-launch path described below.
 
@@ -40,6 +40,10 @@ Sources report semantic activity, not artwork or executable scripts. The process
 | `src/ipc.rs` | Private sockets, inode-safe ownership, bounded `Publisher`, nonblocking worker/ACKs. `Server::start` serves headless presentations; `start_graphical_with_preferences` adds optional saved preferences to complete snapshots, targeted reveal, optional navigation, graceful quit, immutable startup defaults and optional Main bootstrap. Callbacks return promptly; drop stops/joins the IPC worker with bounded preference shutdown. |
 | `src/activity.rs` | Canonical source/activity `Store`, sequences/tombstones/liveness, per-familiar exact bindings, cues, summaries/settings; atomic lifecycle/settings/Forget, logical-key records and epochs. `FamiliarPresentation { id, preset, presentation, settings, preference? }` wraps unchanged `Presentation { base, cue, following? }`. |
 | `src/display.rs` | One-slot `Mailbox` and `LiveDisplay`: semantic expression mapping, terminal-base-to-idle mapping, cue deduplication and manual override. |
+| `src/desktop.rs` | Selects `auto`, `winit` or Linux `layer-shell` before graphical service startup; preflight fallback and incompatible-option checks. |
+| `src/desktop_scene.rs` | `FamiliarScene`: surface-independent playback, visibility, settings and independent sprite/bubble CPU composition, used by layer-shell. |
+| `src/layer_shell.rs` | SCTK/calloop Wayland backend: output-local layer parent, synchronized bubble child, SHM pools, per-seat pointer/cursor handling and existing service reconciliation. |
+| `src/layer_shell/software.rs` | Pure ARGB conversion, alpha input rectangles, bounded integer raster density, geometry, gestures, reveal queue and Close retry helpers. |
 | `src/window.rs` | Outer `App` reconciles complete registry snapshots, routes native window IDs and tracks independent global reveal/navigation registration flags and a global exit deadline; each `FamiliarView` owns native/GPU resources, input, pause, player, visibility and geometry. |
 | `src/motion.rs` | `Navigator::step_raster` returns `Move`, `Arrived` or `Blocked` from cached physical sprite alpha; `MotionClock` hard-gates sampling, and `NativeMotion` accumulates fractional intent. Source-mask stepping remains test-only. |
 | `src/pointer.rs` | `PointerReader::new/position`, currently macOS only: fresh read-only `CGEvent` snapshots using a retained `CombinedSessionState` source. |
@@ -52,7 +56,7 @@ Sources report semantic activity, not artwork or executable scripts. The process
 | `src/bubble.rs` | `text`, `dimensions(show, sprite_scale)`, and `Renderer::compose`: physical-pixel CPU RGBA composition, focused identity/summary/status, Preview labels, measured text and independently scaled sprite placement. |
 | `src/typography.rs` | `Typeface::load(family, file)`, `bundled`, `measure`, `line_metrics`, `kern`, and cached `glyph`: exact installed Regular selection via `fontdb`, single-face rasterization via `fontdue`, embedded fallback and license. |
 
-Rust minimum is 1.89, edition 2024; rendering uses winit 0.30.13, pixels 0.17.2 and image 0.25.8. Socket handling uses standard Unix facilities and a worker thread, not Tokio. See [README](README.md#api--interfaces) for command flags and controls.
+Rust minimum is 1.89, edition 2024; ordinary windows use winit 0.30.13/pixels 0.17.2, Linux layer-shell uses CPU SHM, and asset decoding uses image 0.25.8. Socket handling uses standard Unix facilities and a worker thread, not Tokio. See [README](README.md#api--interfaces) for command flags and controls.
 
 ## Data Flow
 
@@ -63,11 +67,12 @@ diagnostic publisher / future adapters
   -> newline-delimited JSON over private Unix socket
   -> request validation -> connection-scoped source/activity store
   -> per-familiar exclusive binding + base/cue + summary cache
-     -> complete Vec<FamiliarPresentation> -> latest-only mailbox -> winit wake
-         -> App reconciliation -> independent FamiliarViews -> pixels surfaces -> compositor
-     -> legacy main presentation -> headless latest-only mailbox -> detached JSON stdout writer
+      -> complete Vec<FamiliarPresentation> -> latest-only mailbox -> selected GUI wake
+          -> winit App -> independent FamiliarViews -> GPU pixels surfaces -> compositor
+          OR layer-shell State -> FamiliarScenes -> sprite/bubble SHM surfaces -> compositor
+      -> legacy main presentation -> headless latest-only mailbox -> detached JSON stdout writer
 
-Option+I Carbon callback / companion.reveal worker callback
+Winit: Option+I Carbon callback / companion.reveal worker callback
   -> RevealNotifier / bounded RevealMailbox -> coalesced winit RevealBubbles
   -> App::apply_reveals -> selected views' visibility deadlines + native geometry
 ```
@@ -104,7 +109,7 @@ Controls work without registration and do not refresh producer liveness. Status/
 
 ### Saved preferences: interfaces and data flow
 
-The production caller in `window.rs` resolves preferences **only for live GUI startup**: `run --no-preferences` returns before environment/default resolution; `--preferences-file ABS` selects an explicit absolute override and conflicts with it. Otherwise `preferences::default_path(config_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf>` uses nonempty absolute XDG_CONFIG_HOME + `/numen/preferences.json`, else absolute HOME + `/.config/numen/preferences.json`. Relative roots and missing HOME produce distinct cached reasons. Manual/demo/headless do no preference I/O. Existing constructors never start resolving HOME or reading preference files.
+Production callers in `window.rs` and `layer_shell.rs` resolve preferences **only for live GUI startup**: `run --no-preferences` bypasses environment/default resolution; `--preferences-file ABS` selects an explicit absolute override and conflicts with it. Otherwise `preferences::default_path(config_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf>` uses nonempty absolute XDG_CONFIG_HOME + `/numen/preferences.json`, else absolute HOME + `/.config/numen/preferences.json`. Relative roots and missing HOME produce distinct cached reasons. Manual/demo/headless do no preference I/O. Existing constructors never start resolving HOME or reading preference files.
 
 `Server::start_graphical_with_preferences(path: &Path, on_views, on_reveal, on_go_to_mouse: Option<Box<GoToMouse>>, on_quit, bootstrap_main: bool, settings: FamiliarSettings, preferences_path: Option<PathBuf>) -> Result<Server>` extends the existing graphical-settings arguments. `None` retains runtime Settings but disables preferences. Defaults validate before listener creation. `preferences::start(path: PathBuf, on_status) -> (Document, Writer)` owns file work on a dedicated worker; its bounded startup result seeds the canonical activity Store. Status callbacks update `RuntimeDiagnostics`, not windows. The previous `start_graphical_with_settings` and compatibility constructors retain their behavior with no preference-file I/O.
 
@@ -271,7 +276,29 @@ Actual native drag, digits, non-macOS right-click cycle, L, Tab and close cancel
 
 ### Linux desktop surface policy
 
-**Overview:** Linux shares the existing winit/pixels renderer and service. Random selection now uses `fastrand` instead of the Linux-unavailable `libc::arc4random_uniform` call, preserving selection semantics; it does not enable Linux corners or mouse pursuit.
+#### Backend boundary and native layer-shell
+
+**Overview:** `main::Run` calls `desktop::run`; selection occurs before creating the graphical listener/preferences worker. Default `auto` prefers Linux Wayland layer-shell after bounded preflight (two-second registry/protocol deadline, compositor/layer-shell/SHM/subcompositor and ARGB8888 availability). Missing support falls back to ordinary winit. Once the prepared backend starts, runtime failures do not migrate the service to winit. Auto selects winit for `--focus`, `--normal-window-level`, inherited `WAYLAND_SOCKET` (preserving its single-use FD instead of consuming it during probing), or `WINIT_UNIX_BACKEND=x11`. Explicit `--backend layer-shell` fails on unavailable support/non-Linux or either incompatible window-mode flag; `--backend winit` bypasses native probing.
+
+**API / Interfaces:** `Prepared::run` owns the Wayland connection/calloop loop and existing `Server::start_graphical_with_preferences`. Complete `FamiliarPresentation` snapshots pass through the latest-only `Mailbox`; reveal requests and Quit wake the loop via ping. Canonical Store/IPC selection, settings, appearance preferences and CLI/fzf controls are unchanged; no alternate protocol or source authority is added. `FamiliarScene` owns player, manual/live expression policy, pause, visibility and independent raster dirty flags. Winit still owns its existing `FamiliarView` implementation; the new scene is not a rewrite of that backend.
+
+**Data Flow:** each familiar has a compact sprite-sized parent, namespace `numen`, `Layer::Top` (not Overlay), top/left anchored, keyboard interactivity None. It has no application tiling/task-switcher/keyboard-focus role. `exclusive_zone(-1)` reserves nothing and uses the **full output**, ignoring panel exclusive regions: familiars **may overlap panels**; same-layer ordering is undefined. A real synchronized bubble subsurface above the parent has its own raster and explicitly empty input region. Reveal/hide maps/unmaps that child without resizing the sprite; parent commits apply child state atomically. Sprite input rectangles project actual nonzero raster alpha into logical cells, merging runs and excluding transparent padding, including in opaque diagnostics.
+
+CPU straight RGBA → rounded premultiplication → native-endian ARGB8888 SHM → compositor; no GPU is required on this path. Buffer slots remain bounded to three per surface and are reused only when released. Integer output density is reduced when necessary to fit the 8192-per-axis/16-Mpixel allocation bounds for both rasters; logical scene scale and dimensions stay unchanged. Native fractional-scale/viewporter support is not implemented. Parent frame callbacks gate presentation; playback/bubble deadlines and nonblocking protocol-write retries drive wakes.
+
+**Edge Cases:** left-click release reveals; held movement of at least five logical points starts output-local drag, clamped to the current output. Middle-click toggles pause; right-click closes only that familiar. Side-button Preview cycling is manual/demo-only, ignored live. Per-seat default cursor uses cursor-shape/theme support with an immutable SHM arrow fallback. No keyboard is acquired: Q/Esc and other focused shortcuts are winit-only. No global pursuit/hotkeys/native menu or synthetic input is added. Layer placement is runtime-only, never written into the old global-coordinate preference schema; live appearance preferences remain supported.
+
+Output removal drops native surfaces and recreates them on an available output without replacing the scene; zero outputs waits. Compositor-side layer Close similarly retains the logical registry and retries another output or after cooldown. In a live service, per-view pool/render failures disable that view while others and service controls remain available; an appearance change can retry it. Standalone manual/demo instead return the original error promptly, since they have no IPC recovery path. Connection failure remains service-wide. Last familiar Close retains the live service and later Open works; manual/demo remain single-view and socket-free.
+
+**Example usage / validation:** `numen run --backend auto|winit|layer-shell` (choose one value); see [README examples and deployment boundary](README.md#linux-build-run-and-limitations). The ignored `tests/linux_layer_shell.rs` smoke passed after safety fixes on Hyprland using auto selection with five concurrent preset rows including random, independent bubble dimensions, empty child input regions, nonempty sprite input shapes, stable character size across reveal/expiry, settings, Close/reopen and Quit. These are native commit/log assertions, not screenshots or physical click-through proof. The default suite passed **499 tests, 4 ignored**, with formatting, strict production-bin Clippy, embedded assets and diff checks passing. Native layer-shell and ordinary Wayland/Xwayland desktop smoke tests passed separately, without existing user-service/home side effects. Physical click-through/drag/cursor, multi-output/hotplug, fractional-display and macOS regression acceptance remain unverified. Refreshing the selected Arcana payload does not replace a running process; only an explicit user-chosen `numen quit` then `numen` loads the refreshed build, potentially requiring producer reconnects.
+
+The Arcana dev payload refresh and installed-public-command standalone smoke passed. Hyprland reported a **144 × 156** `numen` layer with the bubble always visible and no ordinary client for that process. The existing service retained its old build and instance; no restart was performed.
+
+**Related files:** [`desktop.rs`](src/desktop.rs), [`desktop_scene.rs`](src/desktop_scene.rs), [`layer_shell.rs`](src/layer_shell.rs), [`software.rs`](src/layer_shell/software.rs), [`main.rs`](src/main.rs), [`ipc.rs`](src/ipc.rs), [`tests/linux_layer_shell.rs`](tests/linux_layer_shell.rs).
+
+#### Ordinary winit fallback (prior policy and evidence)
+
+The following policy applies only to ordinary winit/pixels windows, including the historical Linux smoke, not native layer-shell. Its prior placement/input constraints remain. Random selection uses `fastrand` instead of Linux-unavailable `libc::arc4random_uniform`, preserving semantics without enabling Linux corners or pursuit.
 
 **API / Interfaces:** `DesktopBackend::for_window` inspects the raw display handle (`Wayland`, `X11`, `Other`); `absolute_position()` is false only for Wayland. `identify(WindowAttributes, &ActiveEventLoop)` selects the backend-specific naming extension: Wayland app_id `numen`, or X11 WM_CLASS class `Numen`, instance `numen`. X11's naming arguments are `(general_class, instance)`; both extensions write the same name field, so they are not chained. Stable IDs support user-managed floating rules without matching dynamic titles. `negotiate_alpha(opaque, create)` returns the created surface and selected `CompositeAlphaMode`.
 
@@ -288,6 +315,8 @@ Actual native drag, digits, non-macOS right-click cycle, L, Tab and close cancel
 **Related files:** [`src/window_platform.rs`](src/window_platform.rs), [`src/window.rs`](src/window.rs), [`src/activity.rs`](src/activity.rs), [`src/corner.rs`](src/corner.rs), [`tests/linux_desktop.rs`](tests/linux_desktop.rs), [`Cargo.toml`](Cargo.toml).
 
 ### Scene composition
+
+This subsection describes the **winit combined-window** composition path. Layer-shell instead uses the independent sprite/bubble surfaces above; reveal does not resize its parent.
 
 The native window starts at a 96 × 104 logical sprite-only canvas, expands while revealed to 384 × 248 (384 × 144 bubble above the character at `(144, 144)`), and shrinks on hide; no full hidden input area remains. Native atlas cells remain 192 × 208. `--sprite-scale` is finite 0.25–2, default 0.5, affecting artwork only. `dimensions(show, sprite_scale)` rounds sprite bounds upward; shown width is 384, height 144 plus sprite height, otherwise sprite bounds only. `--sprite-scale 1` gives 192 × 208 hidden or 384 × 352 shown. Expansion preserves the sprite anchor when possible and clamps to current monitor bounds near edges. Collapse restores the saved hidden position; an explicit left-drag clears that anchor and commits the current location. This avoids mistaking delayed programmatic window-manager moves for user dragging. Platforms without positioning support are best-effort.
 
