@@ -9,6 +9,8 @@ Numen means divine power or presence: an unseen, animating presence in the machi
 
 ## Overview
 
+**Linux basic desktop support is implemented**, with native Wayland and X11-backend smoke coverage in Hyprland. This is not full Linux desktop acceptance or parity with macOS; see [Linux build, run and limitations](#linux-build-run-and-limitations).
+
 **Current movement update is not installed or restarted.** Earlier installation/check evidence below is historical for this update. Corrected end-to-end multi-display/mixed-DPI movement remains pending; see [movement evidence boundaries](#optionc-validation-and-deployment).
 
 **Open chat via Wisp is implemented, not installed or desktop-accepted.** The macOS familiar menu now offers **Open chat** after **Copy session ID** for the current live Djinn attachment. This needs updated Numen, Djinn Rust CLI and UI plus Wisp/AeroSpace/Kitty; no Wisp code change is required. Older running Djinn needs an explicit restart with the updated build, **not performed**. Installation/test evidence below belongs to earlier features, not this delivery. See [Open chat](#open-chat-via-wisp) and its [privacy/capability lifecycle](../djinn/docs/numen.md#gateway-privacy-and-lifecycle).
@@ -54,7 +56,7 @@ The remembered key is **only `(source, activity)`**, never producer instance or 
 - Production Main starts unattached and never source-auto-selects. First manual Attach preserves live style/location without destination restore; unattached edits have no saved key. The old bootstrap first-selection preference rule is compatibility-only, not user UI.
 - Distinct instances sharing one logical key keep independent live views. The last accepted explicit edit updates the corresponding remembered data; it never automatically reapplies to other views.
 - Only explicit Settings edits and **actual completed manual drags** save. Go to Mouse, programmatic movement, bubble layout, resize, clamp, close and source events do not.
-- Placement allows finite negative coordinates within ±1,000,000. Each new native view restores once, with bounded native-size/DPI feedback (one second, at most five real corrections, 20 ms polling), clamped against all available monitors in logical coordinates using each monitor's own backing scale. Restore does not focus the view or save the clamped/resized result.
+- Placement allows finite negative coordinates within ±1,000,000. On backends with absolute positioning (not Wayland), each new native view restores once, with bounded native-size/DPI feedback (one second, at most five real corrections, 20 ms polling), clamped against all available monitors in logical coordinates using each monitor's own backing scale. Restore does not focus the view or save the clamped/resized result. Wayland retains appearance preferences but cannot capture/restore absolute drag placement.
 
 **Forget:** the native click menu offers **Forget saved preferences** for a writable bound view. CLI `numen preferences forget --familiar main build-pet` (1–16 unique existing IDs) removes both saved style and placement for those logical chats, leaving **current** settings/location unchanged. The entire batch validates before mutation. Native Forget freezes/rechecks the original binding; stale actions after rebinding are rejected. Forget revokes pending drags for every view sharing the key, even if no record exists, preventing queued resurrection. Close keeps the record. Forget does not immediately resave; a **new** explicit style edit or completed drag can remember again. Backup copies are not securely erased.
 
@@ -170,6 +172,44 @@ djinn session chat REF
 Not supported: Rust-native `ask`/`session run`, `--mini`, external attach, remote web clients, the current core v2 API, or arbitrary background/child sessions. No OS process/session scanning is performed. See the optional sibling [Djinn adapter guide](../djinn/docs/numen.md); Djinn is not a dependency of Numen.
 
 An already-running older **Djinn UI needs one restart with the updated Djinn binary** to pick up default-on discovery. Rebuilding alone does not update that running UI; open the chat again and explicitly reattach if the backend instance changed. This is separate from the Numen runtime-settings service upgrade described below; no app restart or home installation is performed by this documentation update. For a source fallback, launch Bun from Djinn's `clients/djinn-ui/packages/opencode` so `bunfig.toml` loads the OpenTUI/Solid preload; no enablement flag is needed.
+
+### Linux build, run and limitations
+
+**Overview:** basic Linux graphical startup, all four characters, runtime appearance settings, transient bubbles and service lifecycle are implemented. The Linux build failure from `libc::arc4random_uniform` was removed by using `fastrand` for random selection. Wayland's unsupported `PostMultiplied` startup failure is handled by alpha-mode negotiation; the existing macOS `PostMultiplied` + `REPLACE` preference is unchanged.
+
+**Build / example usage:** use Rust **1.89+**, a native compiler/linker and `pkg-config`, Wayland/X11/xkbcommon runtime libraries, and a working Vulkan loader plus Mesa Vulkan or the appropriate GPU vendor driver. Package names vary by distribution; no installation is performed here. A running graphical session and its display authentication/runtime environment are required. Install `fzf` separately only for the optional terminal menu.
+
+```sh
+cargo build --locked
+cargo run --locked -- run --no-preferences
+# Optional terminal/fzf controls in another terminal:
+./target/debug/numen menu
+./target/debug/numen bubbles
+./target/debug/numen quit
+
+# Force the ordinary winit application backend via display variables:
+env -u DISPLAY cargo run --locked -- run --no-preferences # Wayland
+env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET cargo run --locked -- run --no-preferences # X11
+```
+
+**API / Interfaces:** Wayland uses stable **app_id `numen`**; X11 uses **WM_CLASS instance `numen`, class `Numen`**. Use these identities for compositor/window-manager floating rules rather than dynamic conversation titles. No particular compositor-rule syntax is prescribed here. Existing immediate left-drag/focus and right-click Preview controls remain implemented; CLI and fzf controls are usable. Linux has **no global hotkeys, Go to mouse pursuit, random corners, native macOS click menu, native clipboard action or Open chat**.
+
+**Data Flow / Edge Cases:** straight-RGBA CPU composition → negotiated GPU surface → compositor. `PostMultiplied` + `REPLACE` remains preferred; unsupported alpha retries `PreMultiplied` + `REPLACE`. For that fallback, the CPU premultiplies encoded sRGB channels with rounded integer math **once per fresh composition**, not on each redraw, matching Wayland's encoded-buffer convention. GPU linear-light `ALPHA_BLENDING` was incorrect for this transparent fallback and is no longer used. `pre_present_notify` runs inside the `render_with` callback after frame acquisition. The debug `Familiar frame presented` log records successful actual presentation, not a timeout/occlusion skip. Wayland skips absolute saved-position restore, new-window cascade and layout repositioning. Appearance settings still work, but the compositor controls placement and stacking, including whether the always-on-top request is honored. **Remembered absolute drag placement is unavailable on Wayland**; floating/placement compositor rules are recommended. Bubble resizing cannot guarantee a fixed global sprite anchor there. X11 retains the absolute-position path, without proven physical drag-save or focus acceptance.
+
+**Opt-in desktop smoke:** the ignored `tests/linux_desktop.rs` test requires a running desktop and GPU. It uses a private temporary socket and isolated XDG config/cache/data roots, disables preferences/hotkeys, and cleans up its child service. Run either backend explicitly:
+
+```sh
+WINIT_UNIX_BACKEND=wayland cargo test --locked --test linux_desktop -- --ignored --nocapture
+WINIT_UNIX_BACKEND=x11 cargo test --locked --test linux_desktop -- --ignored --nocapture
+```
+
+`WINIT_UNIX_BACKEND` is a **hint interpreted by this test only**, which removes the opposite display variables from child processes; it is not a backend-forcing setting for normal winit 0.30 launches. Use the `env -u ...` examples above for those.
+
+**Validation boundary:** the strengthened smoke passed on **native Wayland, Hyprland, AMD RADV/Vulkan**, and on the **X11 backend under Xwayland in the same Hyprland session**—not a full native Xorg acceptance run. Coverage includes all four presets, actual frame presentation after creation/reopen, settings and repeated transient bubble reveal/expiry, close-last with service retained, and quit/socket cleanup. Read-only compositor inspection confirmed Wayland app_id `numen`; `xprop` confirmed X11 `WM_CLASS = "numen", "Numen"`. The default Linux suite passed **468 tests, 3 ignored**; formatting, strict production-binary Clippy, asset validation and diff checks passed. There are no screenshots or proven physical drag/focus, native Xorg, macOS regression or multi-DPI acceptance results. Further Linux/compositor acceptance remains. No installation, home configuration or existing user-service changes were made for this delivery.
+
+**Headless CI:** [`.github/workflows/linux.yml`](.github/workflows/linux.yml) defines Ubuntu checks for `cargo fmt --check`, `cargo test --locked`, strict production-binary Clippy (`cargo clippy --locked --bin numen -- -D warnings`) and `cargo run --locked -- check-assets`. Desktop presentation smoke remains opt-in; this workflow is not graphical acceptance evidence.
+
+**Related files:** [`src/window_platform.rs`](src/window_platform.rs), [`src/window.rs`](src/window.rs), [`src/activity.rs`](src/activity.rs), [`src/corner.rs`](src/corner.rs), [`Cargo.toml`](Cargo.toml), [`tests/linux_desktop.rs`](tests/linux_desktop.rs). See also [surface policy](ARCHITECTURE.md#linux-desktop-surface-policy).
 
 ### Local macOS SDK workaround
 

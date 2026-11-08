@@ -916,8 +916,13 @@ mod tests {
                 solid(),
             ));
             assert!(delta.x.is_finite() && delta.y.is_finite());
-            assert!(delta.x.hypot(delta.y) <= 100.0);
-            assert!(delta.x.hypot(delta.y) <= scale * 2048.0);
+            // Normalizing and measuring the vector can round slightly above travel.
+            let distance = delta.x.hypot(delta.y);
+            let bound = 100.0_f64.min(scale * 2048.0);
+            assert!(
+                distance <= bound * (1.0 + 4.0 * f64::EPSILON),
+                "distance={distance:?}, bound={bound:?}, scale={scale:?}"
+            );
         }
         for speed in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
             let mut nav = Navigator::new(speed, now);

@@ -1,5 +1,8 @@
 //! Declarative familiar controls. Native callbacks only record a selection; the
 //! caller revalidates lifecycle/capabilities and executes it after tracking ends.
+// The native catalog is exercised by portable tests but consumed only by AppKit.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::activity::FocusTarget;

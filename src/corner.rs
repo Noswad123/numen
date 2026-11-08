@@ -27,6 +27,7 @@ impl Area {
             .all(|v| v.is_finite())
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn to_desktop(self, primary_max_y: f64) -> Option<Self> {
         let area = Self {
             y: primary_max_y - self.y - self.height,
@@ -123,14 +124,11 @@ pub fn random_target(
     width: f64,
     height: f64,
 ) -> Option<(DisplayArea, Point)> {
-    let count = u32::try_from(displays.len().checked_mul(4)?).ok()?;
+    let count = displays.len().checked_mul(4)?;
     if count == 0 {
         return None;
     }
-    #[cfg(target_os = "macos")]
-    let index = unsafe { libc::arc4random_uniform(count) } as usize;
-    #[cfg(not(target_os = "macos"))]
-    let index = 0;
+    let index = fastrand::usize(0..count);
     target_at(displays, index, width, height)
 }
 
@@ -226,6 +224,12 @@ mod tests {
         assert!(target_at(&displays, 12, 144.0, 156.0).is_none());
         assert!(random_target(&[], 144.0, 156.0).is_none());
         assert!(random_target(&displays, f64::NAN, 156.0).is_none());
+        for _ in 0..128 {
+            let selected = random_target(&displays, 144.0, 156.0).unwrap();
+            assert!(
+                (0..12).any(|index| target_at(&displays, index, 144.0, 156.0) == Some(selected))
+            );
+        }
     }
 
     #[test]

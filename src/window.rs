@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use pixels::wgpu::{BlendState, Color, CompositeAlphaMode};
+use pixels::wgpu::{Color, CompositeAlphaMode};
 use pixels::{Pixels, PixelsBuilder, ScalingMode, SurfaceTexture};
 use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
@@ -43,6 +43,10 @@ const DEMO_INTERVAL: Duration = Duration::from_secs(3);
 
 #[path = "corner.rs"]
 mod corner;
+
+#[path = "window_platform.rs"]
+mod platform;
+use platform::DesktopBackend;
 
 #[derive(Default)]
 struct ClickGesture {
@@ -609,6 +613,7 @@ pub fn run(atlas: SpriteAtlas, options: RunOptions, socket: Option<&Path>) -> Re
     app.global_navigation_registered = hotkeys[1].is_some();
     app.global_corner_registered = hotkeys[2].is_some();
     let result = event_loop.run_app(&mut app);
+    #[cfg(target_os = "macos")]
     drop(hotkeys);
     drop(server);
     result?;
@@ -670,6 +675,7 @@ struct FamiliarView {
     last_tick: Instant,
     next_demo: Instant,
     draws: u64,
+    premultiplied_alpha: bool,
     error: Option<anyhow::Error>,
     close_requested: bool,
     display: LiveDisplay,
@@ -821,6 +827,9 @@ impl FamiliarView {
         let scale = self.options.sprite_scale;
         self.capture_placement_with(now, || {
             let window = window?;
+            if !DesktopBackend::for_window(&window).absolute_position() {
+                return None;
+            }
             let backing = window.scale_factor();
             if !backing.is_finite() || backing <= 0.0 {
                 return None;
@@ -938,6 +947,9 @@ impl FamiliarView {
             return;
         }
         let Some(window) = &self.window else { return };
+        if !DesktopBackend::for_window(window).absolute_position() {
+            return;
+        }
         let size = window.inner_size();
         let backing = window.scale_factor();
         let geometry = ((size.width, size.height), backing.to_bits());
@@ -1017,6 +1029,7 @@ impl FamiliarView {
             last_tick: now,
             next_demo: now + DEMO_INTERVAL,
             draws: 0,
+            premultiplied_alpha: false,
             error: None,
             close_requested: false,
             display,
@@ -1137,30 +1150,35 @@ impl FamiliarView {
                 .with_has_shadow(false)
                 .with_accepts_first_mouse(true)
         };
-        let window = Arc::new(event_loop.create_window(attributes)?);
+        let window =
+            Arc::new(event_loop.create_window(platform::identify(attributes, event_loop))?);
+        let backend = DesktopBackend::for_window(&window);
         crate::native_window::configure_unrestricted_familiar_window(&window)?;
         let size = window.inner_size();
-        let surface = SurfaceTexture::new(size.width.max(1), size.height.max(1), window.clone());
         // Rasterize into actual display pixels, not a low-resolution canvas
         // subsequently enlarged by the GPU. Only the sprite uses nearest scaling.
-        let mut pixels = PixelsBuilder::new(size.width.max(1), size.height.max(1), surface)
-            .clear_color(if self.options.opaque { Color::BLACK } else { Color::TRANSPARENT })
-            // Preserve straight-alpha PNG bytes in the presentation surface.
-            // Nearest-neighbor scaling avoids filtering straight-alpha edges.
-            .blend_state(if self.options.opaque {
-                BlendState::ALPHA_BLENDING
-            } else {
-                BlendState::REPLACE
-            })
-            .alpha_mode(if self.options.opaque {
-                CompositeAlphaMode::Opaque
-            } else {
-                CompositeAlphaMode::PostMultiplied
-            })
-            .build()
-            .context("cannot create graphics surface; try `numen run --opaque` to diagnose alpha support")?;
+        let (mut pixels, alpha_mode) = platform::negotiate_alpha(
+            self.options.opaque,
+            |alpha, blend| {
+                let surface =
+                    SurfaceTexture::new(size.width.max(1), size.height.max(1), window.clone());
+                PixelsBuilder::new(size.width.max(1), size.height.max(1), surface)
+                    .clear_color(if self.options.opaque {
+                        Color::BLACK
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .blend_state(blend)
+                    .alpha_mode(alpha)
+                    .build()
+            },
+        )
+        .context(
+            "cannot create graphics surface; try `numen run --opaque` to diagnose alpha support",
+        )?;
         pixels.set_scaling_mode(ScalingMode::PixelPerfect);
-        info!(familiar = %self.id, adapter = ?pixels.adapter().get_info(),
+        self.premultiplied_alpha = alpha_mode == CompositeAlphaMode::PreMultiplied;
+        info!(familiar = %self.id, ?backend, ?alpha_mode, adapter = ?pixels.adapter().get_info(),
             framebuffer_width = size.width, framebuffer_height = size.height,
             display_scale = window.scale_factor(), "Graphics initialized");
         self.pixels = Some(pixels);
@@ -1848,7 +1866,10 @@ impl FamiliarView {
     fn layout(&mut self, old_show: bool, old_scale: f32) -> Result<()> {
         let show = self.bubble_visible;
         if let Some(window) = self.window.clone() {
-            let position = window.outer_position().ok();
+            let position = DesktopBackend::for_window(&window)
+                .absolute_position()
+                .then(|| window.outer_position().ok())
+                .flatten();
             let physical_scale = self.options.scale * window.scale_factor();
             let old_size = window.inner_size().into();
             let new_size = layout_size(show, self.options.sprite_scale, physical_scale);
@@ -2147,12 +2168,31 @@ impl FamiliarView {
                             self.display.is_manual().then_some(self.player.animation()),
                             self.bubble_visible,
                         );
+                        if self.premultiplied_alpha {
+                            platform::premultiply_rgba(pixels.frame_mut());
+                        }
                         self.scene_dirty = false;
                     }
-                    if let Err(error) = pixels.render() {
+                    let mut presented = false;
+                    let result = pixels.render_with(|encoder, target, context| {
+                        // Only request a Wayland frame callback after acquiring a
+                        // frame. Timeouts/occlusion can skip this callback entirely.
+                        if let Some(window) = &self.window {
+                            window.pre_present_notify();
+                        }
+                        context.scaling_renderer.render(encoder, target);
+                        presented = true;
+                        Ok(())
+                    });
+                    if let Err(error) = result {
                         self.fail(event_loop, error.into());
-                    } else {
+                    } else if presented {
                         self.draws += 1;
+                        debug!(familiar = %self.id, draws = self.draws,
+                            bubble_visible = self.bubble_visible,
+                            sprite_scale = self.options.sprite_scale,
+                            font_size = self.options.font_size,
+                            "Familiar frame presented");
                     }
                 }
             }
@@ -2421,7 +2461,7 @@ impl App {
             .views
             .values()
             .filter_map(|view| view.window.as_ref())
-            .last()
+            .rfind(|window| DesktopBackend::for_window(window).absolute_position())
             .and_then(|window| window.outer_position().ok())
             .map(next_position);
         for (id, presentation) in updates {
@@ -2445,6 +2485,7 @@ impl App {
                 if created
                     && !restore
                     && let (Some(position), Some(window)) = (cascade, &view.window)
+                    && DesktopBackend::for_window(window).absolute_position()
                 {
                     let position = if let Some(monitor) = window.current_monitor() {
                         let size = window.inner_size();
@@ -2467,6 +2508,7 @@ impl App {
                     cascade = view
                         .window
                         .as_ref()
+                        .filter(|window| DesktopBackend::for_window(window).absolute_position())
                         .and_then(|window| window.outer_position().ok())
                         .map(next_position);
                 }
@@ -5488,6 +5530,10 @@ mod tests {
         ]);
         app.views.get_mut("closing").unwrap().close_requested = true;
         app.views.get_mut("first").unwrap().paused = true;
+        // Inject capability as well as destinations without native platform calls.
+        for view in app.views.values_mut() {
+            view.corner_available = true;
+        }
         app.apply_navigation_with(injected_corner);
         assert!(app.pointer.is_none());
         assert!(!app.views.contains_key("removed"));
@@ -5507,6 +5553,7 @@ mod tests {
         app.navigation_pending.post_corner();
         app.apply_navigation_with(injected_corner);
         app.stage_snapshot(vec![familiar("later")]);
+        app.views.get_mut("later").unwrap().corner_available = true;
         app.apply_navigation_with(injected_corner);
         assert!(app.views["later"].navigation.is_none());
         app.navigation_pending.post_corner();
@@ -5519,6 +5566,9 @@ mod tests {
         for corner_last in [false, true] {
             let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
             app.stage_snapshot(vec![familiar("first"), familiar("second")]);
+            for view in app.views.values_mut() {
+                view.corner_available = true;
+            }
             if corner_last {
                 app.navigation_pending.post(None);
                 app.navigation_pending.post_corner();
@@ -5812,6 +5862,7 @@ mod tests {
         let mut app = App::new(SpriteAtlas::load().unwrap(), options(), true);
         app.stage_snapshot(vec![familiar("first")]);
         let view = app.views.get_mut("first").unwrap();
+        view.corner_available = true;
         view.options.no_bubble = true;
         view.global_navigation_registered = true;
         view.modifiers = ModifiersState::ALT;

@@ -400,9 +400,9 @@ impl Store {
     }
 }
 
+/// Selects uniformly from `0..count`; panics if `count` is zero.
 fn random_index(count: u32) -> u32 {
-    // arc4random_uniform has no preconditions and avoids modulo bias.
-    unsafe { libc::arc4random_uniform(count) }
+    fastrand::u32(0..count)
 }
 
 fn choose_preset(
@@ -1169,6 +1169,21 @@ impl Store {
 mod tests {
     use super::*;
     use crate::protocol::{AttachRequest, OpenRequest, TargetRequest};
+
+    #[test]
+    fn random_index_stays_in_range() {
+        for count in [1, 2, 3, CHARACTERS.len() as u32, u32::MAX] {
+            for _ in 0..128 {
+                assert!(random_index(count) < count);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn random_index_rejects_zero_count() {
+        random_index(0);
+    }
 
     fn preference_store() -> Store {
         let mut store = Store::with_settings(false, FamiliarSettings::default());
