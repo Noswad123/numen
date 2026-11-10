@@ -1,0 +1,765 @@
+{
+  "status": "study only; not approved or applied",
+  "v1_applied_sha256": "b5ea837e8cfe17e24d5607e653fad58a136af2b079666437abd9ca6f3ab318ad",
+  "generator_sha256": "c2fe655cc412a869cdb61a74bb7bd3ad55a5f6e9770f17ff9ab18c36ef9a875d",
+  "v1_recipe": {
+    "version": 1,
+    "profile": "contour",
+    "cell_size": [
+      384,
+      416
+    ],
+    "alpha": "round(255*a*a/(a*a+(255-a)**2)); input<=4 zero; input>=251 opaque",
+    "radius": 1,
+    "max_channel": 96,
+    "max_luminance": 72,
+    "luminance_weights": [
+      0.2126,
+      0.7152,
+      0.0722
+    ],
+    "boundary": "input alpha<=127",
+    "internal_blackhat": false
+  },
+  "v2_change": "Only contour-v1 mask pixels with ORIGINAL alpha>=128 become alpha255; all RGB identical to v1; no internal ink path",
+  "columns": [
+    "BASELINE",
+    "CONTOUR V1",
+    "SOLID CONTOUR V2"
+  ],
+  "rows": [
+    "idle frame 0",
+    "running-right frame 0"
+  ],
+  "cell_size": [
+    384,
+    416
+  ],
+  "scales": [
+    1,
+    0.75,
+    0.5,
+    0.375
+  ],
+  "sampling": "nearest / point",
+  "synthetic_all_256_alpha_values": "passed",
+  "characters": {
+    "djinn": {
+      "idle": {
+        "baseline": {
+          "alpha": {
+            "zero": 112935,
+            "partial": 8804,
+            "opaque": 38005
+          },
+          "visible_true_black": 1040,
+          "bbox": [
+            85,
+            9,
+            299,
+            407
+          ],
+          "coverage_bbox_alpha128": [
+            89,
+            13,
+            294,
+            403
+          ],
+          "opaque_true_black": 306
+        },
+        "v1": {
+          "alpha": {
+            "zero": 115461,
+            "partial": 3819,
+            "opaque": 40464
+          },
+          "visible_true_black": 2947,
+          "bbox": [
+            87,
+            11,
+            295,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            89,
+            13,
+            294,
+            403
+          ],
+          "opaque_true_black": 318
+        },
+        "v2": {
+          "alpha": {
+            "zero": 115461,
+            "partial": 2944,
+            "opaque": 41339
+          },
+          "visible_true_black": 2947,
+          "bbox": [
+            87,
+            11,
+            295,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            89,
+            13,
+            294,
+            403
+          ],
+          "opaque_true_black": 1193
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "2a88cd60fb16b72acb22c9f9d802103749112661bb86b076917dc11018b7f6c5",
+            "2a88cd60fb16b72acb22c9f9d802103749112661bb86b076917dc11018b7f6c5",
+            "2a88cd60fb16b72acb22c9f9d802103749112661bb86b076917dc11018b7f6c5"
+          ],
+          "qualified_strong_ink_pixels": 877,
+          "alpha_pixels_made_opaque_vs_v1": 875
+        }
+      },
+      "running-right": {
+        "baseline": {
+          "alpha": {
+            "zero": 101036,
+            "partial": 10894,
+            "opaque": 47814
+          },
+          "visible_true_black": 1181,
+          "bbox": [
+            45,
+            9,
+            339,
+            389
+          ],
+          "coverage_bbox_alpha128": [
+            50,
+            14,
+            334,
+            382
+          ],
+          "opaque_true_black": 207
+        },
+        "v1": {
+          "alpha": {
+            "zero": 104056,
+            "partial": 4802,
+            "opaque": 50886
+          },
+          "visible_true_black": 3946,
+          "bbox": [
+            49,
+            13,
+            335,
+            383
+          ],
+          "coverage_bbox_alpha128": [
+            50,
+            14,
+            334,
+            382
+          ],
+          "opaque_true_black": 222
+        },
+        "v2": {
+          "alpha": {
+            "zero": 104056,
+            "partial": 3403,
+            "opaque": 52285
+          },
+          "visible_true_black": 3946,
+          "bbox": [
+            49,
+            13,
+            335,
+            383
+          ],
+          "coverage_bbox_alpha128": [
+            50,
+            14,
+            334,
+            382
+          ],
+          "opaque_true_black": 1621
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "07178fd87a0a97f744ebb26f97a9dcbe7b1d9ab97a472a4d3b34a932d22bf825",
+            "07178fd87a0a97f744ebb26f97a9dcbe7b1d9ab97a472a4d3b34a932d22bf825",
+            "07178fd87a0a97f744ebb26f97a9dcbe7b1d9ab97a472a4d3b34a932d22bf825"
+          ],
+          "qualified_strong_ink_pixels": 1399,
+          "alpha_pixels_made_opaque_vs_v1": 1399
+        }
+      }
+    },
+    "ruby": {
+      "idle": {
+        "baseline": {
+          "alpha": {
+            "zero": 126951,
+            "partial": 8826,
+            "opaque": 23967
+          },
+          "visible_true_black": 451,
+          "bbox": [
+            109,
+            70,
+            271,
+            408
+          ],
+          "coverage_bbox_alpha128": [
+            116,
+            74,
+            264,
+            404
+          ],
+          "opaque_true_black": 72
+        },
+        "v1": {
+          "alpha": {
+            "zero": 129388,
+            "partial": 3732,
+            "opaque": 26624
+          },
+          "visible_true_black": 2135,
+          "bbox": [
+            115,
+            73,
+            266,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            116,
+            74,
+            264,
+            404
+          ],
+          "opaque_true_black": 77
+        },
+        "v2": {
+          "alpha": {
+            "zero": 129388,
+            "partial": 3085,
+            "opaque": 27271
+          },
+          "visible_true_black": 2135,
+          "bbox": [
+            115,
+            73,
+            266,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            116,
+            74,
+            264,
+            404
+          ],
+          "opaque_true_black": 724
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "94d5e089e6278439fdb409ea3ffcdb33b46a538abcc9432dcf89108b1f2b4790",
+            "94d5e089e6278439fdb409ea3ffcdb33b46a538abcc9432dcf89108b1f2b4790",
+            "94d5e089e6278439fdb409ea3ffcdb33b46a538abcc9432dcf89108b1f2b4790"
+          ],
+          "qualified_strong_ink_pixels": 648,
+          "alpha_pixels_made_opaque_vs_v1": 647
+        }
+      },
+      "running-right": {
+        "baseline": {
+          "alpha": {
+            "zero": 126565,
+            "partial": 9983,
+            "opaque": 23196
+          },
+          "visible_true_black": 548,
+          "bbox": [
+            89,
+            70,
+            292,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            95,
+            75,
+            285,
+            398
+          ],
+          "opaque_true_black": 77
+        },
+        "v1": {
+          "alpha": {
+            "zero": 129391,
+            "partial": 4224,
+            "opaque": 26129
+          },
+          "visible_true_black": 2046,
+          "bbox": [
+            93,
+            73,
+            287,
+            400
+          ],
+          "coverage_bbox_alpha128": [
+            95,
+            75,
+            285,
+            398
+          ],
+          "opaque_true_black": 83
+        },
+        "v2": {
+          "alpha": {
+            "zero": 129391,
+            "partial": 3696,
+            "opaque": 26657
+          },
+          "visible_true_black": 2046,
+          "bbox": [
+            93,
+            73,
+            287,
+            400
+          ],
+          "coverage_bbox_alpha128": [
+            95,
+            75,
+            285,
+            398
+          ],
+          "opaque_true_black": 611
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "0757d8d052ea3943a51ee7113ea7fb0e487e655cb2b91a3a99d6f7588189599f",
+            "0757d8d052ea3943a51ee7113ea7fb0e487e655cb2b91a3a99d6f7588189599f",
+            "0757d8d052ea3943a51ee7113ea7fb0e487e655cb2b91a3a99d6f7588189599f"
+          ],
+          "qualified_strong_ink_pixels": 528,
+          "alpha_pixels_made_opaque_vs_v1": 528
+        }
+      }
+    },
+    "hexa-glasses": {
+      "idle": {
+        "baseline": {
+          "alpha": {
+            "zero": 130050,
+            "partial": 7769,
+            "opaque": 21925
+          },
+          "visible_true_black": 906,
+          "bbox": [
+            109,
+            70,
+            272,
+            408
+          ],
+          "coverage_bbox_alpha128": [
+            114,
+            76,
+            268,
+            404
+          ],
+          "opaque_true_black": 257
+        },
+        "v1": {
+          "alpha": {
+            "zero": 132415,
+            "partial": 3213,
+            "opaque": 24116
+          },
+          "visible_true_black": 1734,
+          "bbox": [
+            113,
+            74,
+            269,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            114,
+            76,
+            268,
+            404
+          ],
+          "opaque_true_black": 264
+        },
+        "v2": {
+          "alpha": {
+            "zero": 132415,
+            "partial": 2797,
+            "opaque": 24532
+          },
+          "visible_true_black": 1734,
+          "bbox": [
+            113,
+            74,
+            269,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            114,
+            76,
+            268,
+            404
+          ],
+          "opaque_true_black": 680
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "76d8732706c5460289075a98781a15407e01b8818756f5c19c1b9ffd7478a521",
+            "76d8732706c5460289075a98781a15407e01b8818756f5c19c1b9ffd7478a521",
+            "76d8732706c5460289075a98781a15407e01b8818756f5c19c1b9ffd7478a521"
+          ],
+          "qualified_strong_ink_pixels": 416,
+          "alpha_pixels_made_opaque_vs_v1": 416
+        }
+      },
+      "running-right": {
+        "baseline": {
+          "alpha": {
+            "zero": 128869,
+            "partial": 8687,
+            "opaque": 22188
+          },
+          "visible_true_black": 868,
+          "bbox": [
+            109,
+            70,
+            272,
+            408
+          ],
+          "coverage_bbox_alpha128": [
+            115,
+            75,
+            267,
+            403
+          ],
+          "opaque_true_black": 255
+        },
+        "v1": {
+          "alpha": {
+            "zero": 131374,
+            "partial": 3672,
+            "opaque": 24698
+          },
+          "visible_true_black": 2069,
+          "bbox": [
+            113,
+            73,
+            269,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            115,
+            75,
+            267,
+            403
+          ],
+          "opaque_true_black": 272
+        },
+        "v2": {
+          "alpha": {
+            "zero": 131374,
+            "partial": 3161,
+            "opaque": 25209
+          },
+          "visible_true_black": 2069,
+          "bbox": [
+            113,
+            73,
+            269,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            115,
+            75,
+            267,
+            403
+          ],
+          "opaque_true_black": 783
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "d6bb66b50dbc2ca0683ce5e2dc9ccfc956b41f3eea96480446c71b9b4b7571de",
+            "d6bb66b50dbc2ca0683ce5e2dc9ccfc956b41f3eea96480446c71b9b4b7571de",
+            "d6bb66b50dbc2ca0683ce5e2dc9ccfc956b41f3eea96480446c71b9b4b7571de"
+          ],
+          "qualified_strong_ink_pixels": 511,
+          "alpha_pixels_made_opaque_vs_v1": 511
+        }
+      }
+    },
+    "emerald": {
+      "idle": {
+        "baseline": {
+          "alpha": {
+            "zero": 128534,
+            "partial": 7806,
+            "opaque": 23404
+          },
+          "visible_true_black": 647,
+          "bbox": [
+            103,
+            75,
+            279,
+            408
+          ],
+          "coverage_bbox_alpha128": [
+            109,
+            82,
+            273,
+            404
+          ],
+          "opaque_true_black": 219
+        },
+        "v1": {
+          "alpha": {
+            "zero": 130730,
+            "partial": 3383,
+            "opaque": 25631
+          },
+          "visible_true_black": 2378,
+          "bbox": [
+            107,
+            81,
+            275,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            109,
+            82,
+            273,
+            404
+          ],
+          "opaque_true_black": 223
+        },
+        "v2": {
+          "alpha": {
+            "zero": 130730,
+            "partial": 2692,
+            "opaque": 26322
+          },
+          "visible_true_black": 2378,
+          "bbox": [
+            107,
+            81,
+            275,
+            405
+          ],
+          "coverage_bbox_alpha128": [
+            109,
+            82,
+            273,
+            404
+          ],
+          "opaque_true_black": 914
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "26b210900fd135b5fad23e1e5be896c6b2aa0a98d9505400e184cb792f05d326",
+            "26b210900fd135b5fad23e1e5be896c6b2aa0a98d9505400e184cb792f05d326",
+            "26b210900fd135b5fad23e1e5be896c6b2aa0a98d9505400e184cb792f05d326"
+          ],
+          "qualified_strong_ink_pixels": 691,
+          "alpha_pixels_made_opaque_vs_v1": 691
+        }
+      },
+      "running-right": {
+        "baseline": {
+          "alpha": {
+            "zero": 127069,
+            "partial": 8213,
+            "opaque": 24462
+          },
+          "visible_true_black": 684,
+          "bbox": [
+            103,
+            70,
+            277,
+            407
+          ],
+          "coverage_bbox_alpha128": [
+            110,
+            76,
+            272,
+            402
+          ],
+          "opaque_true_black": 220
+        },
+        "v1": {
+          "alpha": {
+            "zero": 129355,
+            "partial": 3538,
+            "opaque": 26851
+          },
+          "visible_true_black": 2210,
+          "bbox": [
+            108,
+            75,
+            273,
+            403
+          ],
+          "coverage_bbox_alpha128": [
+            110,
+            76,
+            272,
+            402
+          ],
+          "opaque_true_black": 227
+        },
+        "v2": {
+          "alpha": {
+            "zero": 129355,
+            "partial": 2967,
+            "opaque": 27422
+          },
+          "visible_true_black": 2210,
+          "bbox": [
+            108,
+            75,
+            273,
+            403
+          ],
+          "coverage_bbox_alpha128": [
+            110,
+            76,
+            272,
+            402
+          ],
+          "opaque_true_black": 798
+        },
+        "invariants": {
+          "alpha128_bit_changes": 0,
+          "new_visible_pixels": 0,
+          "source_zero_or_opaque_alpha_changes": 0,
+          "rgb_changes_vs_v1": 0,
+          "below128_rgba_changes_vs_v1": 0,
+          "nonqualifying_alpha_changes_vs_v1": 0,
+          "qualified_strong_not_opaque_black": 0,
+          "opaque_interior_rgb_changes_vs_baseline": 0,
+          "rgb_changes_outside_disk1_vs_baseline": 0,
+          "coverage_sha256": [
+            "81ceb044452dfd09758dc784ca4072200ef2e4162ac334cbd751f8014d9ec398",
+            "81ceb044452dfd09758dc784ca4072200ef2e4162ac334cbd751f8014d9ec398",
+            "81ceb044452dfd09758dc784ca4072200ef2e4162ac334cbd751f8014d9ec398"
+          ],
+          "qualified_strong_ink_pixels": 571,
+          "alpha_pixels_made_opaque_vs_v1": 571
+        }
+      }
+    }
+  },
+  "protected_hashes_unchanged": {
+    "scripts/refine-sprite-edges.py": "c58eec6a8efec342180f23238b05d98799aa375da03f993a87074193b358b9c3",
+    "scripts/promote-sprites.py": "ee467b9a67d0d6779301e9e9ced504e332684ccfd9958bb2877081189d8e2f7b",
+    "artwork/edge-refinement/applied.json": "b5ea837e8cfe17e24d5607e653fad58a136af2b079666437abd9ca6f3ab318ad",
+    "artwork/edge-refinement/report.json": "c7c0bde39bb0366eaa90ed03387db7d2adec73436a276bd3388f59ef3336635d",
+    "artwork/hd-promotion/report.json": "adcded9bda2dff07eb9766c5fbb87407f84c3f6e8a9223b0457ecbc7e0259292",
+    "artwork/hd-promotion/original-removal.json": "293b638528f607f2d06278a167e8dd4277cf8c83145f705ee08b09dddf60b261",
+    "artwork/upscaled-2x/provenance.json": "a0244112fc6f2a69e7e28243b861644042720dc63c2c0e5cf3ef43af50765cdf",
+    "assets/djinn/manifest.json": "119ed4d4adc47e64075b5e9b2eba3ee3f805e26530098a1a3087042f36315cad",
+    "assets/djinn/README.md": "1c9654320313eaddfe5164422606f9b58e9854b6137df6b45c169857563c951c",
+    "assets/djinn/spritesheet.png": "ef8b4115b67a8e47ea0d7b6ddf8b845d6f7ed1f697ec4dd0c3652ebd3a81bec6",
+    "artwork/upscaled-2x/amethyst/spritesheet.png": "2f95ff340eccdd0ce6433e45a1f2b5d33790d25d81bfc9c911edb6d99536316a",
+    "artwork/upscaled-2x/amethyst/manifest.json": "bc24e86854f6b55c7d918d4848e086387802bb3d94d88f4cc76b6d4c3a574b4a",
+    "artwork/upscaled-2x/amethyst/comparison.png": "0d2492c16a42fdeab4aa6ffb8ee5408b778c66c66feb19684feb632e01a9de69",
+    "artwork/upscaled-2x/amethyst/idle-comparison.gif": "5d2287a372d7ec2f1b574974fa977087b523c6878b55aa5a892b73d1bbeec9c6",
+    "artwork/original-1x/amethyst/manifest.json": "9af8b49aaa83c1a5f1fb8cef96a7b91a3f9c03b7232a580dffdf0ac3a9f06ea7",
+    "artwork/original-1x/amethyst/README.md": "a64600cb2478555705da33af7b80eb69926b6e14db0ad0a0cb512ac606bf2818",
+    "assets/ruby/README.md": "2375b5fbf44f1f590590a6b4d1f1a24300083301508199319f6c5e17f0123e28",
+    "assets/ruby/manifest.json": "119ed4d4adc47e64075b5e9b2eba3ee3f805e26530098a1a3087042f36315cad",
+    "assets/ruby/spritesheet.png": "d29a959a68bcb2cfd79cae7400f1997dfb564e94123d61daaedfa54abcec2896",
+    "artwork/upscaled-2x/ruby/spritesheet.png": "fd6909ceb31fd71b4b1e2ce0cf006338579e1bf59dd70e987cfd5da2b692cb23",
+    "artwork/upscaled-2x/ruby/manifest.json": "bc24e86854f6b55c7d918d4848e086387802bb3d94d88f4cc76b6d4c3a574b4a",
+    "artwork/upscaled-2x/ruby/comparison.png": "7ccb7f13a67c76964bbcca14ac5049d094787278fea0a46b5d02100adf96b94a",
+    "artwork/upscaled-2x/ruby/idle-comparison.gif": "a93bd0189a9bc97883b63ae6b79d9cb56fac1f988b664c8fa0924b1a8d8ec973",
+    "artwork/original-1x/ruby/manifest.json": "9af8b49aaa83c1a5f1fb8cef96a7b91a3f9c03b7232a580dffdf0ac3a9f06ea7",
+    "artwork/original-1x/ruby/README.md": "eb81af1286ac72befdfe7c08739fa213cdbc09d5d55ea353c58519ef23c9d32a",
+    "assets/hexa-glasses/README.md": "56ee1ea1c31675afc6981a0dbc2329c4d93294c929f96fd52b05ed51ad0c1196",
+    "assets/hexa-glasses/manifest.json": "119ed4d4adc47e64075b5e9b2eba3ee3f805e26530098a1a3087042f36315cad",
+    "assets/hexa-glasses/spritesheet.png": "b966414609b6bc2e50369679a50e9684331e6bda5979e93dc14fdb3d95246435",
+    "artwork/upscaled-2x/saphire/spritesheet.png": "baab5176292e1f1291583a4cb71f5874b728ff7a1a86f3b80bf760f7faccfd1e",
+    "artwork/upscaled-2x/saphire/manifest.json": "bc24e86854f6b55c7d918d4848e086387802bb3d94d88f4cc76b6d4c3a574b4a",
+    "artwork/upscaled-2x/saphire/comparison.png": "db94720d5bc223428a7f80030f6408b96a3edb683486525ca0b50772ecc65154",
+    "artwork/upscaled-2x/saphire/idle-comparison.gif": "2d61bd15231106d096ca54b93c7f6f93ea51f1aa23f318dd541893e66866f570",
+    "artwork/original-1x/saphire/manifest.json": "9af8b49aaa83c1a5f1fb8cef96a7b91a3f9c03b7232a580dffdf0ac3a9f06ea7",
+    "artwork/original-1x/saphire/README.md": "3d8cde75fc34c987d64398d0c26ef72b3d0ef3b8f4afe2ada9d07d623dfe7be2",
+    "assets/emerald/README.md": "baf401445fcbe087c82a25e99c2fd3a17e0d81081d5323a71ab0ef0273301cbd",
+    "assets/emerald/manifest.json": "119ed4d4adc47e64075b5e9b2eba3ee3f805e26530098a1a3087042f36315cad",
+    "assets/emerald/spritesheet.png": "34022259e28bc79a53e4d73dd3c7b88cf531148779f8e33bf50fc2df5eafbc13",
+    "artwork/upscaled-2x/emerald/spritesheet.png": "93faeed1717cabfe6a277bda72f6855a1c530608887a7d1e6d58e50403e779fe",
+    "artwork/upscaled-2x/emerald/manifest.json": "bc24e86854f6b55c7d918d4848e086387802bb3d94d88f4cc76b6d4c3a574b4a",
+    "artwork/upscaled-2x/emerald/comparison.png": "82df4076a58c20b77dd9ad90739071ecc62b04a78de4a1b58fc9b353f5b5de07",
+    "artwork/upscaled-2x/emerald/idle-comparison.gif": "c26c23336a069d777030dcd8c05d5983bfad84daaffe169cb7094354d2e7c57d",
+    "artwork/original-1x/emerald/manifest.json": "9af8b49aaa83c1a5f1fb8cef96a7b91a3f9c03b7232a580dffdf0ac3a9f06ea7",
+    "artwork/original-1x/emerald/README.md": "af5943a4a10962148a06cf3af6312d5059eab5da7d8e59ea6f0d0864752334e6"
+  }
+}

@@ -1,0 +1,21 @@
+name: macOS build boundaries
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Non-test builds exercise the platform cfg boundaries; cfg(test) alone
+      # would hide accidentally unguarded references to Linux-only modules.
+      - run: cargo check --locked --bin numen
+      - run: cargo clippy --locked --bin numen -- -D warnings
+      - run: cargo check --locked --tests
+      - run: cargo test --locked --bin numen --no-run

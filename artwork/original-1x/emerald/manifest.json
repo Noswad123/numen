@@ -1,0 +1,19 @@
+{
+  "width": 1536,
+  "height": 2288,
+  "cell_width": 192,
+  "cell_height": 208,
+  "columns": 8,
+  "rows": 11,
+  "clips": {
+    "idle": { "row": 0, "frame_durations_ms": [280, 110, 110, 140, 140, 320], "looping": true },
+    "running-right": { "row": 1, "frame_durations_ms": [120, 120, 120, 120, 120, 120, 120, 220], "looping": true },
+    "running-left": { "row": 2, "frame_durations_ms": [120, 120, 120, 120, 120, 120, 120, 220], "looping": true },
+    "waving": { "row": 3, "frame_durations_ms": [140, 140, 140, 280], "looping": false },
+    "succeeded": { "row": 4, "frame_durations_ms": [140, 140, 140, 140, 280], "looping": false },
+    "failed": { "row": 5, "frame_durations_ms": [140, 140, 140, 140, 140, 140, 140, 240], "looping": false },
+    "waiting": { "row": 6, "frame_durations_ms": [150, 150, 150, 150, 150, 260], "looping": true },
+    "working": { "row": 7, "frame_durations_ms": [120, 120, 120, 120, 120, 220], "looping": true },
+    "review": { "row": 8, "frame_durations_ms": [150, 150, 150, 150, 150, 280], "looping": true }
+  }
+}

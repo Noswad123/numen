@@ -335,44 +335,41 @@ impl Model {
 
     /// Straight RGBA, top-left origin. Native owns font loading (including a lazy
     /// Typeface::bundled fallback when bubbles have not loaded a face).
+    #[cfg(test)]
     pub fn paint(
         &self,
         typeface: &mut Typeface,
         physical_size: (u32, u32),
         logical_size: (u32, u32),
     ) -> Vec<u8> {
-        let (pw, ph) = physical_size;
-        // Bound allocations and reject malformed scales, without shrinking fonts.
-        if pw > 8192 || ph > 8192 {
-            return Vec::new();
-        }
+        crate::raster::RasterSpec::from_sizes(logical_size, physical_size)
+            .map_or_else(Vec::new, |raster| self.paint_raster(typeface, raster))
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn paint_raster(
+        &self,
+        typeface: &mut Typeface,
+        raster: crate::raster::RasterSpec,
+    ) -> Vec<u8> {
+        let (pw, ph) = raster.physical_size();
+        let logical_size = raster.logical_size();
         let mut pixels = vec![0; pw as usize * ph as usize * 4];
-        if logical_size.0 == 0 || logical_size.1 == 0 {
-            return pixels;
-        }
-        let scale = pw / logical_size.0;
-        if scale == 0
-            || scale > 8
-            || pw % logical_size.0 != 0
-            || logical_size.1.checked_mul(scale) != Some(ph)
-        {
-            return pixels;
-        }
+        let project = |(x0, y0, x1, y1): (u32, u32, u32, u32)| {
+            let (x, y, w, h) = raster.covering_buffer_rect((x0, y0, x1 - x0, y1 - y0));
+            (x, y, x + w, y + h)
+        };
         let width = self.viewport.0.min(logical_size.0);
         let height = self.viewport.1.min(logical_size.1);
         if width <= 2 * PAD || height <= 2 * PAD {
             return pixels;
         }
-        let panel = (
-            PAD * scale,
-            PAD * scale,
-            (width - PAD) * scale,
-            (height - PAD) * scale,
-        );
-        fill(&mut pixels, pw, panel, [29, 32, 39, 255]);
+        let panel = (PAD, PAD, width - PAD, height - PAD);
+        fill(&mut pixels, pw, project(panel), [29, 32, 39, 255]);
+        let mut runs = Vec::new();
         for (index, target) in self.visible().into_iter().enumerate() {
-            let top = (PAD + index as u32 * ROW) * scale;
-            let bottom = top + ROW * scale;
+            let top = PAD + index as u32 * ROW;
+            let bottom = top + ROW;
             if bottom > panel.3 {
                 break;
             }
@@ -381,7 +378,7 @@ impl Model {
                 fill(
                     &mut pixels,
                     pw,
-                    (panel.0, top, panel.2, bottom),
+                    project((panel.0, top, panel.2, bottom)),
                     [55, 68, 89, 255],
                 );
             }
@@ -396,7 +393,7 @@ impl Model {
                 fill(
                     &mut pixels,
                     pw,
-                    (11 * scale, top + 12 * scale, 17 * scale, top + 18 * scale),
+                    project((11, top + 12, 17, top + 18)),
                     [140, 195, 236, 255],
                 );
             }
@@ -405,9 +402,9 @@ impl Model {
             } else {
                 12.0
             };
-            let px = font * scale as f32;
-            let right = panel.2.saturating_sub(22 * scale);
-            let x = 25 * scale;
+            let px = font;
+            let right = panel.2.saturating_sub(22);
+            let x = 25;
             let available = right.saturating_sub(x) as f32;
             let mut text = label.to_owned();
             if typeface.measure(&text, px) > available {
@@ -418,28 +415,46 @@ impl Model {
             }
             let metrics = typeface.line_metrics(px);
             let baseline = top as f32
-                + (ROW as f32 * scale as f32 - (metrics.ascent - metrics.descent)) / 2.0
+                + (ROW as f32 - (metrics.ascent - metrics.descent)) / 2.0
                 + metrics.ascent;
-            draw_text(
-                &mut pixels,
-                pw,
-                typeface,
-                &text,
+            runs.push((
+                text,
                 px,
                 (x as f32, baseline),
                 color,
                 (clip.0, clip.1, right, clip.3),
-            );
+            ));
             if submenu {
-                draw_text(
-                    &mut pixels,
-                    pw,
-                    typeface,
-                    ">",
+                runs.push((
+                    ">".into(),
                     px,
-                    ((panel.2 - 16 * scale) as f32, baseline),
+                    ((panel.2 - 16) as f32, baseline),
                     color,
                     clip,
+                ));
+            }
+        }
+        // Batch each font size to avoid repeatedly invalidating Typeface's raster cache.
+        for font in [14.0, 12.0] {
+            for (text, px, origin, color, clip) in &runs {
+                if *px != font {
+                    continue;
+                }
+                crate::bubble::paint_raster_text(
+                    &mut pixels,
+                    typeface,
+                    raster,
+                    1.0,
+                    *origin,
+                    text,
+                    *px,
+                    [color[0], color[1], color[2], 255],
+                    (
+                        clip.0 as f32,
+                        clip.1 as f32,
+                        (clip.2 - clip.0) as f32,
+                        (clip.3 - clip.1) as f32,
+                    ),
                 );
             }
         }
@@ -456,52 +471,6 @@ fn fill(pixels: &mut [u8], width: u32, rect: (u32, u32, u32, u32), color: [u8; 4
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_text(
-    pixels: &mut [u8],
-    width: u32,
-    face: &mut Typeface,
-    text: &str,
-    px: f32,
-    origin: (f32, f32),
-    color: [u8; 3],
-    clip: (u32, u32, u32, u32),
-) {
-    let mut x = origin.0;
-    let mut previous = None;
-    for c in text.chars() {
-        if let Some(previous) = previous {
-            x += face.kern(previous, c, px);
-        }
-        let glyph = face.glyph(c, px);
-        let left = x.round() as i32 + glyph.metrics.xmin;
-        // fontdue bitmap rows run downward; ymin is measured upward from baseline.
-        let top = origin.1.round() as i32 - glyph.metrics.ymin - glyph.metrics.height as i32;
-        for gy in 0..glyph.metrics.height {
-            let y = top + gy as i32;
-            if y < clip.1 as i32 || y >= clip.3 as i32 {
-                continue;
-            }
-            for gx in 0..glyph.metrics.width {
-                let dx = left + gx as i32;
-                if dx < clip.0 as i32 || dx >= clip.2 as i32 {
-                    continue;
-                }
-                let coverage = u32::from(glyph.coverage[gy * glyph.metrics.width + gx]);
-                let offset = (y as usize * width as usize + dx as usize) * 4;
-                for channel in 0..3 {
-                    pixels[offset + channel] = ((u32::from(color[channel]) * coverage
-                        + u32::from(pixels[offset + channel]) * (255 - coverage)
-                        + 127)
-                        / 255) as u8;
-                }
-            }
-        }
-        x += glyph.metrics.advance_width;
-        previous = Some(c);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +483,7 @@ mod tests {
             copy_session_id: false,
             open_chat: false,
             navigation: false,
+            corner_navigation: false,
             settings: Some(FamiliarSettings::default()),
             preferences: false,
             attachments: None,
@@ -523,6 +493,53 @@ mod tests {
 
     fn model() -> Model {
         Model::new(context())
+    }
+
+    #[test]
+    fn fractional_paint_maps_odd_panel_and_preserves_logical_input() {
+        use crate::raster::{Density, RasterMode, RasterSpec};
+        let mut face = Typeface::bundled().unwrap();
+        for units in [120, 150, 180, 210, 240] {
+            let mut model = model();
+            let logical = (301, 337);
+            model.configure(logical);
+            let raster = RasterSpec::fit(
+                logical,
+                Density::from_preferred_scale(units).unwrap(),
+                RasterMode::ViewportDestination,
+            )
+            .unwrap();
+            let position = model
+                .visible_position_for_action(Action::RevealStatus)
+                .unwrap();
+            let rect = model.input_rect();
+            let rows = model.visible();
+            let normal = model.paint_raster(&mut face, raster);
+            let (pw, ph) = raster.physical_size();
+            let (x0, y0, w, h) =
+                raster.covering_buffer_rect((PAD, PAD, logical.0 - 2 * PAD, logical.1 - 2 * PAD));
+            let mut ink = 0;
+            for y in 0..ph {
+                for x in 0..pw {
+                    let offset = ((y * pw + x) * 4) as usize;
+                    let inside = x >= x0 && x < x0 + w && y >= y0 && y < y0 + h;
+                    assert_eq!(normal[offset + 3], if inside { 255 } else { 0 });
+                    ink += usize::from(inside && normal[offset..offset + 3] != [29, 32, 39]);
+                }
+            }
+            assert!(ink > 0);
+            assert_eq!(model.input_rect(), rect);
+            assert_eq!(model.visible(), rows);
+            assert_eq!(
+                model.visible_position_for_action(Action::RevealStatus),
+                Some(position)
+            );
+            let relative = raster.buffer_to_logical(raster.logical_to_buffer(position));
+            assert_eq!(
+                click_position(&mut model, relative),
+                MenuResult::Action(Action::RevealStatus)
+            );
+        }
     }
 
     fn click_position(model: &mut Model, position: (f64, f64)) -> MenuResult {
@@ -586,6 +603,7 @@ mod tests {
                             copy_session_id: features,
                             open_chat: features,
                             navigation: features,
+                            corner_navigation: !features,
                             settings,
                             preferences: features,
                             attachments: (attachment_state > 0).then(|| AttachmentContext {
@@ -612,6 +630,62 @@ mod tests {
     }
 
     #[test]
+    fn linux_and_macos_navigation_contexts_preserve_canonical_tree_and_click_gates() {
+        for (navigation, corner_navigation) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let make_context = || Context {
+                navigation,
+                corner_navigation,
+                open_familiar: Some(true),
+                ..context()
+            };
+            let macos_catalog = context_menu::entries(make_context());
+            let mut linux_model = Model::new(make_context());
+            assert_eq!(linux_model.pages[0].entries, macos_catalog);
+            let actions: Vec<_> = macos_catalog
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Item { action, .. } => *action,
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                actions,
+                [
+                    Action::RevealStatus,
+                    Action::CopySessionId,
+                    Action::OpenChat,
+                    Action::GoToMouse,
+                    Action::GoToCorner,
+                    Action::SetPaused(true),
+                    Action::OpenFamiliar,
+                    Action::CloseFamiliar,
+                    Action::QuitNumen,
+                ]
+            );
+            for (row, action, enabled) in [
+                (3, Action::GoToMouse, navigation),
+                (4, Action::GoToCorner, corner_navigation),
+            ] {
+                assert_eq!(
+                    linux_model.visible_position_for_action(action).is_some(),
+                    enabled
+                );
+                assert_eq!(
+                    click(&mut linux_model, row),
+                    if enabled {
+                        MenuResult::Action(action)
+                    } else {
+                        MenuResult::None
+                    }
+                );
+            }
+            assert_eq!(linux_model.pages[0].entries, macos_catalog);
+        }
+    }
+
+    #[test]
     fn paginated_root_reaches_every_enabled_entry_and_preserves_separators() {
         for size in [SIZE, (180, 158)] {
             for enabled in [false, true] {
@@ -620,6 +694,7 @@ mod tests {
                         copy_session_id: enabled,
                         open_chat: enabled,
                         navigation: enabled,
+                        corner_navigation: enabled,
                         open_familiar: capacity,
                         attachments: Some(AttachmentContext {
                             current: Some(choice(0).target),

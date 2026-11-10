@@ -12,12 +12,22 @@ use crate::{
     assets::{Character, SpriteAtlas},
     bubble::{self, Renderer},
     display::LiveDisplay,
+    motion::Facing,
     protocol::FamiliarSettings,
+    sprite::{initial_facing, selected_facing},
     typography::Typeface,
     visibility::BubbleVisibility,
 };
 
 const DEMO_INTERVAL: Duration = Duration::from_secs(3);
+
+enum CornerReturn {
+    Live,
+    Preview {
+        animation: Animation,
+        selection_index: usize,
+    },
+}
 
 pub(crate) struct FamiliarScene {
     pub id: String,
@@ -27,6 +37,7 @@ pub(crate) struct FamiliarScene {
     pub bubble_dirty: bool,
     atlas: Arc<SpriteAtlas>,
     player: Player,
+    facing: Facing,
     selection_index: usize,
     display: LiveDisplay,
     latest_view: Presentation,
@@ -35,6 +46,7 @@ pub(crate) struct FamiliarScene {
     visible: bool,
     last_tick: Instant,
     next_demo: Instant,
+    corner_return: Option<CornerReturn>,
 }
 
 impl FamiliarScene {
@@ -59,6 +71,7 @@ impl FamiliarScene {
         );
         visibility.observe(&Presentation::default(), now);
         Self {
+            facing: selected_facing(options.animation, initial_facing(&id)),
             id,
             character,
             player: Player::new(options.animation),
@@ -78,6 +91,7 @@ impl FamiliarScene {
             bubble_dirty: true,
             last_tick: now,
             next_demo: now + DEMO_INTERVAL,
+            corner_return: None,
         }
     }
 
@@ -106,7 +120,9 @@ impl FamiliarScene {
             let before = bubble::text(&self.latest_view, self.preview());
             self.visibility.observe(&view, now);
             self.latest_view = view.clone();
-            if let Some(animation) = self.display.update(view) {
+            if let Some(animation) = self.display.update(view)
+                && !self.corner_active()
+            {
                 self.select(animation, now);
             }
             self.bubble_dirty |= before != bubble::text(&self.latest_view, self.preview());
@@ -117,6 +133,62 @@ impl FamiliarScene {
     pub fn reveal(&mut self, now: Instant) {
         self.visibility.reveal(now);
         self.sync_visibility(now);
+    }
+
+    pub fn begin_corner(&mut self, _now: Instant) {
+        if self.corner_active() {
+            return;
+        }
+        self.corner_return = Some(if self.display.is_manual() {
+            CornerReturn::Preview {
+                animation: self.player.animation(),
+                selection_index: self.selection_index,
+            }
+        } else {
+            CornerReturn::Live
+        });
+    }
+
+    pub fn face_corner(&mut self, facing: crate::motion::Facing, now: Instant) {
+        if !self.corner_active() {
+            return;
+        }
+        self.set_facing(facing);
+        let animation = match facing {
+            crate::motion::Facing::Left => Animation::RunningLeft,
+            crate::motion::Facing::Right => Animation::RunningRight,
+        };
+        if self.player.animation() != animation {
+            self.player.select(animation);
+            self.last_tick = now;
+            self.sprite_dirty = true;
+        }
+    }
+
+    pub fn finish_corner(&mut self, now: Instant) {
+        let before = bubble::text(&self.latest_view, self.preview());
+        let Some(saved) = self.corner_return.take() else {
+            return;
+        };
+        match saved {
+            // Source updates consumed travel-time cues; resume restores only the latest base.
+            CornerReturn::Live => {
+                let animation = self.display.resume();
+                self.select(animation, now);
+            }
+            CornerReturn::Preview {
+                animation,
+                selection_index,
+            } => {
+                self.select(animation, now);
+                self.selection_index = selection_index;
+            }
+        }
+        self.bubble_dirty |= before != bubble::text(&self.latest_view, self.preview());
+    }
+
+    pub fn corner_active(&self) -> bool {
+        self.corner_return.is_some()
     }
 
     pub fn cycle(&mut self, now: Instant) {
@@ -150,16 +222,18 @@ impl FamiliarScene {
         if !self.options.paused {
             let before = bubble::text(&self.latest_view, self.preview());
             self.sprite_dirty |= self.player.advance(elapsed, &self.atlas);
-            if let Some(animation) = self.display.on_advance(self.player.animation()) {
-                self.select(animation, now);
-            }
-            if self.options.demo && now >= self.next_demo {
-                self.cycle(now);
+            if !self.corner_active() {
+                if let Some(animation) = self.display.on_advance(self.player.animation()) {
+                    self.select(animation, now);
+                }
+                if self.options.demo && now >= self.next_demo {
+                    self.cycle(now);
+                }
             }
             self.bubble_dirty |= before != bubble::text(&self.latest_view, self.preview());
             let frame_at = now + self.player.until_next_frame(&self.atlas);
             deadline = Some(deadline.map_or(frame_at, |d| d.min(frame_at)));
-            if self.options.demo {
+            if self.options.demo && !self.corner_active() {
                 deadline = deadline.map(|d| d.min(self.next_demo));
             }
         }
@@ -168,6 +242,17 @@ impl FamiliarScene {
 
     pub fn bubble_visible(&self) -> bool {
         self.visible
+    }
+
+    pub fn facing(&self) -> Facing {
+        self.facing
+    }
+
+    pub fn set_facing(&mut self, facing: Facing) -> bool {
+        let changed = self.facing != facing;
+        self.facing = facing;
+        self.sprite_dirty |= changed;
+        changed
     }
 
     pub fn sprite_size(&self) -> (u32, u32) {
@@ -187,13 +272,65 @@ impl FamiliarScene {
         )
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    pub fn render_sprite_raster(&mut self, raster: crate::raster::RasterSpec) -> Vec<u8> {
+        let size = raster.physical_size();
+        let mut frame = vec![0; size.0 as usize * size.1 as usize * 4];
+        let sprite = self
+            .atlas
+            .frame(self.player.animation(), self.player.frame_index())
+            .with_facing(self.facing());
+        // Sample the source atlas directly, retaining straight RGBA and hidden RGB.
+        let width = f64::from(crate::sprite::LOGICAL_WIDTH)
+            * f64::from(self.options.sprite_scale)
+            * self.options.scale;
+        let height = f64::from(crate::sprite::LOGICAL_HEIGHT)
+            * f64::from(self.options.sprite_scale)
+            * self.options.scale;
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let (lx, ly) = raster.buffer_to_logical((f64::from(x) + 0.5, f64::from(y) + 0.5));
+                if lx >= width || ly >= height {
+                    continue;
+                }
+                let source = sprite.source_offset(lx / width, ly / height);
+                let target = (y as usize * size.0 as usize + x as usize) * 4;
+                frame[target..target + 4].copy_from_slice(&sprite[source..source + 4]);
+            }
+        }
+        self.sprite_dirty = false;
+        frame
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn render_bubble_raster(
+        &mut self,
+        raster: crate::raster::RasterSpec,
+        layout: crate::bubble_layout::BubbleLayout,
+    ) -> Vec<u8> {
+        let size = raster.physical_size();
+        let mut frame = vec![0; size.0 as usize * size.1 as usize * 4];
+        let preview = self.preview();
+        self.renderer.compose_bubble_raster(
+            &mut frame,
+            raster,
+            layout,
+            self.options.scale,
+            (&self.latest_view, preview),
+        );
+        self.bubble_dirty = false;
+        frame
+    }
+
+    #[cfg(test)]
     pub fn render_sprite(&mut self, physical_size: (u32, u32)) -> Vec<u8> {
         let mut frame = vec![0; physical_size.0 as usize * physical_size.1 as usize * 4];
         self.renderer.compose_sprite(
             &mut frame,
             physical_size,
             self.atlas
-                .frame(self.player.animation(), self.player.frame_index()),
+                .frame(self.player.animation(), self.player.frame_index())
+                .with_facing(self.facing),
         );
         self.sprite_dirty = false;
         frame
@@ -211,6 +348,7 @@ impl FamiliarScene {
     }
 
     /// Layout and mapping are native concerns; painting never changes sprite geometry.
+    #[cfg(test)]
     pub fn render_bubble_layout(
         &mut self,
         physical_size: (u32, u32),
@@ -235,10 +373,14 @@ impl FamiliarScene {
     }
 
     fn preview(&self) -> Option<Animation> {
+        if let Some(CornerReturn::Preview { animation, .. }) = self.corner_return {
+            return Some(animation);
+        }
         self.display.is_manual().then(|| self.player.animation())
     }
 
     fn select(&mut self, animation: Animation, now: Instant) {
+        self.set_facing(selected_facing(animation, self.facing));
         self.sprite_dirty |= self.player.animation() != animation || self.player.frame_index() != 0;
         self.player.select(animation);
         self.selection_index = Animation::ALL
@@ -307,6 +449,260 @@ mod tests {
         scene.render_sprite(scene.sprite_size());
         scene.render_bubble(scene.bubble_size());
         assert!(!scene.sprite_dirty && !scene.bubble_dirty);
+    }
+
+    #[test]
+    fn facing_only_dirties_sprite_without_restarting_playback_or_bubble() {
+        let mut s = scene(&[]);
+        let now = s.last_tick;
+        s.update(view(ActivityState::Working), now);
+        s.tick(now + Duration::from_millis(151));
+        clean(&mut s);
+        let state = (
+            s.player.animation(),
+            s.player.frame_index(),
+            s.player.until_next_frame(&s.atlas),
+            s.last_tick,
+            s.next_demo,
+            s.selection_index,
+            s.preview(),
+        );
+        let size = s.sprite_size();
+        let bubble = s.render_bubble(s.bubble_size());
+        let pixels = s.render_sprite(size);
+        let facing = match s.facing() {
+            Facing::Left => Facing::Right,
+            Facing::Right => Facing::Left,
+        };
+        assert!(s.set_facing(facing));
+        assert!(s.sprite_dirty && !s.bubble_dirty);
+        assert!(!s.set_facing(facing));
+        assert_eq!(
+            state,
+            (
+                s.player.animation(),
+                s.player.frame_index(),
+                s.player.until_next_frame(&s.atlas),
+                s.last_tick,
+                s.next_demo,
+                s.selection_index,
+                s.preview(),
+            )
+        );
+        assert_eq!(s.sprite_size(), size);
+        assert_eq!(s.render_bubble(s.bubble_size()), bubble);
+        assert_ne!(s.render_sprite(size), pixels);
+        s.update(view(ActivityState::Waiting), s.last_tick);
+        assert_eq!(s.facing(), facing);
+    }
+
+    #[test]
+    fn initial_headings_and_explicit_running_selections() {
+        let mut s = scene(&[]);
+        let mut headings = Vec::new();
+        for id in ["djinn", "emerald", "ruby", "hexa-glasses"] {
+            let fresh = FamiliarScene::new(
+                id.into(),
+                s.character,
+                s.atlas.clone(),
+                s.options.clone(),
+                None,
+            );
+            assert_eq!(fresh.facing(), initial_facing(id));
+            headings.push(fresh.facing());
+        }
+        assert!(headings.contains(&Facing::Left) && headings.contains(&Facing::Right));
+        for (animation, facing) in [
+            ("running-left", Facing::Left),
+            ("running-right", Facing::Right),
+        ] {
+            let fresh = scene(&["--animation", animation]);
+            assert_eq!(fresh.facing(), facing);
+        }
+        for animation in Animation::ALL {
+            s.set_facing(Facing::Right);
+            s.select(animation, s.last_tick);
+            assert_eq!(
+                s.facing(),
+                if animation == Animation::RunningLeft {
+                    Facing::Left
+                } else {
+                    Facing::Right
+                }
+            );
+            s.set_facing(Facing::Left);
+            s.select(animation, s.last_tick);
+            assert_eq!(
+                s.facing(),
+                if animation == Animation::RunningRight {
+                    Facing::Right
+                } else {
+                    Facing::Left
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn corner_keeps_travel_heading_except_explicit_running_preview() {
+        for mode in [None, Some("--manual"), Some("--demo")] {
+            for animation in ["idle", "working", "running-left", "running-right"] {
+                let mut args = vec!["--animation", animation];
+                if let Some(mode) = mode {
+                    args.push(mode);
+                }
+                let mut s = scene(&args);
+                let now = s.last_tick;
+                for travel in [Facing::Left, Facing::Right] {
+                    s.begin_corner(now);
+                    s.face_corner(travel, now);
+                    assert_eq!(s.facing(), travel);
+                    s.finish_corner(now);
+                    let expected = if mode.is_some() {
+                        match animation {
+                            "running-left" => Facing::Left,
+                            "running-right" => Facing::Right,
+                            _ => travel,
+                        }
+                    } else {
+                        travel
+                    };
+                    assert_eq!(s.facing(), expected);
+                    assert_eq!(s.display.is_manual(), mode.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn running_left_samples_canonical_right_once_and_keeps_logical_size() {
+        let mut s = scene(&[
+            "--manual",
+            "--animation",
+            "running-left",
+            "--sprite-scale",
+            "1",
+            "--scale",
+            "1",
+        ]);
+        assert_eq!(s.sprite_size(), (192, 208));
+        let atlas = s.atlas.clone();
+        let left = atlas.frame(Animation::RunningLeft, 0);
+        let right = atlas.frame(Animation::RunningRight, 0);
+        assert_eq!(left.rgba.as_ptr(), right.rgba.as_ptr());
+        assert!(!left.mirror_x && !right.mirror_x);
+        let painted = s.render_sprite(s.sprite_size());
+        for y in 0..208 {
+            for x in 0..192 {
+                let sx = right.width as usize
+                    - 1
+                    - (((x as f64 + 0.5) / 192.0) * f64::from(right.width)).floor() as usize;
+                let sy = (((y as f64 + 0.5) / 208.0) * f64::from(right.height)).floor() as usize;
+                let source = (sy * right.width as usize + sx) * 4;
+                let target = (y * 192 + x) * 4;
+                assert_eq!(&painted[target..target + 4], &right[source..source + 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn every_animation_renders_both_headings_from_hd_source() {
+        let mut s = scene(&["--scale", "1", "--sprite-scale", "1"]);
+        let atlas = s.atlas.clone();
+        for animation in Animation::ALL {
+            s.select(animation, s.last_tick);
+            for facing in [Facing::Left, Facing::Right] {
+                s.set_facing(facing);
+                let source = atlas.frame(animation, s.player.frame_index());
+                let frame = s.render_sprite(s.sprite_size());
+                assert_eq!(frame.len(), 192 * 208 * 4);
+                for y in 0..208 {
+                    for x in 0..192 {
+                        let sx =
+                            (((x as f64 + 0.5) / 192.0) * f64::from(source.width)).floor() as usize;
+                        let sx = if facing == Facing::Left {
+                            source.width as usize - 1 - sx
+                        } else {
+                            sx
+                        };
+                        let sy = (((y as f64 + 0.5) / 208.0) * f64::from(source.height)).floor()
+                            as usize;
+                        let offset = (sy * source.width as usize + sx) * 4;
+                        let target = (y * 192 + x) * 4;
+                        assert_eq!(&frame[target..target + 4], &source[offset..offset + 4]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_split_densities_preserve_settings_dirty_flags_and_atlas_alpha() {
+        use crate::raster::{Density, RasterMode, RasterSpec};
+        let mut s = scene(&["--scale", "1.375"]);
+        s.apply_settings(FamiliarSettings {
+            sprite_scale: 0.713,
+            ..FamiliarSettings::default()
+        })
+        .unwrap();
+        let sizes = (s.sprite_size(), s.bubble_size());
+        let scale = s.options.scale;
+        let layout = crate::bubble_layout::BubbleLayout {
+            origin: (0, 0),
+            size: (301, 149),
+            tail: None,
+        };
+        for (units, facing) in [120, 150, 180, 210, 240]
+            .into_iter()
+            .flat_map(|units| [Facing::Left, Facing::Right].map(|facing| (units, facing)))
+        {
+            s.set_facing(facing);
+            let raster = RasterSpec::fit(
+                sizes.0,
+                Density::from_preferred_scale(units).unwrap(),
+                RasterMode::ViewportDestination,
+            )
+            .unwrap();
+            s.sprite_dirty = true;
+            s.bubble_dirty = true;
+            let sprite = s.render_sprite_raster(raster);
+            assert!(!s.sprite_dirty && s.bubble_dirty);
+            let size = raster.physical_size();
+            let atlas = s.atlas.frame(s.player.animation(), s.player.frame_index());
+            let width = 192.0 * f64::from(s.options.sprite_scale) * scale;
+            let height = 208.0 * f64::from(s.options.sprite_scale) * scale;
+            for y in 0..size.1 {
+                for x in 0..size.0 {
+                    let (lx, ly) =
+                        raster.buffer_to_logical((f64::from(x) + 0.5, f64::from(y) + 0.5));
+                    let offset = ((y * size.0 + x) * 4) as usize;
+                    if lx < width && ly < height {
+                        let sx = (lx / width * f64::from(atlas.width)).floor() as usize;
+                        let sx = if s.facing() == Facing::Left {
+                            atlas.width as usize - 1 - sx
+                        } else {
+                            sx
+                        };
+                        let sy = (ly / height * f64::from(atlas.height)).floor() as usize;
+                        let source = (sy * atlas.width as usize + sx) * 4;
+                        assert_eq!(&sprite[offset..offset + 4], &atlas[source..source + 4]);
+                    } else {
+                        assert_eq!(&sprite[offset..offset + 4], &[0; 4]);
+                    }
+                }
+            }
+            let bubble = RasterSpec::fit(
+                layout.size,
+                Density::from_preferred_scale(360 - units).unwrap(),
+                RasterMode::ViewportDestination,
+            )
+            .unwrap();
+            let frame = s.render_bubble_raster(bubble, layout);
+            assert!(!s.bubble_dirty && !s.sprite_dirty);
+            assert!(frame.chunks_exact(4).any(|p| p[3] == 255));
+            assert_eq!((s.sprite_size(), s.bubble_size()), sizes);
+            assert_eq!(s.options.scale, scale);
+        }
     }
 
     #[test]
@@ -564,5 +960,239 @@ mod tests {
                 assert_eq!(s.player.animation(), Animation::Failed);
             }
         }
+    }
+
+    #[test]
+    fn corner_source_updates_restore_latest_base_without_replacing_running_pose() {
+        for attention in [false, true] {
+            let mut s = scene(&[]);
+            let now = s.last_tick;
+            s.update(view(ActivityState::Working), now);
+            clean(&mut s);
+            let deadline = s.next_demo;
+            s.begin_corner(now + Duration::from_millis(10));
+            assert!(s.corner_active());
+            assert_eq!(s.player.animation(), Animation::Working);
+            assert_eq!(s.last_tick, now);
+            assert_eq!(s.next_demo, deadline);
+            assert!(!s.sprite_dirty && !s.bubble_dirty);
+            s.face_corner(crate::motion::Facing::Left, now);
+            assert_eq!(s.player.animation(), Animation::RunningLeft);
+            clean(&mut s);
+            let mut waiting = view(ActivityState::Waiting);
+            waiting.base.as_mut().unwrap().attention = attention;
+            s.update(waiting.clone(), now + Duration::from_millis(20));
+            assert_eq!(s.player.animation(), Animation::RunningLeft);
+            assert_eq!(s.latest_view, waiting);
+            assert!(!s.sprite_dirty && s.bubble_dirty);
+            assert!(!s.display.is_manual());
+            assert_eq!(s.last_tick, now);
+            s.finish_corner(now + Duration::from_millis(40));
+            assert!(!s.corner_active());
+            assert_eq!(
+                s.player.animation(),
+                if attention {
+                    Animation::Waiting
+                } else {
+                    Animation::Review
+                }
+            );
+            let last_tick = s.last_tick;
+            clean(&mut s);
+            s.finish_corner(now + Duration::from_secs(1));
+            s.face_corner(crate::motion::Facing::Right, now + Duration::from_secs(1));
+            assert_eq!(s.last_tick, last_tick);
+            assert!(!s.sprite_dirty && !s.bubble_dirty);
+        }
+    }
+
+    #[test]
+    fn corner_consumes_terminal_cues_without_replay_or_arrival_celebration() {
+        for state in [ActivityState::Succeeded, ActivityState::Failed] {
+            let mut s = scene(&[]);
+            let now = s.last_tick;
+            s.update(view(ActivityState::Working), now);
+            s.begin_corner(now);
+            s.face_corner(crate::motion::Facing::Left, now);
+            let mut terminal = view(state);
+            terminal.cue = Some(Cue {
+                id: 7,
+                selection: terminal.base.clone().unwrap(),
+            });
+            s.update(terminal.clone(), now);
+            s.tick(now + Duration::from_secs(1));
+            assert_eq!(s.player.animation(), Animation::RunningLeft);
+            s.finish_corner(now + Duration::from_secs(1));
+            assert_eq!(s.player.animation(), Animation::Idle);
+            // Force a new presentation with the same consumed cue, not the scene's no-op path.
+            terminal.following.as_mut().unwrap().summary = Some("Updated outcome".into());
+            s.update(terminal, now + Duration::from_secs(1));
+            assert_eq!(s.player.animation(), Animation::Idle);
+            s.tick(now + Duration::from_secs(2));
+            assert_eq!(s.player.animation(), Animation::Idle);
+        }
+    }
+
+    #[test]
+    fn repeated_corner_facing_and_requests_preserve_frame_time_and_return_pose() {
+        let mut s = scene(&["--manual", "--animation", "working"]);
+        let now = s.last_tick;
+        let cursor = s.selection_index;
+        let demo = s.next_demo;
+        s.begin_corner(now);
+        s.face_corner(crate::motion::Facing::Left, now);
+        let mut expected = Player::new(Animation::RunningLeft);
+        let step = Duration::from_millis(17);
+        for index in 1..=30 {
+            let at = now + step * index;
+            s.begin_corner(at);
+            s.face_corner(crate::motion::Facing::Left, at);
+            expected.advance(step, &s.atlas);
+            let deadline = s.tick(at);
+            assert_eq!(s.player.frame_index(), expected.frame_index());
+            assert_eq!(
+                s.player.until_next_frame(&s.atlas),
+                expected.until_next_frame(&s.atlas)
+            );
+            assert_eq!(deadline, Some(at + expected.until_next_frame(&s.atlas)));
+            // A second event at the same instant must not advance the clip twice.
+            assert_eq!(s.tick(at), deadline);
+            assert_eq!(s.player.frame_index(), expected.frame_index());
+            assert_eq!(s.next_demo, demo);
+            assert_eq!(s.selection_index, cursor);
+        }
+        clean(&mut s);
+        let at = now + step * 30;
+        s.face_corner(crate::motion::Facing::Right, at);
+        assert_eq!(s.player.animation(), Animation::RunningRight);
+        assert_eq!(s.player.frame_index(), 0);
+        assert!(s.sprite_dirty && !s.bubble_dirty);
+        s.begin_corner(at);
+        s.finish_corner(at);
+        assert_eq!(s.player.animation(), Animation::Working);
+        assert_eq!(s.selection_index, cursor);
+        assert_eq!(s.preview(), Some(Animation::Working));
+        assert!(s.display.is_manual());
+        assert_eq!(s.options.animation, Animation::Working);
+        assert!(!s.bubble_dirty);
+    }
+
+    #[test]
+    fn corner_preserves_paused_preview_options_and_independent_bubble_expiry() {
+        for mode in ["--manual", "--demo"] {
+            let mut s = scene(&[
+                mode,
+                "--animation",
+                "review",
+                "--scale",
+                "1.375",
+                "--opaque",
+                "--normal-window-level",
+            ]);
+            let now = s.last_tick;
+            s.set_paused(true, now);
+            s.cycle(now);
+            let animation = s.player.animation();
+            let cursor = s.selection_index;
+            let sizes = (s.sprite_size(), s.bubble_size(), s.minimum_bubble_size());
+            let options = s.options.clone();
+            s.reveal(now);
+            let bubble = s.render_bubble(s.bubble_size());
+            s.begin_corner(now);
+            s.face_corner(crate::motion::Facing::Left, now);
+            assert_eq!(s.preview(), Some(animation));
+            assert_eq!(s.render_bubble(s.bubble_size()), bubble);
+            clean(&mut s);
+            assert_eq!(s.tick(now), Some(now + Duration::from_secs(5)));
+            assert_eq!(s.tick(now + Duration::from_secs(5)), None);
+            assert_eq!(s.player.animation(), Animation::RunningLeft);
+            assert_eq!(s.player.frame_index(), 0);
+            assert!(!s.sprite_dirty && s.bubble_dirty && !s.bubble_visible());
+            s.update(view(ActivityState::Working), now + Duration::from_secs(5));
+            s.finish_corner(now + Duration::from_secs(5));
+            assert_eq!(s.player.animation(), animation);
+            assert_eq!(s.preview(), Some(animation));
+            assert_eq!(s.selection_index, cursor);
+            assert!(s.display.is_manual());
+            assert_eq!(
+                (
+                    s.options.manual,
+                    s.options.demo,
+                    s.options.paused,
+                    s.options.animation
+                ),
+                (
+                    options.manual,
+                    options.demo,
+                    options.paused,
+                    options.animation
+                )
+            );
+            assert_eq!(
+                (
+                    s.options.scale,
+                    s.options.sprite_scale,
+                    s.options.font_size,
+                    s.options.bubble_duration
+                ),
+                (
+                    options.scale,
+                    options.sprite_scale,
+                    options.font_size,
+                    options.bubble_duration
+                )
+            );
+            assert_eq!(
+                (
+                    s.options.opaque,
+                    s.options.normal_window_level,
+                    s.options.no_bubble,
+                    s.options.always_bubble
+                ),
+                (
+                    options.opaque,
+                    options.normal_window_level,
+                    options.no_bubble,
+                    options.always_bubble
+                )
+            );
+            assert_eq!(
+                (s.sprite_size(), s.bubble_size(), s.minimum_bubble_size()),
+                sizes
+            );
+        }
+    }
+
+    #[test]
+    fn corner_suppresses_demo_and_settings_do_not_cancel_ownership() {
+        let mut s = scene(&["--demo", "--animation", "succeeded"]);
+        let now = s.last_tick;
+        let cursor = s.selection_index;
+        s.tick(now + Duration::from_secs(1));
+        assert_eq!(s.player.animation(), Animation::Idle);
+        s.begin_corner(now + Duration::from_secs(1));
+        s.face_corner(crate::motion::Facing::Right, now + Duration::from_secs(1));
+        s.apply_settings(FamiliarSettings {
+            sprite_scale: 2.0,
+            font_size: 24.0,
+            bubble_duration: 0.25,
+        })
+        .unwrap();
+        assert!(s.corner_active());
+        let at = now + Duration::from_secs(10);
+        let deadline = s.tick(at).unwrap();
+        assert!(deadline > at, "overdue demo must not cause a busy loop");
+        assert_eq!(s.player.animation(), Animation::RunningRight);
+        assert_eq!(s.selection_index, cursor);
+        s.finish_corner(at);
+        assert_eq!(s.player.animation(), Animation::Idle);
+        assert_eq!(s.selection_index, cursor);
+        assert_eq!(s.options.animation, Animation::Succeeded);
+        assert!(s.options.demo && s.display.is_manual());
+        assert_eq!(s.options.sprite_scale, 2.0);
+        assert_eq!(s.options.font_size, 24.0);
+        assert_eq!(s.options.bubble_duration, Duration::from_secs_f64(0.25));
+        s.tick(at + DEMO_INTERVAL);
+        assert_eq!(s.player.animation(), Animation::Failed);
     }
 }

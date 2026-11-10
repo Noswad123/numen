@@ -308,7 +308,7 @@ fn auto_native_lifecycle_concurrent_presets_settings_and_transient_bubbles() {
         let sprite = logical_size(&line);
         // Initial creation must render pixels; later commits may retain this count.
         assert!(numeric_field(&line, "input_rectangles=") > 0, "{line}");
-        assert!(numeric_field(&line, "raster_scale=") >= 1, "{line}");
+        assert!(numeric_field(&line, "raster_units=") >= 120, "{line}");
         let (_, line) = observed(
             &mut app,
             &log,
@@ -359,7 +359,7 @@ fn auto_native_lifecycle_concurrent_presets_settings_and_transient_bubbles() {
             numeric_field(&applied, "input_rectangles=") > 0,
             "{applied}"
         );
-        assert!(numeric_field(&applied, "raster_scale=") >= 1, "{applied}");
+        assert!(numeric_field(&applied, "raster_units=") >= 120, "{applied}");
         let (_, line) = observed(
             &mut app,
             &log,

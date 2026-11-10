@@ -224,8 +224,11 @@ pub struct Navigator {
 }
 
 impl Navigator {
-    /// Fixed foot-center pursuit. Arrival is based only on actual native feedback;
-    /// one native position step per axis tolerates fractional quantization.
+    /// Fixed foot-center pursuit using the caller's position feedback. Ordinary
+    /// windows supply observed native positions; layer-shell supplies its last
+    /// submitted margin after frame readiness, not compositor-reported XY.
+    /// Arrival is only as authoritative as that feedback. One native position
+    /// step per axis tolerates fractional quantization.
     pub fn step_fixed(
         &mut self,
         now: Instant,

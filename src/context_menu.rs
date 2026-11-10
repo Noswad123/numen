@@ -29,6 +29,7 @@ pub enum Action {
     CopySessionId,
     OpenChat,
     GoToMouse,
+    GoToCorner,
     SetPaused(bool),
     Settings(SettingsPatch),
     ForgetPreferences,
@@ -50,6 +51,7 @@ pub struct Context {
     pub copy_session_id: bool,
     pub open_chat: bool,
     pub navigation: bool,
+    pub corner_navigation: bool,
     pub settings: Option<FamiliarSettings>,
     pub preferences: bool,
     pub attachments: Option<AttachmentContext>,
@@ -100,6 +102,13 @@ pub fn entries(context: Context) -> Vec<Entry> {
             label: "Go to mouse".into(),
             action: Some(Action::GoToMouse),
             enabled: context.navigation,
+            checked: false,
+            tooltip: None,
+        },
+        Entry::Item {
+            label: "Go to random corner".into(),
+            action: Some(Action::GoToCorner),
+            enabled: context.corner_navigation,
             checked: false,
             tooltip: None,
         },
@@ -756,6 +765,7 @@ mod tests {
             copy_session_id: false,
             open_chat: false,
             navigation: true,
+            corner_navigation: true,
             settings,
             preferences: false,
             attachments: None,
@@ -1093,6 +1103,7 @@ mod tests {
             copy_session_id: false,
             open_chat: false,
             navigation: false,
+            corner_navigation: false,
             settings: None,
             preferences: false,
             attachments: None,
@@ -1115,15 +1126,15 @@ mod tests {
             }
         ));
         assert!(
-            matches!(&catalog[4], Entry::Item { label, action: Some(Action::SetPaused(false)), checked: true, .. } if label == "Resume")
+            matches!(&catalog[5], Entry::Item { label, action: Some(Action::SetPaused(false)), checked: true, .. } if label == "Resume")
         );
-        assert_eq!(catalog[5], Entry::Separator);
+        assert_eq!(catalog[6], Entry::Separator);
         assert!(
-            matches!(&catalog[6], Entry::Item { label, action: Some(Action::CloseFamiliar), .. } if label == "Close familiar")
+            matches!(&catalog[7], Entry::Item { label, action: Some(Action::CloseFamiliar), .. } if label == "Close familiar")
         );
-        assert_eq!(catalog[7], Entry::Separator);
+        assert_eq!(catalog[8], Entry::Separator);
         assert!(
-            matches!(&catalog[8], Entry::Item { label, action: Some(Action::QuitNumen), .. } if label == "Quit Numen (all familiars)")
+            matches!(&catalog[9], Entry::Item { label, action: Some(Action::QuitNumen), .. } if label == "Quit Numen (all familiars)")
         );
         assert!(Action::QuitNumen.is_service());
         assert!(Action::OpenFamiliar.is_service());
@@ -1133,6 +1144,7 @@ mod tests {
             Action::CopySessionId,
             Action::OpenChat,
             Action::GoToMouse,
+            Action::GoToCorner,
             Action::SetPaused(true),
             Action::Settings(SettingsPatch {
                 font_size: Some(12.0),
@@ -1142,8 +1154,62 @@ mod tests {
             assert!(!action.is_service());
         }
         assert!(
-            matches!(&entries(context(None))[4], Entry::Item { label, action: Some(Action::SetPaused(true)), checked: false, .. } if label == "Pause")
+            matches!(&entries(context(None))[5], Entry::Item { label, action: Some(Action::SetPaused(true)), checked: false, .. } if label == "Pause")
         );
+    }
+
+    #[test]
+    fn navigation_capabilities_are_independent_and_keep_common_row_positions() {
+        for navigation in [false, true] {
+            for corner_navigation in [false, true] {
+                for attachments in [false, true] {
+                    let mut context = context(None);
+                    context.navigation = navigation;
+                    context.corner_navigation = corner_navigation;
+                    context.open_familiar = Some(false);
+                    context.attachments = attachments.then(|| AttachmentContext {
+                        current: None,
+                        available: false,
+                        choices: Vec::new(),
+                    });
+                    let catalog = entries(context);
+                    let mouse = 3 + usize::from(attachments);
+                    for (index, expected_label, expected_action, expected_enabled) in [
+                        (mouse, "Go to mouse", Action::GoToMouse, navigation),
+                        (
+                            mouse + 1,
+                            "Go to random corner",
+                            Action::GoToCorner,
+                            corner_navigation,
+                        ),
+                    ] {
+                        assert!(matches!(&catalog[index], Entry::Item {
+                            label, action: Some(action), enabled, checked: false, tooltip: None,
+                        } if label == expected_label && *action == expected_action
+                            && *enabled == expected_enabled));
+                        assert_eq!(
+                            action_for_tag(
+                                &[Some(expected_action).filter(|_| expected_enabled)],
+                                1
+                            ),
+                            expected_enabled.then_some(expected_action)
+                        );
+                        assert!(!expected_action.is_service());
+                    }
+                    let service_actions: Vec<_> = catalog
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            Entry::Item {
+                                action: Some(action),
+                                ..
+                            } if action.is_service() => Some(*action),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(service_actions, [Action::OpenFamiliar, Action::QuitNumen]);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1185,7 +1251,7 @@ mod tests {
         let catalog = entries(context(Some(FamiliarSettings::default())));
         let Entry::Submenu {
             entries: fields, ..
-        } = &catalog[5]
+        } = &catalog[6]
         else {
             panic!("settings missing")
         };
@@ -1230,7 +1296,7 @@ mod tests {
         })));
         let Entry::Submenu {
             entries: fields, ..
-        } = &catalog[5]
+        } = &catalog[6]
         else {
             panic!("settings missing")
         };

@@ -1,5 +1,5 @@
-//! Linux software layer-shell backend. Integer output scaling is intentional;
-//! fractional-scale/viewporter and global keyboard/navigation are not implemented.
+//! Linux software layer-shell backend with optional per-surface fractional scaling.
+//! Global keyboard/navigation are not implemented.
 //! Full-output coordinates ignore exclusive panel regions and reserve no space.
 //! Familiars may overlap panels; ordering among surfaces in Layer::Top is undefined.
 
@@ -60,10 +60,14 @@ use smithay_client_toolkit::{
 use tracing::{debug, info, warn};
 
 mod popup;
+mod scaling;
 mod software;
+mod travel;
+use crate::raster::{Density, RasterMode, RasterSpec};
+use scaling::{ScalingGlobals, SurfaceScaling};
 use software::{
     CloseRequest, Gesture, Reveals, clamp_origin, fallback_cursor, framebuffer_fits,
-    initial_origin, input_rectangles, raster_scale, write_argb,
+    initial_origin, input_rectangles, write_argb,
 };
 
 use crate::{
@@ -126,6 +130,7 @@ pub(crate) fn prepare() -> Result<Prepared> {
             xdg: smithay_client_toolkit::shell::xdg::XdgShell::bind(&globals, &qh).ok(),
             shm,
             subs,
+            scaling: ScalingGlobals::bind(&globals, &qh),
             views: BTreeMap::new(),
             pointers: Vec::new(),
             snapshots: Arc::new(Mailbox::default()),
@@ -275,7 +280,7 @@ impl Prepared {
             } else {
                 "disabled in live mode"
             },
-            "Layer-shell controls: left click reveal, drag move, middle click pause/resume, right click menu; integer output scaling; no global navigation or keyboard focus"
+            "Layer-shell controls: left click reveal, drag move, middle click pause/resume, right click menu; optional per-surface fractional scaling; no global navigation or keyboard focus"
         );
         loop {
             let now = Instant::now();
@@ -297,6 +302,10 @@ impl Prepared {
             let mut deadline = exit_at;
             state.refresh_surfaces(&qh, now)?;
             state.service_popups(&qh, now, &mut deadline);
+            let menu_held = state
+                .views
+                .values()
+                .any(|v| v.native.as_ref().is_some_and(|n| n.popup.is_some()));
             for view in state.views.values_mut() {
                 if view.native.is_none() && !view.failed {
                     earliest(
@@ -313,22 +322,24 @@ impl Prepared {
                     }
                     earliest(&mut deadline, view.close.retry_at);
                 }
-                if view.native.is_some() {
-                    earliest(&mut deadline, view.scene.tick(now));
-                    if let Some(native) = &mut view.native
-                        && !native.frame_pending
-                        && native.configured
-                    {
-                        match native.present(&mut view.scene, &state.raw_compositor, &qh) {
-                            Ok(false) => {
-                                earliest(&mut deadline, Some(now + Duration::from_millis(100)))
-                            }
-                            Ok(true) => {}
-                            Err(error) => {
-                                warn!(familiar = %view.scene.id, %error, "Layer rendering failed");
-                                fail_view(&mut view.failed, state.control.is_some(), error)?;
-                                view.native = None;
-                            }
+                if let Some(native) = &mut view.native {
+                    match native.turn(
+                        &mut view.scene,
+                        now,
+                        menu_held || view.closing,
+                        &state.raw_compositor,
+                        &qh,
+                        &mut deadline,
+                    ) {
+                        Ok(false) => {
+                            earliest(&mut deadline, Some(now + Duration::from_millis(100)))
+                        }
+                        Ok(true) => {}
+                        Err(error) => {
+                            warn!(familiar = %view.scene.id, %error, "Layer rendering failed");
+                            native.cancel_corner(&mut view.scene, now);
+                            fail_view(&mut view.failed, state.control.is_some(), error)?;
+                            view.native = None;
                         }
                     }
                 }
@@ -394,6 +405,7 @@ struct State {
     xdg: Option<smithay_client_toolkit::shell::xdg::XdgShell>,
     shm: Shm,
     subs: SubcompositorState,
+    scaling: ScalingGlobals,
     pointers: Vec<SeatPointer>,
     views: BTreeMap<String, View>,
     snapshots: Arc<Mailbox<Vec<FamiliarPresentation>>>,
@@ -528,6 +540,13 @@ impl State {
                 )?;
             }
             let view = self.views.get_mut(&familiar.id).unwrap();
+            if view.settings.sprite_scale != familiar.settings.sprite_scale {
+                if let Some(n) = &mut view.native {
+                    n.cancel_corner(&mut view.scene, now);
+                } else {
+                    view.scene.finish_corner(now);
+                }
+            }
             if (view.runtime_binding.as_ref() != Some(&familiar.runtime_binding)
                 || view.settings != familiar.settings
                 || view.preference.as_ref().map(|p| (&p.binding, p.writable))
@@ -553,6 +572,9 @@ impl State {
     fn refresh_surfaces(&mut self, qh: &QueueHandle<Self>, now: Instant) -> Result<()> {
         let outputs: Vec<_> = self.outputs.outputs().collect();
         for (index, view) in self.views.values_mut().enumerate() {
+            if view.native.is_none() && view.scene.corner_active() {
+                view.scene.finish_corner(now);
+            }
             if view.failed {
                 continue;
             }
@@ -561,6 +583,10 @@ impl State {
                 .as_ref()
                 .is_some_and(|n| !outputs.contains(&n.output))
             {
+                view.native
+                    .as_mut()
+                    .unwrap()
+                    .cancel_corner(&mut view.scene, now);
                 view.native = None;
             }
             view.rejected_outputs
@@ -590,6 +616,7 @@ impl State {
                 }
             };
             let parent = self.compositor.create_surface(qh);
+            let sprite_scaling = SurfaceScaling::new(&self.scaling, &parent, scale, qh);
             let layer = self.layers.create_layer_surface(
                 qh,
                 parent,
@@ -605,6 +632,10 @@ impl State {
             layer.set_size(size.0, size.1);
             layer.set_margin(origin.1, 0, 0, origin.0);
             let (subsurface, child) = self.subs.create_subsurface(layer.wl_surface().clone(), qh);
+            let mut bubble_scaling = SurfaceScaling::new(&self.scaling, &child, scale, qh);
+            bubble_scaling
+                .state
+                .inherit_density(Some(sprite_scaling.state.requested_density()));
             subsurface.set_sync();
             subsurface.place_above(layer.wl_surface());
             let empty = self.raw_compositor.create_region(qh, ());
@@ -618,6 +649,7 @@ impl State {
             view.native = Some(Native {
                 identity: self.next_parent,
                 popup: None,
+                travel: None,
                 layer,
                 child,
                 subsurface,
@@ -625,13 +657,14 @@ impl State {
                 pool,
                 sprite_buffers: Vec::new(),
                 bubble_buffers: Vec::new(),
-                scale,
-                raster_scale: 0,
+                sprite_scaling,
+                bubble_scaling,
                 origin,
                 committed_origin: origin,
                 output_size: dimensions,
                 configured: false,
                 frame_pending: false,
+                buffers_blocked: false,
                 layout_dirty: true,
                 sprite_size: (0, 0),
                 bubble_visible: false,
@@ -707,6 +740,7 @@ fn available_buffer(
 }
 
 struct Native {
+    travel: Option<travel::CornerTravel>,
     identity: u64,
     popup: Option<popup::NativePopup>,
     layer: LayerSurface,
@@ -716,13 +750,15 @@ struct Native {
     pool: SlotPool,
     sprite_buffers: Vec<StoredBuffer>,
     bubble_buffers: Vec<StoredBuffer>,
-    scale: i32,
-    raster_scale: i32,
+    sprite_scaling: SurfaceScaling,
+    bubble_scaling: SurfaceScaling,
     origin: (i32, i32),
+    // Last client-submitted margin, not absolute compositor position feedback.
     committed_origin: (i32, i32),
     output_size: Option<(i32, i32)>,
     configured: bool,
     frame_pending: bool,
+    buffers_blocked: bool,
     layout_dirty: bool,
     sprite_size: (u32, u32),
     bubble_visible: bool,
@@ -734,12 +770,161 @@ struct Native {
 impl Drop for Native {
     fn drop(&mut self) {
         self.popup = None;
+        self.bubble_scaling.destroy();
         self.subsurface.destroy();
         self.child.destroy();
+        self.sprite_scaling.destroy();
     }
 }
 
 impl Native {
+    fn sync_density_hints(&mut self) {
+        let density = Some(self.sprite_scaling.state.requested_density());
+        self.bubble_scaling.state.inherit_density(density);
+        if let Some(popup) = &mut self.popup {
+            popup.scaling.state.inherit_density(density);
+        }
+    }
+
+    fn request_corner(&mut self, scene: &mut FamiliarScene, now: Instant) -> Result<()> {
+        let corner = [
+            crate::corner::Corner::TopLeft,
+            crate::corner::Corner::TopRight,
+            crate::corner::Corner::BottomLeft,
+            crate::corner::Corner::BottomRight,
+        ][fastrand::usize(0..4)];
+        self.request_corner_at(scene, now, corner)
+    }
+
+    fn request_corner_at(
+        &mut self,
+        scene: &mut FamiliarScene,
+        now: Instant,
+        corner: crate::corner::Corner,
+    ) -> Result<()> {
+        let output = self.output_size.context("output dimensions unavailable")?;
+        self.travel = Some(
+            travel::CornerTravel::new(
+                corner,
+                output,
+                scene.sprite_size(),
+                scene.options.move_speed,
+                now,
+            )
+            .context("invalid corner geometry")?,
+        );
+        scene.begin_corner(now);
+        info!(familiar = %scene.id, ?corner, "corner travel submitted");
+        Ok(())
+    }
+
+    fn suspend_corner(&mut self, now: Instant) {
+        // Only travel owns this pending origin. A drag cancels travel and must
+        // retain its own unsubmitted margin, even while paused or opening menus.
+        if travel::discard_pending(
+            &mut self.travel,
+            &mut self.origin,
+            self.committed_origin,
+            now,
+        ) {
+            self.layout_dirty = true;
+        }
+    }
+
+    fn cancel_corner(&mut self, scene: &mut FamiliarScene, now: Instant) {
+        self.suspend_corner(now);
+        self.travel = None;
+        scene.finish_corner(now);
+    }
+
+    fn update_output_size(
+        &mut self,
+        scene: &mut FamiliarScene,
+        size: Option<(i32, i32)>,
+        now: Instant,
+    ) {
+        if self.output_size == size {
+            return;
+        }
+        self.cancel_corner(scene, now);
+        self.popup = None;
+        self.output_size = size;
+        self.origin = clamp_origin(self.origin, size, scene.sprite_size());
+        self.layout_dirty = true;
+        self.gesture = Gesture::default();
+    }
+
+    fn advance_corner(&mut self, scene: &mut FamiliarScene, now: Instant, held: bool) {
+        if held || scene.options.paused {
+            self.suspend_corner(now);
+        }
+        let eligible = !held
+            && !scene.options.paused
+            && self.configured
+            && self.sprite_size.0 > 0
+            && !self.frame_pending
+            && !self.buffers_blocked
+            && self.origin == self.committed_origin;
+        let Some(travel) = &mut self.travel else {
+            return;
+        };
+        match travel.step(
+            now,
+            self.output_size,
+            scene.sprite_size(),
+            self.committed_origin,
+            eligible,
+        ) {
+            travel::Step::Move(origin, facing) => {
+                scene.face_corner(facing, now);
+                if origin != self.origin {
+                    self.origin = origin;
+                    self.layout_dirty = true;
+                }
+            }
+            result @ (travel::Step::Completed | travel::Step::Cancelled) => {
+                if result == travel::Step::Completed {
+                    info!(familiar = %scene.id, submitted_origin = ?self.committed_origin, "corner travel submitted/completed");
+                } else {
+                    debug!(familiar = %scene.id, "corner travel cancelled");
+                }
+                self.cancel_corner(scene, now);
+            }
+            travel::Step::Hold => {}
+        }
+    }
+
+    fn turn(
+        &mut self,
+        scene: &mut FamiliarScene,
+        now: Instant,
+        held: bool,
+        compositor: &wl_compositor::WlCompositor,
+        qh: &QueueHandle<State>,
+        deadline: &mut Option<Instant>,
+    ) -> Result<bool> {
+        self.advance_corner(scene, now, held);
+        earliest(deadline, scene.tick(now));
+        let ready = if self.configured && !self.frame_pending {
+            let ready = self.present(scene, compositor, qh)?;
+            self.buffers_blocked = !ready;
+            ready
+        } else {
+            true
+        };
+        if ready
+            && !held
+            && !scene.options.paused
+            && self.configured
+            && !self.frame_pending
+            && self.origin == self.committed_origin
+            && let Some(travel) = &self.travel
+        {
+            earliest(deadline, travel.deadline());
+        }
+        Ok(ready)
+    }
+
     fn present(
         &mut self,
         scene: &mut FamiliarScene,
@@ -762,31 +947,39 @@ impl Native {
         let paint_layout_changed =
             self.bubble_layout.map(|l| (l.size, l.tail)) != layout.map(|l| (l.size, l.tail));
         let placement_changed = self.bubble_layout != layout;
-        let density = raster_scale(self.scale, size, bubble_size)
+        let sprite_spec = self
+            .sprite_scaling
+            .state
+            .plan(size)
             .context("logical layer size exceeds raster budget even at scale one")?;
-        let density_changed = density != self.raster_scale;
+        let bubble_spec = self
+            .bubble_scaling
+            .state
+            .plan(bubble_size)
+            .context("logical bubble size exceeds raster budget even at scale one")?;
+        let sprite_density_changed = Some(sprite_spec) != self.sprite_scaling.state.committed;
+        let bubble_density_changed = Some(bubble_spec) != self.bubble_scaling.state.committed;
         let resized = self.sprite_size != size;
-        if resized || density_changed || self.origin != self.committed_origin {
+        if resized || self.origin != self.committed_origin {
             self.popup = None;
         }
-        let sprite_dirty = scene.sprite_dirty || resized || density_changed;
+        let sprite_dirty = scene.sprite_dirty || resized || sprite_density_changed;
         let bubble_dirty = scene.bubble_dirty
             || self.layout_dirty
             || resized
-            || density_changed
+            || (visible && bubble_density_changed)
             || placement_changed
             || visible != self.bubble_visible;
         let bubble_pixels_dirty = visible
             && (scene.bubble_dirty
                 || !self.bubble_visible
-                || density_changed
+                || bubble_density_changed
                 || paint_layout_changed);
         if !sprite_dirty && !bubble_dirty && !self.layout_dirty {
             return Ok(true);
         }
-        let physical = |(w, h): (u32, u32)| (w * density as u32, h * density as u32);
-        let sprite_physical = physical(size);
-        let bubble_physical = physical(bubble_size);
+        let sprite_physical = sprite_spec.physical_size();
+        let bubble_physical = bubble_spec.physical_size();
         let sprite_slot = if sprite_dirty {
             let Some(index) =
                 available_buffer(&mut self.pool, &mut self.sprite_buffers, sprite_physical)?
@@ -817,8 +1010,6 @@ impl Native {
         if self.layout_dirty {
             self.layer.set_margin(self.origin.1, 0, 0, self.origin.0);
         }
-        parent.set_buffer_scale(density);
-        self.child.set_buffer_scale(density);
         if let Some(layout) = layout {
             self.subsurface.set_position(
                 layout.origin.0 - self.origin.0,
@@ -826,9 +1017,9 @@ impl Native {
             );
         }
         if let Some(index) = sprite_slot {
-            let rgba = scene.render_sprite(sprite_physical);
+            let rgba = scene.render_sprite_raster(sprite_spec);
             let region = compositor.create_region(qh, ());
-            let rectangles = input_rectangles(&rgba, sprite_physical, density as u32);
+            let rectangles = input_rectangles(&rgba, sprite_spec);
             self.input_rectangles = rectangles.len();
             for (x, y, w, h) in rectangles {
                 region.add(x, y, w, h);
@@ -842,17 +1033,17 @@ impl Native {
                 scene.options.opaque,
             );
             buffer.attach_to(parent)?;
+            self.sprite_scaling.apply(parent, sprite_spec);
             parent.damage_buffer(0, 0, sprite_physical.0 as i32, sprite_physical.1 as i32);
         }
         if bubble_dirty {
             if let Some(index) = bubble_slot {
-                let rgba = scene.render_bubble_layout(
-                    bubble_physical,
-                    layout.expect("visible bubble has layout"),
-                );
+                let rgba = scene
+                    .render_bubble_raster(bubble_spec, layout.expect("visible bubble has layout"));
                 let buffer = &self.bubble_buffers[index].buffer;
                 write_argb(&rgba, self.pool.canvas(buffer).unwrap(), false);
                 buffer.attach_to(&self.child)?;
+                self.bubble_scaling.apply(&self.child, bubble_spec);
                 self.child
                     .damage_buffer(0, 0, bubble_physical.0 as i32, bubble_physical.1 as i32);
             } else if !visible {
@@ -866,8 +1057,14 @@ impl Native {
         // The parent commit applies the synchronized child's pixels, layout and
         // input region atomically, even when the sprite buffer did not change.
         self.layer.commit();
+        if sprite_slot.is_some() {
+            self.sprite_scaling.committed(sprite_spec, "sprite");
+        }
+        if bubble_slot.is_some() {
+            self.bubble_scaling.committed(bubble_spec, "bubble");
+        }
         debug!(familiar = %scene.id, logical_width = size.0, logical_height = size.1,
-            bubble_visible = visible, input_rectangles = self.input_rectangles, raster_scale = density, "Layer sprite presented");
+            bubble_visible = visible, input_rectangles = self.input_rectangles, raster_units = sprite_spec.density().units_120(), "Layer sprite presented");
         if bubble_dirty {
             debug!(familiar = %scene.id, visible, logical_width = bubble_size.0,
                 logical_height = bubble_size.1, input_empty = true,
@@ -877,7 +1074,6 @@ impl Native {
                 "Layer bubble presented");
         }
         self.sprite_size = size;
-        self.raster_scale = density;
         self.committed_origin = self.origin;
         self.bubble_visible = visible;
         self.bubble_layout = layout;
@@ -895,16 +1091,17 @@ impl CompositorHandler for State {
         factor: i32,
     ) {
         for view in self.views.values_mut() {
-            if let Some(n) = &mut view.native
-                && n.layer.wl_surface() == surface
-                && n.scale != factor.max(1)
-            {
-                n.scale = factor.max(1);
-                n.popup = None;
-                n.layout_dirty = true;
-                n.gesture = Gesture::default();
-                view.scene.sprite_dirty = true;
-                view.scene.bubble_dirty = true;
+            if let Some(n) = &mut view.native {
+                if n.layer.wl_surface() == surface {
+                    n.sprite_scaling.state.integer_changed(factor);
+                } else if &n.child == surface {
+                    n.bubble_scaling.state.integer_changed(factor);
+                } else if let Some(popup) = &mut n.popup
+                    && popup.role.wl_surface() == surface
+                {
+                    popup.scaling.state.integer_changed(factor);
+                }
+                n.sync_density_hints();
             }
         }
     }
@@ -962,7 +1159,8 @@ impl LayerShellHandler for State {
                 .as_ref()
                 .is_some_and(|n| n.layer.wl_surface() == layer.wl_surface())
             {
-                let n = view.native.take().unwrap();
+                let mut n = view.native.take().unwrap();
+                n.cancel_corner(&mut view.scene, Instant::now());
                 let retry_at = Instant::now() + Duration::from_secs(1);
                 view.rejected_outputs.push((n.output.clone(), retry_at));
                 warn!(familiar = %view.scene.id, "Layer closed; trying another output or retrying after one second");
@@ -1010,24 +1208,13 @@ impl OutputHandler for State {
             if let Some(n) = &mut view.native
                 && n.output == output
             {
-                if n.output_size != size {
-                    n.popup = None;
-                    n.output_size = size;
-                    if let Some((w, h)) = size {
-                        let sprite = view.scene.sprite_size();
-                        n.origin = clamp_origin(n.origin, Some((w, h)), sprite);
-                    }
-                    n.layout_dirty = true;
-                    n.gesture = Gesture::default();
+                n.update_output_size(&mut view.scene, size, Instant::now());
+                n.sprite_scaling.state.output_changed(factor);
+                n.bubble_scaling.state.output_changed(factor);
+                if let Some(popup) = &mut n.popup {
+                    popup.scaling.state.output_changed(factor);
                 }
-                if n.scale != factor {
-                    n.popup = None;
-                    n.scale = factor;
-                    n.layout_dirty = true;
-                    n.gesture = Gesture::default();
-                    view.scene.sprite_dirty = true;
-                    view.scene.bubble_dirty = true;
-                }
+                n.sync_density_hints();
             }
         }
     }
@@ -1039,6 +1226,10 @@ impl OutputHandler for State {
     ) {
         for view in self.views.values_mut() {
             if view.native.as_ref().is_some_and(|n| n.output == output) {
+                view.native
+                    .as_mut()
+                    .unwrap()
+                    .cancel_corner(&mut view.scene, Instant::now());
                 view.native = None;
             }
             view.rejected_outputs.retain(|(o, _)| o != &output);
@@ -1196,6 +1387,7 @@ impl PointerHandler for State {
                 n.committed_origin,
             );
             if let Some(origin) = origin {
+                n.cancel_corner(&mut view.scene, Instant::now());
                 n.origin = clamp_origin(origin, n.output_size, view.scene.sprite_size());
                 n.layout_dirty = true;
             }
@@ -1209,6 +1401,7 @@ impl PointerHandler for State {
                 PointerEventKind::Press { button: 275, .. }
                     if view.scene.options.manual || view.scene.options.demo =>
                 {
+                    n.cancel_corner(&mut view.scene, Instant::now());
                     view.scene.cycle(Instant::now())
                 }
                 _ => {}

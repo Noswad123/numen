@@ -24,6 +24,7 @@ use crate::animation::{Animation, Player};
 use crate::assets::{Character, DEFAULT_CHARACTER_ID, RANDOM_PRESET, SpriteAtlas, character};
 use crate::bubble;
 use crate::context_menu::{self, Action, AttachmentContext, ChatChoice};
+use crate::corner;
 use crate::diagnostics::{RuntimeDiagnostics, ShortcutReason, ShortcutState, ShortcutStatus};
 use crate::display::{LiveDisplay, Mailbox};
 use crate::hotkey::{GlobalHotkey, Shortcut};
@@ -36,13 +37,11 @@ use crate::motion::{
 use crate::pointer::{self, PointerReader};
 use crate::preferences::{self, Placement};
 use crate::protocol::FamiliarSettings;
+use crate::sprite::{SpriteFrame, initial_facing, selected_facing};
 use crate::typography::Typeface;
 use crate::visibility::BubbleVisibility;
 
 const DEMO_INTERVAL: Duration = Duration::from_secs(3);
-
-#[path = "corner.rs"]
-mod corner;
 
 #[path = "window_platform.rs"]
 mod platform;
@@ -640,6 +639,7 @@ enum Navigation {
 struct RasterKey {
     animation: Animation,
     frame: usize,
+    facing: Facing,
     size: (u32, u32),
     show: bool,
     sprite_scale: u32,
@@ -651,11 +651,15 @@ struct CachedRaster {
 }
 
 impl CachedRaster {
-    fn new(key: RasterKey, sprite: &[u8]) -> Self {
+    fn new<'a>(key: RasterKey, sprite: impl Into<SpriteFrame<'a>>) -> Self {
         let projection =
             bubble::SpriteProjection::new(key.size, key.show, f32::from_bits(key.sprite_scale));
         let (x0, y0, x1, y1) = projection.bounds;
-        let mask = RasterMask::new(x1 - x0, y1 - y0, projection.alpha(sprite));
+        let mask = RasterMask::new(
+            x1 - x0,
+            y1 - y0,
+            projection.alpha(sprite.into().with_facing(key.facing)),
+        );
         Self { key, mask }
     }
 }
@@ -668,6 +672,7 @@ struct FamiliarView {
     window: Option<Arc<Window>>,
     atlas: Arc<SpriteAtlas>,
     player: Player,
+    facing: Facing,
     selection_index: usize,
     options: RunOptions,
     paused: bool,
@@ -1013,6 +1018,7 @@ impl FamiliarView {
             display.on_advance(options.animation);
         }
         Self {
+            facing: selected_facing(options.animation, initial_facing(&id)),
             id,
             character,
             pixels: None,
@@ -1227,6 +1233,7 @@ impl FamiliarView {
     }
 
     fn select(&mut self, animation: Animation) {
+        self.set_facing(selected_facing(animation, self.facing));
         self.scene_dirty = true;
         self.player.select(animation);
         self.selection_index = Animation::ALL
@@ -1239,6 +1246,14 @@ impl FamiliarView {
             window.request_redraw();
         }
         info!(familiar = %self.id, animation = animation.label(), "Expression selected");
+    }
+
+    fn set_facing(&mut self, facing: Facing) {
+        if self.facing != facing {
+            self.facing = facing;
+            self.scene_dirty = true;
+            self.raster = None;
+        }
     }
 
     fn cycle(&mut self) {
@@ -1532,6 +1547,7 @@ impl FamiliarView {
     }
 
     fn prepare_running_pose(&mut self, facing: Facing, elapsed: Duration) {
+        self.set_facing(facing);
         let animation = match facing {
             Facing::Left => Animation::RunningLeft,
             Facing::Right => Animation::RunningRight,
@@ -1548,6 +1564,7 @@ impl FamiliarView {
         RasterKey {
             animation: self.player.animation(),
             frame: self.player.frame_index(),
+            facing: self.facing,
             size,
             show: self.bubble_visible,
             sprite_scale: self.options.sprite_scale.to_bits(),
@@ -1560,7 +1577,8 @@ impl FamiliarView {
             self.raster = Some(CachedRaster::new(
                 key,
                 self.atlas
-                    .frame(self.player.animation(), self.player.frame_index()),
+                    .frame(self.player.animation(), self.player.frame_index())
+                    .with_facing(self.facing),
             ));
         }
     }
@@ -2163,7 +2181,8 @@ impl FamiliarView {
                             pixels.frame_mut(),
                             self.frame_size,
                             self.atlas
-                                .frame(self.player.animation(), self.player.frame_index()),
+                                .frame(self.player.animation(), self.player.frame_index())
+                                .with_facing(self.facing),
                             &self.latest_view,
                             self.display.is_manual().then_some(self.player.animation()),
                             self.bubble_visible,
@@ -2659,6 +2678,7 @@ impl App {
                         frozen.open_chat_index(&view.runtime_binding).is_some()
                     }),
                 navigation: view.navigation_available && self.pointer.is_some(),
+                corner_navigation: view.corner_available,
                 settings: self.control.as_ref().map(|_| view.settings),
                 preferences: menu_binding.is_some(),
                 attachments,
@@ -2797,6 +2817,7 @@ impl App {
                 self.navigation_pending.post(Some(vec![id.to_owned()]));
                 self.apply_navigation();
             }
+            Action::GoToCorner if view.corner_available => view.request_corner(Instant::now()),
             Action::SetPaused(paused) => view.set_paused(paused),
             Action::Attach(index) => {
                 let Some(frozen) = bindings.attachment.as_ref() else {
@@ -4125,6 +4146,7 @@ mod tests {
                 copy_session_id: false,
                 open_chat: false,
                 navigation: false,
+                corner_navigation: false,
                 settings: Some(view.settings),
                 preferences: false,
                 attachments: None,
@@ -4132,7 +4154,7 @@ mod tests {
             });
             let context_menu::Entry::Submenu {
                 entries: fields, ..
-            } = &catalog[5]
+            } = &catalog[6]
             else {
                 panic!("settings submenu missing")
             };
@@ -4173,6 +4195,7 @@ mod tests {
                 Action::CopySessionId,
                 Action::OpenChat,
                 Action::GoToMouse,
+                Action::GoToCorner,
                 Action::SetPaused(true),
                 Action::Settings(crate::protocol::SettingsPatch {
                     font_size: Some(16.0),
@@ -5008,6 +5031,158 @@ mod tests {
     }
 
     #[test]
+    fn facing_only_changes_invalidate_contact_without_resetting_pose_or_clocks() {
+        let mut view = test_view();
+        view.options.sprite_scale = 1.0;
+        view.bubble_visible = false;
+        view.select(Animation::RunningRight);
+        view.advance_animation(Duration::from_millis(1));
+        let remaining = view.player.until_next_frame(&view.atlas);
+        let frame = view.player.frame_index();
+        let selection = view.selection_index;
+        let tick = view.last_tick;
+        let demo = view.next_demo;
+        let now = Instant::now();
+        view.motion_clock.reset(now);
+
+        let mut rgba = vec![0; 384 * 416 * 4];
+        for y in 20..40 {
+            for x in 20..40 {
+                rgba[(y * 384 + x) * 4..(y * 384 + x + 1) * 4].copy_from_slice(&[120, 80, 40, 255]);
+            }
+        }
+        let source = SpriteFrame::new(&rgba, 384, 416);
+        let size = (192, 208);
+        let old_key = view.raster_key(size);
+        view.raster = Some(CachedRaster::new(old_key, source));
+        let geometry = SpriteGeometry {
+            origin: Point::default(),
+            pixel_scale: 1.0,
+        };
+        let right_contact = Point { x: 15.5, y: 15.5 };
+        let left_contact = Point { x: 176.5, y: 15.5 };
+        assert!(
+            view.raster
+                .as_ref()
+                .unwrap()
+                .mask
+                .contact(right_contact, geometry)
+        );
+        view.scene_dirty = false;
+        view.set_facing(Facing::Left);
+        assert!(view.scene_dirty);
+        assert!(view.raster.is_none());
+        assert!(old_key != view.raster_key(size));
+        assert_eq!(view.player.animation(), Animation::RunningRight);
+        assert_eq!(view.player.frame_index(), frame);
+        assert_eq!(view.player.until_next_frame(&view.atlas), remaining);
+        assert_eq!(view.selection_index, selection);
+        assert_eq!(view.last_tick, tick);
+        assert_eq!(view.next_demo, demo);
+        assert_eq!(view.motion_clock.take(now), Some(Duration::ZERO));
+
+        let raster = CachedRaster::new(view.raster_key(size), source);
+        assert!(!raster.mask.contact(right_contact, geometry));
+        assert!(raster.mask.contact(left_contact, geometry));
+        let projection = bubble::SpriteProjection::new(size, false, 1.0);
+        assert_eq!(projection.bounds, (0, 0, 192, 208));
+        assert_eq!(layout_size(false, 1.0, 1.0), size);
+        assert_eq!(
+            foot_offset(size, 1.0, false, 1.0),
+            Some(Point { x: 96.0, y: 208.0 })
+        );
+        let oriented = source.with_facing(view.facing);
+        let mut painted = vec![0; 192 * 208 * 4];
+        bubble::Renderer::new(None, 12.0).compose(
+            &mut painted,
+            size,
+            oriented,
+            &view.latest_view,
+            None,
+            false,
+        );
+        for (index, pixel) in painted.chunks_exact(4).enumerate() {
+            let x = index % 192;
+            let y = index / 192;
+            let offset = projection.source_offset_for(oriented, x, y);
+            assert_eq!(pixel, &rgba[offset..offset + 4]);
+            assert_eq!(
+                raster.mask.contact(
+                    Point {
+                        x: x as f64 + 0.5,
+                        y: y as f64 + 0.5
+                    },
+                    geometry
+                ),
+                pixel[3] >= 32,
+            );
+        }
+        view.raster = Some(raster);
+        view.scene_dirty = false;
+        view.set_facing(Facing::Left);
+        assert!(!view.scene_dirty);
+        assert!(view.raster.is_some());
+        // Repair heading even when the requested running animation is unchanged.
+        view.prepare_running_pose(Facing::Right, Duration::ZERO);
+        assert_eq!(view.facing, Facing::Right);
+        assert_eq!(view.player.frame_index(), frame);
+        assert_eq!(view.player.until_next_frame(&view.atlas), remaining);
+        assert_eq!(view.last_tick, tick);
+    }
+
+    #[test]
+    fn initial_facing_is_stable_and_explicit_running_selection_overrides_it() {
+        let atlas = Arc::new(SpriteAtlas::load().unwrap());
+        for id in ["first", "second", "third"] {
+            for animation in [
+                Animation::Idle,
+                Animation::RunningLeft,
+                Animation::RunningRight,
+            ] {
+                let mut opts = options();
+                opts.animation = animation;
+                let mut view = FamiliarView::new(
+                    id.into(),
+                    character(DEFAULT_CHARACTER_ID).unwrap(),
+                    atlas.clone(),
+                    opts,
+                );
+                assert_eq!(view.facing, selected_facing(animation, initial_facing(id)));
+                view.select(Animation::RunningLeft);
+                view.select(Animation::Waving);
+                assert_eq!(view.facing, Facing::Left);
+                view.select(Animation::RunningRight);
+                view.select(Animation::Idle);
+                assert_eq!(view.facing, Facing::Right);
+            }
+        }
+    }
+
+    #[test]
+    fn corner_return_restores_explicit_running_heading_but_idle_keeps_travel_heading() {
+        for (animation, expected) in [
+            (Animation::RunningLeft, Facing::Left),
+            (Animation::RunningRight, Facing::Right),
+            (Animation::Idle, Facing::Left),
+        ] {
+            let mut view = test_view();
+            view.display.manual(animation);
+            view.select(animation);
+            injected_corner(&mut view, Instant::now());
+            let travel = if animation == Animation::RunningLeft {
+                Facing::Right
+            } else {
+                Facing::Left
+            };
+            view.prepare_running_pose(travel, Duration::ZERO);
+            view.apply_pursuit_step(PursuitStep::Arrived);
+            assert_eq!(view.player.animation(), animation);
+            assert_eq!(view.facing, expected);
+            assert!(view.display.is_manual());
+        }
+    }
+
+    #[test]
     fn occlusion_does_not_freeze_pursuit_contact_or_success_completion() {
         let mut view = test_view();
         let now = Instant::now();
@@ -5033,11 +5208,10 @@ mod tests {
         view.apply_pursuit_step(step);
         let frame = view
             .atlas
-            .frame(view.player.animation(), view.player.frame_index());
-        let index = frame
-            .chunks_exact(4)
-            .position(|rgba| rgba[3] >= 32)
-            .unwrap();
+            .frame(view.player.animation(), view.player.frame_index())
+            .with_facing(view.facing);
+        let alpha = bubble::SpriteProjection::new((192, 208), false, 1.0).alpha(frame);
+        let index = alpha.iter().position(|&alpha| alpha >= 32).unwrap();
         let cursor = Point {
             x: (index % 192) as f64 + 0.5,
             y: (index / 192) as f64 + 0.5,
@@ -5114,7 +5288,10 @@ mod tests {
             let raster = view.raster.as_ref().unwrap();
             assert_eq!(raster.key.animation, animation);
             assert_eq!(raster.key.frame, frame_index);
-            let current = view.atlas.frame(animation, frame_index);
+            let current = view
+                .atlas
+                .frame(animation, frame_index)
+                .with_facing(view.facing);
             let mut painted = vec![0; 192 * 208 * 4];
             bubble::Renderer::new(None, 12.0).compose(
                 &mut painted,
@@ -5202,10 +5379,11 @@ mod tests {
         let start = Instant::now();
         view.start_navigation(start);
         let frame = view.atlas.frame(Animation::RunningRight, 0);
-        let index = frame
-            .chunks_exact(4)
+        let alpha = bubble::SpriteProjection::new((192, 208), false, 1.0).alpha(frame);
+        let index = alpha
+            .iter()
             .enumerate()
-            .find(|(index, rgba)| index % 192 >= 96 && rgba[3] >= 32)
+            .find(|&(index, &alpha)| index % 192 >= 96 && alpha >= 32)
             .unwrap()
             .0;
         let cursor = Point {
@@ -5235,7 +5413,8 @@ mod tests {
             &mut painted,
             (192, 208),
             view.atlas
-                .frame(view.player.animation(), view.player.frame_index()),
+                .frame(view.player.animation(), view.player.frame_index())
+                .with_facing(view.facing),
             &view.latest_view,
             None,
             false,
@@ -5374,6 +5553,7 @@ mod tests {
         view.source_animation(source(ActivityState::Succeeded, Some(10)));
         assert_eq!(view.player.animation(), Animation::RunningLeft);
         view.apply_pursuit_step(PursuitStep::Arrived);
+        assert_eq!(view.facing, Facing::Left);
         view.advance_animation(Duration::from_millis(1));
         let remaining = view.player.until_next_frame(&view.atlas);
         view.apply_pursuit_step(PursuitStep::Arrived);
@@ -5385,8 +5565,13 @@ mod tests {
         finish_clip(&mut view);
         assert!(view.navigation.is_none());
         assert_eq!(view.player.animation(), Animation::Waiting);
+        assert_eq!(view.facing, Facing::Left);
         view.source_animation(source(ActivityState::Succeeded, Some(10)));
         assert_eq!(view.player.animation(), Animation::Idle);
+        assert_eq!(view.facing, Facing::Left);
+        view.source_animation(source(ActivityState::Working, None));
+        assert_eq!(view.player.animation(), Animation::Working);
+        assert_eq!(view.facing, Facing::Left);
     }
 
     #[test]
@@ -5401,6 +5586,7 @@ mod tests {
         view.apply_pursuit_step(step);
         view.advance_animation(Duration::from_millis(1));
         let remaining = view.player.until_next_frame(&view.atlas);
+        view.prepare_running_pose(Facing::Right, Duration::ZERO);
         view.apply_pursuit_step(step);
         assert_eq!(view.player.until_next_frame(&view.atlas), remaining);
         view.prepare_running_pose(Facing::Left, Duration::ZERO);
@@ -5639,6 +5825,7 @@ mod tests {
                 }
             );
             assert_eq!(view.display.is_manual(), manual);
+            assert_eq!(view.facing, Facing::Left);
         }
     }
 
@@ -6427,10 +6614,11 @@ mod tests {
         .unwrap();
         assert!(view.raster.is_none());
         let frame = view.atlas.frame(Animation::RunningRight, frame_index);
-        let index = frame
-            .chunks_exact(4)
+        let alpha = bubble::SpriteProjection::new((192, 208), false, 1.0).alpha(frame);
+        let index = alpha
+            .iter()
             .enumerate()
-            .find(|(index, rgba)| index % 192 >= 96 && rgba[3] >= 32)
+            .find(|&(index, &alpha)| index % 192 >= 96 && alpha >= 32)
             .unwrap()
             .0;
         let cursor = Point {

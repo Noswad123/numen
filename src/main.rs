@@ -8,8 +8,9 @@ mod bubble_layout;
 mod build_info;
 mod chat;
 mod context_menu;
+mod corner;
 mod desktop;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod desktop_scene;
 mod diagnostics;
 mod display;
@@ -26,6 +27,9 @@ mod pointer;
 mod pointer_menu;
 mod preferences;
 mod protocol;
+#[cfg(any(target_os = "linux", test))]
+mod raster;
+mod sprite;
 mod typography;
 mod visibility;
 mod window;
@@ -158,7 +162,7 @@ pub struct RunOptions {
     /// Scale the whole scene; sprite size can be adjusted separately with --sprite-scale.
     #[arg(long, default_value = "1.5", value_parser = parse_scale)]
     scale: f64,
-    /// Go-to-mouse movement speed in desktop points per second.
+    /// Movement speed for Go to mouse and corner travel, in logical desktop units per second.
     #[arg(long, default_value = "360", value_parser = parse_move_speed)]
     move_speed: f64,
     /// Cycle through every expression automatically, three seconds per selection.
@@ -786,8 +790,9 @@ fn main() -> Result<()> {
             for character in CHARACTERS {
                 let atlas = SpriteAtlas::load_character(character.id)
                     .with_context(|| format!("cannot load {} runtime assets", character.name))?;
+                let (source_width, source_height) = atlas.source_cell_size();
                 println!(
-                    "{} ({}): validated embedded RGBA atlas; {CELL_WIDTH} × {CELL_HEIGHT} cells",
+                    "{} ({}): validated embedded RGBA atlas; {source_width} × {source_height} source cells; {CELL_WIDTH} × {CELL_HEIGHT} logical units",
                     character.name, character.id
                 );
                 for animation in Animation::ALL {

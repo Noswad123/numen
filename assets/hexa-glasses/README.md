@@ -1,5 +1,30 @@
 # Saphire runtime assets
 
+## Active HD Source
+
+The active sheet is promoted from owner-approved
+`artwork/upscaled-2x/saphire/spritesheet.png`: 3072 x 4576 RGBA,
+8 x 11 cells of 384 x 416, with logical size still 192 x 208.
+Retired row 2 is RGBA zero. All 65 occupied cells, including gaze rows 9/10,
+receive boundary-only solid `contour` V2 ink plus a smooth alpha curve. The owner
+requested crisper black edges; the assistant selected this recipe after preview
+and main reviewed it. Qualified ink with baseline alpha>=128 becomes fully opaque
+black; other pixels keep the alpha LUT, including antialiased outer fringes.
+Opaque interior fills beyond the one-pixel boundary band are byte-identical;
+the entire alpha-128 coverage mask is unchanged. Internal blackhat was rejected.
+`running-left` aliases `running-right`, mirrored once at painting; timings,
+registration and all row indices are unchanged. Current hashes and per-cell
+audits are in `artwork/edge-refinement/applied.json`; historical baseline evidence
+is in `artwork/hd-promotion/report.json`. Neural provenance remains untouched.
+Original manifests/import history remain in `artwork/original-1x/saphire/`;
+the old 1x PNG was owner-authorized for removal, with its SHA/path retained in
+`artwork/hd-promotion/original-removal.json`.
+
+## Original 1x Import History
+
+The details below describe the historical original, no longer bundled as a PNG,
+not the active HD derivative. Original metadata and SHA records are retained.
+
 Saphire (`saphire`) is an owner-supplied/generated character in
 Numen's embedded catalog. Character identity is independent of activity source IDs.
 

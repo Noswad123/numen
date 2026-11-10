@@ -1,4 +1,5 @@
 //! Pure software conversion and logical-coordinate helpers, also testable with rustc.
+use crate::raster::RasterSpec;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Mutex,
@@ -95,17 +96,6 @@ pub fn framebuffer_fits((width, height): (u32, u32)) -> bool {
         && u64::from(width) * u64::from(height) <= 16 * 1024 * 1024
 }
 
-/// Reduce density, never logical geometry, before allocating either surface.
-pub fn raster_scale(requested: i32, sprite: (u32, u32), bubble: (u32, u32)) -> Option<i32> {
-    (1..=requested.clamp(1, 8192)).rev().find(|&scale| {
-        [sprite, bubble].into_iter().all(|(w, h)| {
-            w.checked_mul(scale as u32)
-                .zip(h.checked_mul(scale as u32))
-                .is_some_and(framebuffer_fits)
-        })
-    })
-}
-
 /// Immutable emergency cursor when neither cursor-shape nor an installed theme works.
 pub fn fallback_cursor() -> Vec<u8> {
     let mut rgba = vec![0; 16 * 24 * 4];
@@ -139,29 +129,19 @@ pub fn write_argb(rgba: &[u8], canvas: &mut [u8], opaque: bool) {
 
 /// Project actual nonzero framebuffer alpha to logical cells, then merge equal
 /// horizontal runs vertically. Diagnostic black fill is deliberately excluded.
-pub fn input_rectangles(
-    rgba: &[u8],
-    physical: (u32, u32),
-    scale: u32,
-) -> Vec<(i32, i32, i32, i32)> {
-    if scale == 0
-        || physical.0 == 0
-        || physical.1 == 0
-        || !physical.0.is_multiple_of(scale)
-        || !physical.1.is_multiple_of(scale)
-        || physical.0 > i32::MAX as u32
-        || physical.1 > i32::MAX as u32
-        || u64::from(physical.0) * u64::from(physical.1) * 4 != rgba.len() as u64
-    {
+pub fn input_rectangles(rgba: &[u8], raster: RasterSpec) -> Vec<(i32, i32, i32, i32)> {
+    let physical = raster.physical_size();
+    if u64::from(physical.0) * u64::from(physical.1) * 4 != rgba.len() as u64 {
         return Vec::new();
     }
-    let (width, height) = (physical.0 / scale, physical.1 / scale);
+    let (width, height) = raster.logical_size();
     let mut result: Vec<(i32, i32, i32, i32)> = Vec::new();
     let mut previous: BTreeMap<(u32, u32), usize> = BTreeMap::new();
     for y in 0..height {
         let filled = |x: u32| {
-            (y * scale..(y + 1) * scale).any(|py| {
-                (x * scale..(x + 1) * scale)
+            let (px, py, w, h) = raster.covering_buffer_rect((x, y, 1, 1));
+            (py..py + h).any(|py| {
+                (px..px + w)
                     .any(|px| rgba[(py as usize * physical.0 as usize + px as usize) * 4 + 3] != 0)
             })
         };
@@ -256,21 +236,37 @@ mod tests {
 
     #[test]
     fn maximum_valid_scene_geometry_fits_outputs_one_through_eight_without_resizing() {
+        use crate::raster::{Density, RasterMode};
         let sprite = (1536, 1664);
         let bubble = (1536, 576);
         for output_scale in 1..=8 {
-            let density = raster_scale(output_scale, sprite, bubble).unwrap() as u32;
-            assert!(density >= 1 && density <= output_scale as u32);
             for size in [sprite, bubble] {
-                let physical = (size.0 * density, size.1 * density);
-                assert!(framebuffer_fits(physical));
-                assert_eq!((physical.0 / density, physical.1 / density), size);
+                let raster = RasterSpec::fit(
+                    size,
+                    Density::from_integer(output_scale),
+                    RasterMode::IntegerBufferScale,
+                )
+                .unwrap();
+                assert!(framebuffer_fits(raster.physical_size()));
+                assert_eq!(raster.logical_size(), size);
+                assert!(raster.density().as_f64() >= 1.0);
+                assert!(raster.density().as_f64() <= f64::from(output_scale));
             }
-            assert_eq!(density, output_scale.min(2) as u32);
         }
-        assert_eq!(raster_scale(8, (96, 104), (4096, 4096)), Some(1));
-        assert_eq!(raster_scale(i32::MAX, sprite, bubble), Some(2));
-        assert_eq!(raster_scale(8, (8193, 1), bubble), None);
+        let plan = |size| {
+            RasterSpec::fit(
+                size,
+                Density::from_integer(8),
+                RasterMode::IntegerBufferScale,
+            )
+        };
+        assert_eq!(plan(sprite).unwrap().density().as_f64(), 2.0);
+        assert!(
+            plan(bubble).unwrap().density().as_f64() > 2.0,
+            "large sprite must not degrade the bubble raster"
+        );
+        assert_eq!(plan((4096, 4096)).unwrap().density(), Density::ONE);
+        assert!(plan((8193, 1)).is_none());
     }
 
     #[test]
@@ -365,14 +361,17 @@ mod tests {
             rgba[(y * 8 + x) * 4 + 3] = 1;
         }
         assert_eq!(
-            input_rectangles(&rgba, (8, 6), 2),
+            input_rectangles(&rgba, RasterSpec::from_sizes((4, 3), (8, 6)).unwrap()),
             vec![(1, 0, 1, 2), (3, 2, 1, 1)]
         );
-        let before = input_rectangles(&rgba, (8, 6), 2);
+        let raster = RasterSpec::from_sizes((4, 3), (8, 6)).unwrap();
+        let before = input_rectangles(&rgba, raster);
         let mut diagnostic = vec![0; rgba.len()];
         write_argb(&rgba, &mut diagnostic, true);
-        assert_eq!(input_rectangles(&rgba, (8, 6), 2), before);
-        assert!(input_rectangles(&[0; 64], (4, 4), 1).is_empty());
+        assert_eq!(input_rectangles(&rgba, raster), before);
+        assert!(
+            input_rectangles(&[0; 64], RasterSpec::from_sizes((4, 4), (4, 4)).unwrap()).is_empty()
+        );
     }
 
     #[test]
@@ -388,7 +387,8 @@ mod tests {
                         rgba[((y * physical.0 + x) * 4 + 3) as usize] = 1;
                     }
                 }
-                let rectangles = input_rectangles(&rgba, physical, scale);
+                let rectangles =
+                    input_rectangles(&rgba, RasterSpec::from_sizes((3, 3), physical).unwrap());
                 for cell in 0..9 {
                     let (x, y) = (cell % 3, cell / 3);
                     let coverage = rectangles
@@ -399,7 +399,65 @@ mod tests {
                 }
             }
         }
-        assert!(input_rectangles(&[], (0, i32::MAX as u32), 1).is_empty());
+        assert!(input_rectangles(&[], RasterSpec::from_sizes((1, 1), (1, 1)).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn fractional_alpha_matches_independent_rational_overlap_oracle() {
+        use crate::raster::{Density, RasterMode};
+
+        for logical in [(7, 5), (101, 79)] {
+            for units in [120, 150, 180, 210, 240] {
+                let raster = RasterSpec::fit(
+                    logical,
+                    Density::from_preferred_scale(units).unwrap(),
+                    RasterMode::ViewportDestination,
+                )
+                .unwrap();
+                let (pw, ph) = raster.physical_size();
+                // Include edge pixels, low alpha, and a sparse asymmetric interior.
+                let pixels: Vec<_> = (0..ph)
+                    .flat_map(|py| (0..pw).map(move |px| (px, py)))
+                    .filter(|&(px, py)| {
+                        (px * 13 + py * 7) % 211 == 0 || (px == pw - 1 && py == ph - 1)
+                    })
+                    .collect();
+                let mut rgba = vec![0; (pw * ph * 4) as usize];
+                for &(px, py) in &pixels {
+                    rgba[((py * pw + px) * 4 + 3) as usize] = 1;
+                }
+                let rects = input_rectangles(&rgba, raster);
+                for y in 0..logical.1 {
+                    for x in 0..logical.0 {
+                        // Strict inequalities exclude boundary-only contact.
+                        // This oracle uses no raster projection helpers.
+                        let expected = pixels.iter().any(|&(px, py)| {
+                            u64::from(px) * u64::from(logical.0) < u64::from(x + 1) * u64::from(pw)
+                                && u64::from(px + 1) * u64::from(logical.0)
+                                    > u64::from(x) * u64::from(pw)
+                                && u64::from(py) * u64::from(logical.1)
+                                    < u64::from(y + 1) * u64::from(ph)
+                                && u64::from(py + 1) * u64::from(logical.1)
+                                    > u64::from(y) * u64::from(ph)
+                        });
+                        let coverage = rects
+                            .iter()
+                            .filter(|&&(rx, ry, w, h)| {
+                                x as i32 >= rx
+                                    && (x as i32) < rx + w
+                                    && y as i32 >= ry
+                                    && (y as i32) < ry + h
+                            })
+                            .count();
+                        assert_eq!(
+                            coverage,
+                            usize::from(expected),
+                            "{logical:?} {units} ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -566,9 +624,9 @@ mod tests {
             initial_origin(Some((i32::MIN, i32::MIN)), (u32::MAX, u32::MAX), 0),
             (0, 0)
         );
-        assert!(input_rectangles(&[0; 64], (4, 4), 0).is_empty());
-        assert!(input_rectangles(&[0; 64], (4, 4), 3).is_empty());
-        assert!(input_rectangles(&[0; 63], (4, 4), 1).is_empty());
+        let raster = RasterSpec::from_sizes((4, 4), (4, 4)).unwrap();
+        assert!(input_rectangles(&[0; 63], raster).is_empty());
+        assert!(input_rectangles(&[0; 65], raster).is_empty());
     }
 
     #[test]

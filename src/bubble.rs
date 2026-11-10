@@ -1,7 +1,8 @@
 //! CPU thought bubble with display-density text. Text is always producer metadata.
 
 use crate::{
-    activity::Presentation, animation::Animation, protocol::ActivityState, typography::Typeface,
+    activity::Presentation, animation::Animation, protocol::ActivityState, sprite::SpriteFrame,
+    typography::Typeface,
 };
 
 const SPRITE_WIDTH: usize = 192;
@@ -139,22 +140,27 @@ impl SpriteProjection {
     }
 
     /// Coordinates must be inside `bounds`. Returns a source RGBA byte offset.
-    pub fn source_offset(&self, x: usize, y: usize) -> usize {
-        let sx = ((((x as f32 + 0.5 - self.canvas.x) / self.canvas.scale - self.left)
-            / self.sprite_scale)
-            .floor() as usize)
-            .min(SPRITE_WIDTH - 1);
-        let sy = ((((y as f32 + 0.5 - self.canvas.y) / self.canvas.scale - self.top)
-            / self.sprite_scale)
-            .floor() as usize)
-            .min(SPRITE_HEIGHT - 1);
-        (sy * SPRITE_WIDTH + sx) * 4
+    pub fn source_offset_for(&self, source: SpriteFrame<'_>, x: usize, y: usize) -> usize {
+        let (u, v) = self.source_position(x, y);
+        source.source_offset(u, v)
     }
 
-    pub fn alpha(&self, sprite: &[u8]) -> Vec<u8> {
+    fn source_position(&self, x: usize, y: usize) -> (f64, f64) {
+        (
+            ((x as f64 + 0.5 - f64::from(self.canvas.x)) / f64::from(self.canvas.scale)
+                - f64::from(self.left))
+                / (f64::from(self.sprite_scale) * SPRITE_WIDTH as f64),
+            ((y as f64 + 0.5 - f64::from(self.canvas.y)) / f64::from(self.canvas.scale)
+                - f64::from(self.top))
+                / (f64::from(self.sprite_scale) * SPRITE_HEIGHT as f64),
+        )
+    }
+
+    pub fn alpha<'a>(&self, sprite: impl Into<SpriteFrame<'a>>) -> Vec<u8> {
+        let sprite = sprite.into();
         let (x0, y0, x1, y1) = self.bounds;
         (y0..y1)
-            .flat_map(|y| (x0..x1).map(move |x| sprite[self.source_offset(x, y) + 3]))
+            .flat_map(|y| (x0..x1).map(move |x| sprite[self.source_offset_for(sprite, x, y) + 3]))
             .collect()
     }
 }
@@ -190,17 +196,17 @@ impl Renderer {
     }
 
     /// `size` is the physical framebuffer size, not the logical window size.
-    pub fn compose(
+    pub fn compose<'a>(
         &mut self,
         frame: &mut [u8],
         size: (u32, u32),
-        sprite: &[u8],
+        sprite: impl Into<SpriteFrame<'a>>,
         view: &Presentation,
         preview: Option<Animation>,
         show: bool,
     ) {
         assert_eq!(frame.len(), size.0 as usize * size.1 as usize * 4);
-        assert_eq!(sprite.len(), SPRITE_WIDTH * SPRITE_HEIGHT * 4);
+        let sprite = sprite.into();
         frame.fill(0);
         if size.0 == 0 || size.1 == 0 {
             return;
@@ -212,10 +218,15 @@ impl Renderer {
         self.paint_sprite(frame, size, sprite, show);
     }
 
-    #[cfg(any(target_os = "linux", test))]
-    pub fn compose_sprite(&mut self, frame: &mut [u8], size: (u32, u32), sprite: &[u8]) {
+    #[cfg(test)]
+    pub fn compose_sprite<'a>(
+        &mut self,
+        frame: &mut [u8],
+        size: (u32, u32),
+        sprite: impl Into<SpriteFrame<'a>>,
+    ) {
         assert_eq!(frame.len(), size.0 as usize * size.1 as usize * 4);
-        assert_eq!(sprite.len(), SPRITE_WIDTH * SPRITE_HEIGHT * 4);
+        let sprite = sprite.into();
         frame.fill(0);
         if size.0 != 0 && size.1 != 0 {
             self.paint_sprite(frame, size, sprite, false);
@@ -243,7 +254,7 @@ impl Renderer {
     }
 
     /// Reflow in scene units; only display density and scene scale affect glyph size.
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     pub fn compose_bubble_layout(
         &mut self,
         frame: &mut [u8],
@@ -251,6 +262,38 @@ impl Renderer {
         layout: crate::bubble_layout::BubbleLayout,
         scene_scale: f64,
         content: (&Presentation, Option<Animation>),
+    ) {
+        self.compose_bubble_mapped(frame, size, layout, scene_scale, content, None);
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn compose_bubble_raster(
+        &mut self,
+        frame: &mut [u8],
+        raster: crate::raster::RasterSpec,
+        layout: crate::bubble_layout::BubbleLayout,
+        scene_scale: f64,
+        content: (&Presentation, Option<Animation>),
+    ) {
+        self.compose_bubble_mapped(
+            frame,
+            raster.physical_size(),
+            layout,
+            scene_scale,
+            content,
+            Some(raster),
+        );
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn compose_bubble_mapped(
+        &mut self,
+        frame: &mut [u8],
+        size: (u32, u32),
+        layout: crate::bubble_layout::BubbleLayout,
+        scene_scale: f64,
+        content: (&Presentation, Option<Animation>),
+        raster: Option<crate::raster::RasterSpec>,
     ) {
         use crate::bubble_layout::TailEdge;
         assert_eq!(frame.len(), size.0 as usize * size.1 as usize * 4);
@@ -264,8 +307,12 @@ impl Renderer {
         {
             return;
         }
-        let density = (size.0 / layout.size.0).min(size.1 / layout.size.1);
-        let scale = scene_scale as f32 * density as f32;
+        let scale = if raster.is_some() {
+            1.0
+        } else {
+            let density = (size.0 / layout.size.0).min(size.1 / layout.size.1);
+            scene_scale as f32 * density as f32
+        };
         if !scale.is_finite() || scale <= 0.0 {
             return;
         }
@@ -282,6 +329,7 @@ impl Renderer {
             x: 0.0,
             y: 0.0,
             content_clip: None,
+            raster: raster.map(|r| (r, scene_scale)),
         };
         let tail = layout.tail.filter(|_| width >= 32.0 && height >= 32.0);
         let (mut left, mut top, mut right, mut bottom) = (4.0, 4.0, width - 4.0, height - 4.0);
@@ -366,6 +414,7 @@ impl Renderer {
         let (above, below) = ink_extents(face, &identity, px);
         let (status_above, status_below) = ink_extents(face, &status, px);
         let gap = 3.0 * scale;
+        let mut text_runs = Vec::new();
         // Status is essential; summary and identity use only the remaining space.
         if bottom - top >= status_above + status_below {
             let accent = match content
@@ -389,18 +438,11 @@ impl Renderer {
                 2.0,
                 accent,
             );
-            canvas.paint_text(
-                frame,
-                face,
-                (left, bottom - status_below),
-                &status,
-                px,
-                accent,
-            );
+            text_runs.push(((left, bottom - status_below), status, accent));
             bottom -= status_above + status_below + gap;
         }
         if bottom - top >= above + below + gap + line_height {
-            canvas.paint_text(frame, face, (left, top + above), &identity, px, MUTED);
+            text_runs.push(((left, top + above), identity, MUTED));
             top += above + below + gap;
         }
         let lines = ((bottom - top) / line_height).floor().clamp(0.0, 3.0) as usize;
@@ -408,14 +450,14 @@ impl Renderer {
             .iter()
             .enumerate()
         {
-            canvas.paint_text(
-                frame,
-                face,
+            text_runs.push((
                 (left, top + index as f32 * line_height + metrics.ascent),
-                line,
-                px,
+                line.clone(),
                 INK,
-            );
+            ));
+        }
+        for (origin, value, color) in text_runs {
+            canvas.paint_text(frame, face, origin, &value, px, color);
         }
     }
 
@@ -500,17 +542,104 @@ impl Renderer {
         }
     }
 
-    fn paint_sprite(&self, frame: &mut [u8], size: (u32, u32), sprite: &[u8], show: bool) {
+    fn paint_sprite(
+        &self,
+        frame: &mut [u8],
+        size: (u32, u32),
+        sprite: SpriteFrame<'_>,
+        show: bool,
+    ) {
         // Only the artwork is nearest-resampled. Copy straight RGBA, including hidden RGB.
         let projection = SpriteProjection::new(size, show, self.sprite_scale);
         let (x0, y0, x1, y1) = projection.bounds;
         for y in y0..y1 {
             for x in x0..x1 {
-                let source = projection.source_offset(x, y);
+                let source = projection.source_offset_for(sprite, x, y);
                 let target = (y * size.0 as usize + x) * 4;
                 frame[target..target + 4].copy_from_slice(&sprite[source..source + 4]);
             }
         }
+    }
+}
+
+/// Layout advances stay logical; only glyph coverage uses the effective density.
+#[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_raster_text(
+    frame: &mut [u8],
+    face: &mut Typeface,
+    raster: crate::raster::RasterSpec,
+    scene_scale: f64,
+    (mut pen, baseline): (f32, f32),
+    value: &str,
+    logical_px: f32,
+    color: [u8; 4],
+    clip: (f32, f32, f32, f32),
+) {
+    let density = raster.density().as_f64() * scene_scale;
+    let px = (f64::from(logical_px) * density) as f32;
+    let canvas = Canvas {
+        size: raster.physical_size(),
+        scale: 1.0,
+        x: 0.0,
+        y: 0.0,
+        content_clip: None,
+        raster: Some((raster, scene_scale)),
+    };
+    let (cx0, cy0, cx1, cy1) = canvas.bounds(clip);
+    // Raster bounds may extend a fraction beyond logical ink metrics. Keep the
+    // full vertical ink inside its clip without feeding hinting back into layout.
+    let (above, below) = ink_extents(face, value, px);
+    let minimum = f64::from(clip.1) + f64::from(above) / density;
+    let maximum = f64::from(clip.1 + clip.3) - f64::from(below) / density;
+    let baseline = if minimum <= maximum {
+        f64::from(baseline).clamp(minimum, maximum)
+    } else {
+        f64::from(baseline)
+    };
+    let mut previous = None;
+    for c in value.chars() {
+        pen += previous.map_or(0.0, |p| face.kern(p, c, logical_px));
+        let mut bytes = [0; 4];
+        let advance = face.measure(c.encode_utf8(&mut bytes), logical_px);
+        let glyph = face.glyph(c, px);
+        let m = &glyph.metrics;
+        let left = f64::from(pen) + f64::from(m.xmin) / density;
+        let top = baseline - (m.ymin as f64 + m.height as f64) / density;
+        let rect = (
+            left as f32,
+            top as f32,
+            (m.width as f64 / density) as f32,
+            (m.height as f64 / density) as f32,
+        );
+        let (x0, y0, x1, y1) = canvas.bounds(rect);
+        for y in y0.max(cy0)..y1.min(cy1) {
+            for x in x0.max(cx0)..x1.min(cx1) {
+                let (lx, ly) = raster.buffer_to_logical((x as f64 + 0.5, y as f64 + 0.5));
+                let column = (((lx / scene_scale - left) * density).floor() as usize)
+                    .min(m.width.saturating_sub(1));
+                let row = (((ly / scene_scale - top) * density).floor() as usize)
+                    .min(m.height.saturating_sub(1));
+                let alpha =
+                    u32::from(glyph.coverage[row * m.width + column]) * u32::from(color[3]) / 255;
+                if alpha == 0 {
+                    continue;
+                }
+                let offset = (y * raster.physical_size().0 as usize + x) * 4;
+                let dest = &mut frame[offset..offset + 4];
+                let da = u32::from(dest[3]);
+                let denominator = alpha * 255 + da * (255 - alpha);
+                for channel in 0..3 {
+                    dest[channel] = ((u32::from(color[channel]) * alpha * 255
+                        + u32::from(dest[channel]) * da * (255 - alpha)
+                        + denominator / 2)
+                        / denominator) as u8;
+                }
+                dest[3] = ((denominator + 127) / 255) as u8;
+            }
+        }
+        pen += advance;
+        previous = Some(c);
     }
 }
 
@@ -617,6 +746,8 @@ struct Canvas {
     x: f32,
     y: f32,
     content_clip: Option<(f32, f32, f32, f32)>,
+    #[cfg(any(target_os = "linux", test))]
+    raster: Option<(crate::raster::RasterSpec, f64)>,
 }
 
 impl Canvas {
@@ -632,12 +763,28 @@ impl Canvas {
             x: (size.0 as f32 - logical.0 as f32 * scale) / 2.0,
             y: (size.1 as f32 - logical.1 as f32 * scale) / 2.0,
             content_clip: None,
+            #[cfg(any(target_os = "linux", test))]
+            raster: None,
         }
     }
 
     fn bounds(&self, (x, y, w, h): (f32, f32, f32, f32)) -> (usize, usize, usize, usize) {
         // Pixel centers determine inclusion, including at fractional display scales.
         let edge = |v: f32, max: u32| (v - 0.5).ceil().clamp(0.0, max as f32) as usize;
+        #[cfg(any(target_os = "linux", test))]
+        if let Some((raster, scale)) = self.raster {
+            let (left, top) =
+                raster.logical_to_buffer((f64::from(x) * scale, f64::from(y) * scale));
+            let (right, bottom) =
+                raster.logical_to_buffer((f64::from(x + w) * scale, f64::from(y + h) * scale));
+            let edge = |v: f64, max: u32| (v - 0.5).ceil().clamp(0.0, f64::from(max)) as usize;
+            return (
+                edge(left, self.size.0),
+                edge(top, self.size.1),
+                edge(right, self.size.0),
+                edge(bottom, self.size.1),
+            );
+        }
         (
             edge(self.x + x * self.scale, self.size.0),
             edge(self.y + y * self.scale, self.size.1),
@@ -648,13 +795,37 @@ impl Canvas {
 
     fn rounded(&self, frame: &mut [u8], rect: (f32, f32, f32, f32), radius: f32, color: [u8; 4]) {
         let (left, top, width, height) = rect;
+        if ![left, top, width, height, radius]
+            .iter()
+            .all(|v| v.is_finite())
+            || width <= 0.0
+            || height <= 0.0
+        {
+            return;
+        }
+        let radius = radius.max(0.0).min(width / 2.0).min(height / 2.0);
+        // At a circular tail dot, the two centers are mathematically equal.
+        // Different f32 addition order can invert them by an ULP as it moves.
+        let min_x = left + radius;
+        let max_x = (left + width - radius).max(min_x);
+        let min_y = top + radius;
+        let max_y = (top + height - radius).max(min_y);
         let (x0, y0, x1, y1) = self.bounds(rect);
         for y in y0..y1 {
             for x in x0..x1 {
-                let lx = (x as f32 + 0.5 - self.x) / self.scale;
-                let ly = (y as f32 + 0.5 - self.y) / self.scale;
-                let cx = lx.clamp(left + radius, left + width - radius);
-                let cy = ly.clamp(top + radius, top + height - radius);
+                let (lx, ly) = (
+                    (x as f32 + 0.5 - self.x) / self.scale,
+                    (y as f32 + 0.5 - self.y) / self.scale,
+                );
+                #[cfg(any(target_os = "linux", test))]
+                let (lx, ly) = if let Some((raster, scale)) = self.raster {
+                    let (lx, ly) = raster.buffer_to_logical((x as f64 + 0.5, y as f64 + 0.5));
+                    ((lx / scale) as f32, (ly / scale) as f32)
+                } else {
+                    (lx, ly)
+                };
+                let cx = lx.clamp(min_x, max_x);
+                let cy = ly.clamp(min_y, max_y);
                 if (lx - cx).powi(2) + (ly - cy).powi(2) <= radius * radius {
                     let offset = (y * self.size.0 as usize + x) * 4;
                     frame[offset..offset + 4].copy_from_slice(&color);
@@ -672,6 +843,21 @@ impl Canvas {
         px: f32,
         color: [u8; 4],
     ) {
+        #[cfg(any(target_os = "linux", test))]
+        if let Some((raster, scale)) = self.raster {
+            paint_raster_text(
+                frame,
+                face,
+                raster,
+                scale,
+                (pen, baseline),
+                value,
+                px,
+                color,
+                self.content_clip.unwrap_or((16.0, 12.0, 352.0, 108.0)),
+            );
+            return;
+        }
         let (x0, y0, x1, y1) = self.bounds(self.content_clip.unwrap_or((16.0, 12.0, 352.0, 108.0)));
         let mut previous = None;
         for c in value.chars() {
@@ -719,6 +905,288 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hd_facings_sample_rgb_and_contact_alpha_without_flipping_bubbles() {
+        use crate::motion::Facing;
+        let rgba: Vec<u8> = (0..416)
+            .flat_map(|y| {
+                (0..384).flat_map(move |x| {
+                    [x as u8, y as u8, (x * 17 + y * 31) as u8, (x + y * 7) as u8]
+                })
+            })
+            .collect();
+        let source = SpriteFrame::new(&rgba, 384, 416);
+        let face = Typeface::bundled().unwrap();
+        for density in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            for scale in [0.5, 0.713, 1.0] {
+                for show in [false, true] {
+                    let logical = dimensions(show, scale);
+                    // Extra width exercises letterboxing as well as fractional density.
+                    let size = (
+                        (logical.0 as f32 * density).ceil() as u32 + 13,
+                        (logical.1 as f32 * density).ceil() as u32,
+                    );
+                    let projection = SpriteProjection::new(size, show, scale);
+                    let (x0, y0, x1, y1) = projection.bounds;
+                    let mut painted = Vec::new();
+                    for facing in [Facing::Left, Facing::Right] {
+                        let sprite = source.with_facing(facing);
+                        let mut frame = vec![99; size.0 as usize * size.1 as usize * 4];
+                        Renderer::new(Some(face.fork()), 12.0)
+                            .with_sprite_scale(scale)
+                            .compose(
+                                &mut frame,
+                                size,
+                                sprite,
+                                &Presentation::default(),
+                                None,
+                                show,
+                            );
+                        let alpha = projection.alpha(sprite);
+                        // Independent destination-to-source oracle; do not use projection sampling.
+                        let canvas_scale = (size.0 as f32 / logical.0 as f32)
+                            .min(size.1 as f32 / logical.1 as f32);
+                        let ox = (size.0 as f32 - logical.0 as f32 * canvas_scale) / 2.0;
+                        let oy = (size.1 as f32 - logical.1 as f32 * canvas_scale) / 2.0;
+                        let left = if show {
+                            (384.0 - 192.0 * scale) / 2.0
+                        } else {
+                            0.0
+                        };
+                        let top = if show { 144.0 } else { 0.0 };
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                let lx = (x as f64 + 0.5 - f64::from(ox)) / f64::from(canvas_scale);
+                                let ly = (y as f64 + 0.5 - f64::from(oy)) / f64::from(canvas_scale);
+                                let sx = (((lx - f64::from(left)) / (192.0 * f64::from(scale))
+                                    * 384.0)
+                                    .floor() as usize)
+                                    .min(383);
+                                let sx = if facing == Facing::Left { 383 - sx } else { sx };
+                                let sy = (((ly - top) / (208.0 * f64::from(scale)) * 416.0).floor()
+                                    as usize)
+                                    .min(415);
+                                let expected = (sy * 384 + sx) * 4;
+                                let target = (y * size.0 as usize + x) * 4;
+                                assert_eq!(
+                                    &frame[target..target + 4],
+                                    &rgba[expected..expected + 4]
+                                );
+                                assert_eq!(
+                                    alpha[(y - y0) * (x1 - x0) + x - x0],
+                                    rgba[expected + 3]
+                                );
+                                assert_eq!(projection.source_offset_for(sprite, x, y), expected);
+                            }
+                        }
+                        painted.push(frame);
+                    }
+                    assert_ne!(painted[0], painted[1]);
+                    if show {
+                        let bubble_end = y0 * size.0 as usize * 4;
+                        assert_eq!(painted[0][..bubble_end], painted[1][..bubble_end]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_raster_axes_text_clips_and_logical_wraps() {
+        use crate::raster::{Density, RasterMode, RasterSpec};
+        let mut face = Typeface::bundled().unwrap();
+        let logical = (301, 149);
+        let layout = crate::bubble_layout::BubbleLayout {
+            origin: (0, 0),
+            size: logical,
+            tail: None,
+        };
+        let mut presentation = view(ActivityState::Waiting, true);
+        presentation.following.as_mut().unwrap().summary = Some("word ".repeat(90));
+        let expected = wrap(&face, &text(&presentation, None).summary, 12.0, 269.0, 3);
+        assert!(expected[2].ends_with('\u{2026}'));
+        for units in [120, 150, 180, 210, 240] {
+            let raster = RasterSpec::fit(
+                logical,
+                Density::from_preferred_scale(units).unwrap(),
+                RasterMode::ViewportDestination,
+            )
+            .unwrap();
+            let size = raster.physical_size();
+            let mut actual = vec![99; size.0 as usize * size.1 as usize * 4];
+            let mut blank = actual.clone();
+            Renderer::new(Some(face.fork()), 12.0).compose_bubble_raster(
+                &mut actual,
+                raster,
+                layout,
+                1.0,
+                (&presentation, None),
+            );
+            Renderer::new(None, 12.0).compose_bubble_raster(
+                &mut blank,
+                raster,
+                layout,
+                1.0,
+                (&presentation, None),
+            );
+            let canvas = Canvas {
+                size,
+                scale: 1.0,
+                x: 0.0,
+                y: 0.0,
+                content_clip: None,
+                raster: Some((raster, 1.0)),
+            };
+            let (x0, y0, x1, y1) = canvas.bounds((16.0, 12.0, 269.0, 125.0));
+            let mut ink = 0;
+            for y in 0..size.1 as usize {
+                for x in 0..size.0 as usize {
+                    let offset = (y * size.0 as usize + x) * 4;
+                    if actual[offset..offset + 4] != blank[offset..offset + 4]
+                        && actual[offset..offset + 4] != MUTED
+                    {
+                        // The small status accent is outside the text clip.
+                        if x >= x0 {
+                            assert!(x < x1 && y >= y0 && y < y1);
+                            ink += 1;
+                        }
+                    }
+                }
+            }
+            assert!(ink > 0);
+            assert_eq!(
+                wrap(&face, &text(&presentation, None).summary, 12.0, 269.0, 3),
+                expected
+            );
+            let mut transparent = vec![0; actual.len()];
+            paint_raster_text(
+                &mut transparent,
+                &mut face,
+                raster,
+                1.0,
+                (16.0, 35.0),
+                "Fgj",
+                12.0,
+                INK,
+                (16.0, 12.0, 269.0, 125.0),
+            );
+            assert!(transparent.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
+            assert!(
+                transparent
+                    .chunks_exact(4)
+                    .filter(|p| p[3] > 0)
+                    .all(|p| p[..3] == INK[..3])
+            );
+        }
+    }
+
+    #[test]
+    fn raster_minimum_bubbles_keep_full_status_ink_at_fractional_density() {
+        use crate::{
+            bubble_layout::{BubbleLayout, Tail, TailEdge},
+            raster::{Density, RasterMode, RasterSpec},
+        };
+        let mut face = Typeface::bundled().unwrap();
+        for font in [8.0_f32, 12.0, 24.0, 32.0] {
+            let scene_scale = 1.375;
+            let logical = (
+                (f64::from((font * 6.0 + 32.0).clamp(160.0, 384.0)) * scene_scale).ceil() as u32,
+                (f64::from((font * 2.5 + 24.0).clamp(80.0, 144.0)) * scene_scale).ceil() as u32,
+            );
+            for units in [120, 150, 180, 210, 240] {
+                let raster = RasterSpec::fit(
+                    logical,
+                    Density::from_preferred_scale(units).unwrap(),
+                    RasterMode::ViewportDestination,
+                )
+                .unwrap();
+                for edge in [
+                    TailEdge::Top,
+                    TailEdge::Bottom,
+                    TailEdge::Left,
+                    TailEdge::Right,
+                ] {
+                    let layout = BubbleLayout {
+                        origin: (0, 0),
+                        size: logical,
+                        tail: Some(Tail { edge, position: 40 }),
+                    };
+                    let width = logical.0 as f32 / scene_scale as f32;
+                    let height = logical.1 as f32 / scene_scale as f32;
+                    let left = if edge == TailEdge::Left { 30.0 } else { 16.0 };
+                    let right = width - if edge == TailEdge::Right { 30.0 } else { 16.0 };
+                    let top = if edge == TailEdge::Top { 26.0 } else { 12.0 };
+                    let bottom = height - if edge == TailEdge::Bottom { 26.0 } else { 12.0 };
+                    let rect = (left, top, right - left, bottom - top);
+                    let canvas = Canvas {
+                        size: raster.physical_size(),
+                        scale: 1.0,
+                        x: 0.0,
+                        y: 0.0,
+                        content_clip: Some(rect),
+                        raster: Some((raster, scene_scale)),
+                    };
+                    for (state, attention, accent) in [
+                        (ActivityState::Waiting, true, [130, 83, 25, 255]),
+                        (ActivityState::Waiting, false, [130, 83, 25, 255]),
+                        (ActivityState::Failed, false, [151, 53, 48, 255]),
+                    ] {
+                        let view = view(state, attention);
+                        let status = clip(&face, &text(&view, None).status, font, right - left);
+                        let (_, below) = ink_extents(&mut face, &status, font);
+                        let size = raster.physical_size();
+                        let mut expected = IVORY.repeat(size.0 as usize * size.1 as usize);
+                        canvas.paint_text(
+                            &mut expected,
+                            &mut face,
+                            (left, bottom - below),
+                            &status,
+                            font,
+                            accent,
+                        );
+                        let mut actual = vec![0; expected.len()];
+                        Renderer::new(Some(face.fork()), font).compose_bubble_raster(
+                            &mut actual,
+                            raster,
+                            layout,
+                            scene_scale,
+                            (&view, None),
+                        );
+                        let mut ink = 0;
+                        for (index, pixel) in expected.chunks_exact(4).enumerate() {
+                            if pixel != IVORY {
+                                assert_eq!(
+                                    &actual[index * 4..index * 4 + 4],
+                                    pixel,
+                                    "font {font}, density {units}, edge {edge:?}, status {status}"
+                                );
+                                ink += 1;
+                            }
+                        }
+                        assert!(ink > 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_fractional_tail_dots_cannot_invert_rounded_clamp_bounds() {
+        let canvas = Canvas::for_dimensions((192, 192), (128, 128));
+        let mut frame = vec![0; 192 * 192 * 4];
+        let left = 53.833_332_f32;
+        assert!(
+            left + 5.5 > left + 11.0 - 5.5,
+            "retain the ULP regression case"
+        );
+        for offset in 0..192 {
+            let position = offset as f32 / 1.5;
+            canvas.rounded(&mut frame, (position, left, 11.0, 11.0), 5.5, IVORY);
+            canvas.rounded(&mut frame, (left, position, 5.0, 5.0), 2.5, BORDER);
+        }
+        assert!(frame.as_chunks::<4>().0.iter().any(|rgba| rgba[3] != 0));
+    }
 
     fn responsive_frame(
         renderer: &mut Renderer,
@@ -928,6 +1396,7 @@ mod tests {
                         x: 0.0,
                         y: 0.0,
                         content_clip: Some((left, top, right - left, bottom - top)),
+                        raster: None,
                     };
                     let mut frames = Vec::new();
                     for (state, attention, accent) in [
@@ -1011,6 +1480,7 @@ mod tests {
                 x: 0.0,
                 y: 0.0,
                 content_clip: Some((16.0, 12.0, 352.0, 176.0)),
+                raster: None,
             };
             let mut expected = IVORY.repeat(size.0 as usize * size.1 as usize);
             canvas.paint_text(
@@ -1901,7 +2371,9 @@ mod tests {
         );
         for y in 0..104 {
             for x in 0..96 {
-                let source = (((y * 2 + 1) * SPRITE_WIDTH) + x * 2 + 1) * 4;
+                let sx = (((x as f64 + 0.5) / 96.0) * 192.0).floor() as usize;
+                let sy = (((y as f64 + 0.5) / 104.0) * 208.0).floor() as usize;
+                let source = (sy * SPRITE_WIDTH + sx) * 4;
                 let target = (((y + BUBBLE_HEIGHT) * WIDTH) + x + 144) * 4;
                 assert_eq!(&half[target..target + 4], &sprite[source..source + 4]);
             }
